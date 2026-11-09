@@ -82,8 +82,9 @@ ratios compose exactly: RTX 5070 training goes from 1.49 to 1.49 × 2.27 / 1.20
 reduced precision; the search has not found a competitive long-sequence
 attention.
 
-**Gap analysis.** A single-operation study on RTX 5070 times strict-f32 GEMMs,
-convolutions and dispatches, with both engines running 30 serial copies:
+**Gap analysis.** A single-operation study times strict-f32 GEMMs,
+convolutions and dispatches on RTX 5070, with RX 7900 XT and Arc B570 for
+context; both engines run 30 serial copies. On the RTX 5070:
 
 - Dense f32 GEMM is 1.3–1.7× cuBLAS. With TF32 off, cuBLAS also runs CUTLASS
   SIMT kernels on CUDA cores, so the arithmetic matches: 11.8 against 19.9

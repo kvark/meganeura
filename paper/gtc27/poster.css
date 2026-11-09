@@ -211,15 +211,24 @@ footer p { margin: 0; }
 .fine h3 { font-size: 30pt; }
 .fine p { margin: 0.05in 0; }
 
-.takeaways { list-style: none; padding: 0; margin: 0.1in 0; font-size: 26pt; line-height: 1.25; }
-.takeaways li { padding: 0.08in 0 0.08in 0.62in; position: relative; border-bottom: 1.5pt solid var(--tint); }
-.takeaways li::before {
-  position: absolute; left: 0; top: 0.08in;
-  width: 0.44in; height: 0.44in; border-radius: 50%;
-  color: white; font-weight: bold; font-size: 22pt; text-align: center; line-height: 0.44in;
-}
-.takeaways .slow::before { content: '−'; background: var(--brown); }
-.takeaways .fast::before { content: '+'; background: var(--teal); }
-.takeaways .fixed::before { content: '↓'; background: var(--muted); }
-.takeaways .even::before { content: '='; background: var(--muted); }
-.takeaways .open::before { content: '?'; background: var(--muted); }
+.context { color: var(--muted); font-size: 24pt; margin: 0 0 0.2in; }
+
+table.ops { width: 100%; border-collapse: separate; border-spacing: 0 8pt; font-size: 28pt; }
+table.ops th { color: var(--muted); font-weight: bold; font-size: 20pt; text-transform: uppercase; letter-spacing: .5pt; padding: 0 10pt 4pt; }
+table.ops th:nth-child(-n+2) { text-align: left; }
+table.ops td { background: #f3f5f4; padding: 16pt 10pt; }
+table.ops td:first-child { font-weight: bold; color: var(--deep); }
+table.ops td:nth-child(2) { color: var(--muted); font-size: 20pt; }
+table.ops td:nth-child(n+3), table.ops th:nth-child(n+3) { text-align: center; width: 17%; white-space: nowrap; }
+table.ops .nv { background: #e3ecda; font-weight: bold; }
+table.ops th.nv { background: #4a7d2a; color: white; border-radius: 6pt 6pt 0 0; padding-top: 6pt; }
+table.ops td.near { background: #cfe4e2; color: var(--teal); font-weight: bold; }
+table.ops td.far { background: #f1d9cc; color: var(--brown); font-weight: bold; }
+
+.lead { font-size: 27pt; margin: 0.25in 0; }
+
+.nvstats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.2in; margin: 0.15in 0 0.1in; }
+.nvstats div { background: var(--tint); border-left: 10pt solid #4a7d2a; padding: 0.12in 0.2in; }
+.nvstats p { margin: 0; font-size: 20pt; line-height: 1.25; color: var(--muted); }
+.nvstats .big { font-size: 46pt; font-weight: bold; color: var(--deep); line-height: 1.15; }
+.nvstats .big span { font-size: 0.5em; color: var(--muted); font-weight: normal; }

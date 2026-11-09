@@ -65,14 +65,6 @@
       <p><b>Workloads:</b> SmolLM2-135M (public checkpoint), SmolVLA action expert, scaled 10.9M-parameter SD 1.x U-Net, ResNet-50 (folded normalization), Whisper-tiny encoder; all but SmolLM2 use synthetic weights. <b>Phases:</b> batch or 128-token prefill; one token without a KV cache (not decode latency); forward, loss and backward without an optimizer update.</p>
       <p><b>Gates:</b> Meganeura checks full outputs and single-step gradients against an f32 build; PyTorch checks its forward against eager f32 and its training against an SGD trajectory; across engines, sampled outputs, loss and gradient norms must agree. <b>Timing:</b> 10 s warmup, 20 samples, 3 processes.</p>
     </div>
-    <div class="box">
-      <h3>Driver finding</h3>
-      <p>Driver 595 reads zeros from a dynamically indexed nested local array (<code>array&lt;array&lt;f32,4&gt;,8&gt;</code>, rows 4–7). Flat accumulators avoid it.</p>
-    </div>
-    <div class="box next">
-      <h3>Next</h3>
-      <p>Cooperative-matrix GEMM against cuBLAS BF16 · fused attention · <code>VK_NV_cooperative_matrix2</code> · fewer round trips per step.</p>
-    </div>
   </section>
 
   <section class="col">
@@ -94,23 +86,38 @@
   </section>
 
   <section class="col">
-    <h2><span>3</span>Where the time goes: RTX 5070</h2>
-    <figure>
-      <img src="figures/single-ops.svg" alt="Single GEMM, convolution and dispatch ratios against PyTorch on RTX 5070, with earlier values">
-      <figcaption>One strict-f32 operation, batch 1, cooperative matrices off; both engines time 30 serial copies. The last row compares host round trips.</figcaption>
-    </figure>
-    <ul class="takeaways">
-      <li class="slow"><b>f32 GEMM: 1.3–1.7× cuBLAS.</b> Both run on CUDA cores; 11.8 vs 19.9 TFLOP/s at 4096³.</li>
-      <li class="fixed"><b>Split-K:</b> long-K GEMMs went from 4.4× to 1.9×.</li>
-      <li class="fast"><b>Winograd 3×3: 0.34–0.64×</b> of cuDNN's batch-1 time.</li>
-      <li class="even"><b>Dispatch ≈ CUDA graph:</b> 0.97 vs 0.85 µs per dependent op.</li>
-      <li class="slow"><b>Submit + wait: 19 vs 7 µs</b> per host round trip.</li>
-      <li class="open"><b>Tensor cores: not yet isolated.</b> No TF32 inputs or Hopper warpgroup MMA from Vulkan; their cost needs kernel profiles.</li>
-    </ul>
+    <h2><span>3</span>Kernel and dispatch gaps</h2>
+    <p class="context">Strict f32, one operation, our time ÷ PyTorch's. The vendor libraries run on the same f32 units we use.</p>
+    <table class="ops">
+      <tr><th>Operation</th><th>Shapes</th><th>RX 7900 XT</th><th class="nv">RTX 5070</th><th>Arc B570</th></tr>
+      <tr><td>Large GEMM</td><td>4096³</td><td>1.3×</td><td class="nv">1.7×</td><td>1.3×</td></tr>
+      <tr><td>Transformer GEMMs</td><td>Speech, LLM</td><td>1.3×</td><td class="nv">1.3–1.6×</td><td>1.3–1.6×</td></tr>
+      <tr><td>Small GEMMs</td><td>Diffusion, M = 64–256</td><td class="near">0.25–0.65×</td><td class="nv far">0.93–2.0×</td><td>0.93–1.7×</td></tr>
+      <tr><td>3×3 convolutions</td><td>Diffusion, vision</td><td>0.52–1.4×</td><td class="nv near">0.34–0.64×</td><td>0.79–1.2×</td></tr>
+      <tr><td>Other convolutions</td><td>1×1, stems</td><td class="near">0.34–1.17×</td><td class="nv">1.2–1.3×</td><td>0.49–1.7×</td></tr>
+      <tr><td>Dependent dispatch</td><td>Tiny add after a barrier</td><td class="near">0.28×</td><td class="nv">1.1×</td><td class="near">0.20×</td></tr>
+      <tr><td>Submit and wait</td><td>One tiny add, host time</td><td>1.4×</td><td class="nv far">2.8×</td><td class="far">5.1×</td></tr>
+    </table>
+    <p class="lead"><b>The submission round trip is now the clearest target.</b> Split-K took the worst small GEMM from 4.4× to 2.0×, and a larger tile took the Arc's 4096³ GEMM from 2.2× to 1.3×.</p>
+    <div class="nvstats">
+      <div><p class="big">11.8 <span>vs</span> 19.9</p><p>TFLOP/s, 4096³ GEMM<br>Meganeura vs cuBLAS</p></div>
+      <div><p class="big">11 <span>vs</span> 6</p><p>µs, 64×1024×256 GEMM<br>was 25 before split-K</p></div>
+      <div><p class="big">0.97 <span>vs</span> 0.85</p><p>µs per dependent op<br>barrier vs CUDA graph</p></div>
+      <div><p class="big">19 <span>vs</span> 7</p><p>µs, submit and wait<br>vs eager op + sync</p></div>
+    </div>
+    <p class="caption">RTX 5070 details. Both engines time 30 serial ops, except the round trip. The cooperative-matrix (tensor-core) path is not part of this study. Ratios do not partition model time.</p>
+    <div class="box">
+      <h3>Driver finding</h3>
+      <p>Driver 595 reads zeros from a dynamically indexed nested local array (<code>array&lt;array&lt;f32,4&gt;,8&gt;</code>, rows 4–7). Flat accumulators avoid it.</p>
+    </div>
+    <div class="box next">
+      <h3>Next</h3>
+      <p>Cooperative-matrix GEMM against cuBLAS BF16 · fused attention · <code>VK_NV_cooperative_matrix2</code> · fewer round trips per step.</p>
+    </div>
   </section>
 
   <footer>
-    <p>Model results: P3HPC cohort, October 31 – November 1, 2026 (Meganeura <code>567028b8</code>, PyTorch 2.13.0), 57 qualified NVIDIA ratios. Single operations: November 8, 2026, Meganeura <code>d32a495</code>; they locate losses and do not partition model time. Protocol, archives and replay: D. Malyshau, “Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training and Inference,” P3HPC at SC26.</p>
+    <p>Model results: P3HPC cohort, October 31 – November 1, 2026 (Meganeura <code>567028b8</code>, PyTorch 2.13.0), 57 qualified NVIDIA ratios. Single operations: November 8, 2026, Meganeura <code>d32a495</code> on RX 7900 XT, RTX 5070 and Arc B570; they locate losses and do not partition model time. Protocol, archives and replay: D. Malyshau, “Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training and Inference,” P3HPC at SC26.</p>
   </footer>
 </main>
 </body>
