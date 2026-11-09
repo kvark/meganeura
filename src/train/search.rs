@@ -571,6 +571,9 @@ struct CoordinateOrder {
     initial: usize,
     physical_next: bool,
     priority_choices: collections::VecDeque<usize>,
+    /// Queued indices retain their original intent; resolved candidates are
+    /// recomputed for the latest incumbent before each trial.
+    rebased_choices: collections::HashMap<usize, usize>,
     /// Forms to cover before the first arithmetic alternatives. Eight-wide
     /// products need early coverage of arithmetic, not just scalar layouts.
     arithmetic_layouts: usize,
@@ -590,10 +593,24 @@ impl CoordinateOrder {
             initial: 0,
             physical_next: false,
             priority_choices: collections::VecDeque::new(),
+            rebased_choices: collections::HashMap::new(),
             arithmetic_layouts: ARITHMETIC_LAYOUTS,
             priority_attention: None,
             deferred: collections::HashSet::new(),
         }
+    }
+
+    fn candidate_choice(&self, template: usize) -> usize {
+        self.rebased_choices
+            .get(&template)
+            .copied()
+            .unwrap_or(template)
+    }
+
+    fn has_priority(&self, candidate: usize) -> bool {
+        self.priority_choices
+            .iter()
+            .any(|&template| self.candidate_choice(template) == candidate)
     }
 
     /// The next (form, choice) to measure, given the incumbent's.
@@ -611,19 +628,22 @@ impl CoordinateOrder {
             .count()
             >= self.seeds.min(self.arithmetic_layouts)
         {
-            // Keep the ordinary graph cover ahead of reduced attention too:
-            // an early kernel win can hide a larger graph-layout improvement.
-            if let Some(choice) = self.priority_attention.take() {
-                let entry = (incumbent.0, choice);
-                if self.mark(entry) {
-                    return Some(entry);
-                }
-            }
             while let Some(choice) = self.priority_choices.pop_front() {
+                let choice = self.rebased_choices.remove(&choice).unwrap_or(choice);
                 let entry = (incumbent.0, choice);
                 if self.deferred.contains(&entry) {
                     continue;
                 }
+                if self.mark(entry) {
+                    return Some(entry);
+                }
+            }
+            // Keep the ordinary graph cover ahead of reduced attention too:
+            // an early kernel win can hide a larger graph-layout improvement.
+            // Reduced attention also follows the queued arithmetic, because
+            // the frontier rebuilds it on the winning dense choices.
+            if let Some(choice) = self.priority_attention.take() {
+                let entry = (incumbent.0, choice);
                 if self.mark(entry) {
                     return Some(entry);
                 }
@@ -1382,7 +1402,10 @@ impl measure::Frontier for Implementations {
         self.order
             .priority_choices
             .iter()
-            .filter(|&&choice| self.order.available((form, choice)))
+            .filter(|&&choice| {
+                self.order
+                    .available((form, self.order.candidate_choice(choice)))
+            })
             .count()
     }
 
@@ -1395,7 +1418,7 @@ impl measure::Frontier for Implementations {
             };
             if let Some(index) = self.choices.iter().position(|&c| c == stored) {
                 if !self.order.tried.contains(&(origin.form, index))
-                    && !self.order.priority_choices.contains(&index)
+                    && !self.order.has_priority(index)
                 {
                     self.order.priority_choices.push_back(index);
                 }
@@ -1450,7 +1473,16 @@ impl measure::Frontier for Implementations {
             // spending the deadline on more derivative variants of early forms.
             // This is only an ordering hint: every form remains reachable and
             // must pass qualification and the whole-program timing gate.
-            let backward_rank = self.seeds.get(incumbent.0)?.backward_rank;
+            // Cover the first derivative alternative across forward forms even
+            // if a faster ordinary kernel keeps the initial form incumbent.
+            // Otherwise that improvement can hide a better combined layout.
+            let cover_alternative = self.order.visited_forms.iter().filter(|&&v| v).count()
+                < self.order.seeds.min(self.order.arithmetic_layouts);
+            let backward_rank = if cover_alternative && self.seeds.len() > 1 {
+                self.seeds[1].backward_rank
+            } else {
+                self.seeds.get(incumbent.0)?.backward_rank
+            };
             self.order
                 .form_order
                 .sort_by_key(|&index| (self.seeds[index].backward_rank != backward_rank, index));
@@ -1465,10 +1497,14 @@ impl measure::Frontier for Implementations {
                 .make_contiguous()
                 .sort_by_key(|&index| self.choices[index].forward_products);
             let arithmetic_pending = self.order.priority_choices.iter().any(|&index| {
-                !self.choices[index].forward_products && self.order.available((incumbent.0, index))
+                !self.choices[index].forward_products
+                    && self
+                        .order
+                        .available((incumbent.0, self.order.candidate_choice(index)))
             });
             for index in &mut self.order.priority_choices {
                 let arithmetic = self.choices[*index];
+                self.order.rebased_choices.remove(index);
                 let derivative_trial = (arithmetic.gradient_inputs.is_some()
                     && arithmetic.gradient_inputs != active.gradient_inputs)
                     || (arithmetic.conv_gradient_inputs.is_some()
@@ -1513,7 +1549,7 @@ impl measure::Frontier for Implementations {
                     ..base
                 };
                 if let Some(next) = self.choices.iter().position(|&choice| choice == neighbor) {
-                    *index = next;
+                    self.order.rebased_choices.insert(*index, next);
                 }
             }
             // Try the other arithmetic family on top of a winning family
@@ -1529,7 +1565,7 @@ impl measure::Frontier for Implementations {
             let combined: Vec<_> = arithmetic
                 .into_iter()
                 .filter_map(|index| {
-                    let trial = self.choices[index];
+                    let trial = self.choices[self.order.candidate_choice(index)];
                     if (active.matrix_inputs.is_none() && active.winograd.is_none())
                         || trial.forward_products != active.forward_products
                         || trial.matrix_inputs.is_some() == trial.winograd.is_some()
@@ -1564,9 +1600,7 @@ impl measure::Frontier for Implementations {
                 })
                 .collect();
             for index in combined.into_iter().rev() {
-                if self.order.available((incumbent.0, index))
-                    && !self.order.priority_choices.contains(&index)
-                {
+                if self.order.available((incumbent.0, index)) && !self.order.has_priority(index) {
                     self.order.priority_choices.push_front(index);
                 }
             }
@@ -1601,6 +1635,17 @@ impl measure::Frontier for Implementations {
                     index,
                 )
             });
+            if let Some(index) = self.order.priority_attention {
+                // Compare cooperative backward with the winning dense precision,
+                // after the independent arithmetic choices have had coverage.
+                self.choices[index] = AxisChoice {
+                    f16_attention: true,
+                    backward_ept: None,
+                    f16_flash_tiles: false,
+                    subgroup_tiles: false,
+                    ..active
+                };
+            }
             let (seed_index, choice_index) = self.order.next(incumbent)?;
             let seed = &self.seeds[seed_index];
             let AxisChoice {
@@ -2079,6 +2124,59 @@ mod tests {
                         .unwrap_or_else(|e| panic!("{dtype:?} ({ci},{co},{h},{w},{batch}): {e}"));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn queued_reduction_uses_the_latest_gradient_winner() {
+        use measure::Frontier as _;
+        let mut frontier = gradient_frontier();
+        for index in 1..3 {
+            let seed = &frontier.seeds[0];
+            frontier.seeds.push(Seed {
+                graph: seed.graph.clone(),
+                options: seed.options.clone(),
+                plan: seed.plan.clone(),
+                description: format!("graph={index}"),
+                backward_rank: 0,
+            });
+        }
+        let ordinary = frontier.choices[0];
+        let bf16 = frontier.choices.len();
+        frontier.choices.push(AxisChoice {
+            gradient_inputs: Some(crate::DType::BF16),
+            ..ordinary
+        });
+        let f16 = frontier.choices.len();
+        frontier.choices.push(AxisChoice {
+            gradient_inputs: Some(crate::DType::F16),
+            ..ordinary
+        });
+        let reduction = frontier.choices.len();
+        frontier.choices.push(AxisChoice {
+            subgroup_tiles: true,
+            ..ordinary
+        });
+        for dtype in [crate::DType::BF16, crate::DType::F16] {
+            frontier.choices.push(AxisChoice {
+                gradient_inputs: Some(dtype),
+                subgroup_tiles: true,
+                ..ordinary
+            });
+        }
+        frontier.order = CoordinateOrder::new(frontier.seeds.len(), frontier.choices.len());
+        frontier.order.priority_choices.push_back(reduction);
+        // Two arithmetic winners arrive while initial graph coverage keeps the
+        // reduction trial pending. It must use F16, not its earlier BF16 snapshot.
+        for (choice, dtype) in [(bf16, crate::DType::BF16), (f16, crate::DType::F16)] {
+            frontier
+                .next(Some(measure::Origin { form: 0, choice }))
+                .unwrap();
+            let queued = frontier.order.priority_choices.front().unwrap();
+            assert_eq!(
+                frontier.choices[frontier.order.candidate_choice(*queued)].gradient_inputs,
+                Some(dtype)
+            );
         }
     }
 
@@ -2571,6 +2669,33 @@ mod tests {
     }
 
     #[test]
+    fn initial_graph_cover_reaches_alternative_layouts_when_baseline_keeps_winning() {
+        use measure::Frontier as _;
+        let mut frontier = matrix_frontier();
+        for index in 1..16 {
+            let seed = &frontier.seeds[0];
+            frontier.seeds.push(Seed {
+                graph: seed.graph.clone(),
+                options: seed.options.clone(),
+                plan: seed.plan.clone(),
+                description: format!("graph={index}"),
+                backward_rank: usize::from([1, 2, 5, 13].contains(&index)),
+            });
+        }
+        frontier.order = CoordinateOrder::new(frontier.seeds.len(), frontier.choices.len());
+        let baseline = frontier.next(None).unwrap();
+        let mut forms = vec![0];
+        while forms.len() < ARITHMETIC_LAYOUTS {
+            let program = frontier.next(baseline.origin).unwrap();
+            let form = program.origin.unwrap().form;
+            if !forms.contains(&form) {
+                forms.push(form);
+            }
+        }
+        assert_eq!(forms, [0, 1, 2, 5, 13]);
+    }
+
+    #[test]
     fn eight_wide_arithmetic_precedes_layout_and_weight_split_exploration() {
         use measure::Frontier as _;
         let mut graph = Graph::new();
@@ -2732,12 +2857,17 @@ mod tests {
                     .iter()
                     .any(|&(dense, _, _, _)| matches!(dense, Some(_)))
             {
-                assert_eq!(
-                    choice.winograd,
-                    Some(F16),
-                    "retain the incumbent for the first dense trial"
-                );
-                assert!(choice.f16_attention, "retain winning attention arithmetic");
+                if let Some(incumbent) = incumbent {
+                    let winner = frontier.choices[incumbent.choice];
+                    assert_eq!(
+                        choice.winograd, winner.winograd,
+                        "retain the incumbent for the first dense trial"
+                    );
+                    assert_eq!(
+                        choice.f16_attention, winner.f16_attention,
+                        "retain winning attention arithmetic"
+                    );
+                }
             }
             reached.insert((
                 choice.matrix_inputs,
@@ -3506,8 +3636,8 @@ mod tests {
             assert!(choice < 4, "arithmetic displaced ordinary layout coverage");
             visits += 1;
         }
-        assert_eq!(order.next((1, 0)), Some((1, 4)));
-        assert_eq!(order.next((1, 4)), Some((1, 5)));
+        assert_eq!(order.next((1, 0)), Some((1, 5)));
+        assert_eq!(order.next((1, 5)), Some((1, 4)));
         let rest: Vec<_> = std::iter::from_fn(|| order.next((1, 0))).collect();
         assert_eq!(rest.len() + visits + 2, 8 * 6);
         assert!(order.exhausted());
