@@ -5130,6 +5130,16 @@ impl Session {
         Some(self.plan.buffers[buf_ref.0 as usize])
     }
 
+    /// Device view of the GPU buffer backing the given slot, for a sibling
+    /// pipeline on the same [`blade_graphics::Context`]. Inputs and outputs
+    /// follow the ordering rules of [`Session::input_buffer`] and
+    /// [`Session::output_buffer`]; parameter storage stays live for the whole
+    /// session. Returns `None` if the slot is not known to the graph.
+    pub fn slot_buffer(&self, slot: ExternalSlot<'_>) -> Option<blade_graphics::BufferPiece> {
+        let buf_ref = self.resolve_slot(slot).ok()?;
+        Some(self.buffers[buf_ref.0 as usize])
+    }
+
     fn resolve_slot(&self, slot: ExternalSlot<'_>) -> Result<BufferRef, ExternalBindError> {
         match slot {
             ExternalSlot::Input(name) => self
