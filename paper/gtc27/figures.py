@@ -65,7 +65,7 @@ def ratio_grid():
     """One heat grid per GPU: workloads by (precision, phase). Minimal-shape ratios stay in the caption."""
     columns = [(profile, phase) for profile, _ in PROFILES for phase, _ in PHASES]
     offsets = [0, 1, 2.2, 3.2]  # a gap between the strict and reduced pairs
-    height = (len(ROWS) + 1.6) * 1.2 + .08  # 1.2 in per row, header included
+    height = (len(ROWS) + 1.6) * .9 + .08  # 0.9 in per row, header included
     fig, axes = plt.subplots(1, len(DEVICES), figsize=(13.2, height), gridspec_kw={"wspace": .09})
     for ax, (device, (label, system)) in zip(axes, DEVICES.items()):
         for row, (_, model, suffix) in enumerate(ROWS):
@@ -111,14 +111,14 @@ def precision_gains():
                     torch.append(strict[1] / accel[1])
             groups.append((label, phase, geomean(torch), geomean(native)))
             print(f"{label:9s} {phase:9s} PyTorch {geomean(torch):.2f}  Meganeura {geomean(native):.2f}  n={len(torch)}")
-    fig, ax = plt.subplots(figsize=(13.2, 7.0))
-    bar = .36
+    fig, ax = plt.subplots(figsize=(13.2, 5.5))
+    bar = .34
     positions = [i + .45 * (i // len(PHASES)) for i in range(len(groups))]
     for y, (_, _, torch, native) in zip(positions, groups):
-        ax.barh(y - bar / 2 - .02, torch, bar, color=BROWN)
-        ax.barh(y + bar / 2 + .02, native, bar, color=TEAL)
-        ax.text(torch + .04, y - bar / 2 - .02, f"{torch:.2f}×", va="center", fontsize=19, color=INK)
-        ax.text(native + .04, y + bar / 2 + .02, f"{native:.2f}×", va="center", fontsize=19, color=INK)
+        ax.barh(y - bar / 2 - .03, torch, bar, color=BROWN)
+        ax.barh(y + bar / 2 + .03, native, bar, color=TEAL)
+        ax.text(torch + .04, y - bar / 2 - .03, f"{torch:.2f}×", va="center", fontsize=17, color=INK)
+        ax.text(native + .04, y + bar / 2 + .03, f"{native:.2f}×", va="center", fontsize=17, color=INK)
     ax.set_yticks(positions, [phase for _, phase, _, _ in groups], fontsize=18)
     for i, (label, _) in enumerate(DEVICES.values()):
         middle = (positions[i * len(PHASES)] + positions[(i + 1) * len(PHASES) - 1]) / 2
@@ -136,7 +136,7 @@ def precision_gains():
     ax.legend(handles=[Rectangle((0, 0), 1, 1, color=BROWN), Rectangle((0, 0), 1, 1, color=TEAL)],
               labels=["PyTorch: autocast BF16", "Meganeura: searched precision policy"],
               loc="lower left", bbox_to_anchor=(-.02, 1.0), ncol=2, frameon=False, fontsize=18)
-    fig.subplots_adjust(left=.27, right=.985, top=.93, bottom=.13)
+    fig.subplots_adjust(left=.27, right=.985, top=.91, bottom=.165)
     save(fig, "precision-gains.svg")
 
 
