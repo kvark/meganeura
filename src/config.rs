@@ -154,6 +154,8 @@ registry! {
         "Fill every non-parameter buffer with NaN at session build, so a kernel that reads memory nothing wrote produces NaN instead of a plausible zero.";
     NO_DEVICE_LOCAL: "MEGANEURA_NO_DEVICE_LOCAL", Bool, Diagnostic,
         "Keep all buffers host-visible instead of device-local.";
+    DEVICE_LOCAL_IO: "MEGANEURA_DEVICE_LOCAL_IO", Bool, Diagnostic,
+        "Place parameters, inputs, outputs and loss in device-local memory with staging transfers.";
     SERIAL_DISPATCH: "MEGANEURA_SERIAL_DISPATCH", Bool, Diagnostic,
         "One compute pass per dispatch — guarantees serial execution for bisection.";
     NO_WINOGRAD: "MEGANEURA_NO_WINOGRAD", Bool, Diagnostic,
@@ -352,6 +354,7 @@ impl SessionOptions {
             no_alias: NO_ALIAS.bool_or(false),
             poison: POISON.bool_or(false),
             no_device_local: NO_DEVICE_LOCAL.bool_or(false),
+            device_local_io: DEVICE_LOCAL_IO.bool_or(true),
             skip_parameter_zero: false,
             serial_dispatch: SERIAL_DISPATCH.bool_or(false),
             dump_plan: DUMP_PLAN.bool_or(false),

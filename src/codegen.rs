@@ -440,14 +440,20 @@ impl ScalarMatmulShape {
     }
 
     /// The staged tiles have to be an integer number of 256-thread passes,
-    /// and each thread's register tile is BM/16 by BN/16.
+    /// and each thread's register tile is BM/16 by BN/16. 128 is the widest
+    /// block on that 16×16 mapping: it is an 8×8 register tile, 64
+    /// accumulators per thread. A wider output tile needs a larger workgroup.
     pub fn legal(self) -> bool {
         let (bm, bn, k) = (self.rows(), self.cols(), self.k_stage);
+        let threads = self.geometry().threads();
+        let wide_512 = matches!((bm, bn), (256, 128) | (128, 256));
+        let squareish = matches!(bm, 16 | 32 | 64 | 128) && matches!(bn, 16 | 32 | 64 | 128);
         matches!(k, 8 | 16 | 32)
-            && matches!(bm, 16 | 32 | 64 | 128)
-            && matches!(bn, 16 | 32 | 64 | 128)
-            && bm * k % 256 == 0
-            && bn * k % 256 == 0
+            && (squareish || wide_512)
+            && (bm * bn <= 16384 || wide_512)
+            && (wide_512 || bm * k % threads == 0)
+            && (wide_512 || bn * k % threads == 0)
+            && (!wide_512 || (bm * k % threads == 0 && bn * k % threads == 0 && k <= 16))
     }
 
     pub fn geometry(self) -> MatMulTile {
@@ -1115,7 +1121,13 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
     subgroup: u32,
 ) -> ShaderModule {
     assert!(
-        coop_shape(group).is_some() || group.is_checked_convolution(),
+        coop_shape(group).is_some()
+            || matches!(
+                group,
+                ShaderGroup::Conv2dBF16 { .. }
+                    | ShaderGroup::Conv2dChecked { .. }
+                    | ShaderGroup::Conv2dPointwiseGradInput
+            ),
         "no cooperative form for {group:?}"
     );
     if let Some((addend, variant)) = coop_shape(group)
@@ -1326,17 +1338,17 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// matmul.wgsl — 4×4 register-tiled matrix multiply (64×64 output tiles)
+// matmul.wgsl — register-tiled matrix multiply
 //
-// Workgroup [16, 16, 1] = 256 threads, dispatched as [ceil(N/64), ceil(M/64), 1].
-// Each thread computes a 4×4 sub-tile of the output using register blocking.
-// Shared memory tiles: shared_a[64*16], shared_b[16*64].
+// Workgroup [16, 16, 1] = 256 threads. Each thread's register tile is
+// BM/16 by BN/16: 4×4 for 64×64, 2×2 for 32×32, 8×8 for 128×128.
+// Dispatched as [ceil(N/BN), ceil(M/BM), 1].
 // ---------------------------------------------------------------------------
 
 /// Register-tiled matmul: C = A × B via WGSL with shared memory.
 ///
-/// BM=64, BN=64, KTILE=16, TM=4, TN=4.
-/// Workgroup [16, 16, 1], dispatched as [ceil(N/64), ceil(M/64), 1].
+/// The plain kernel is BM=BN=64 (TM=TN=4). The same skeleton covers every
+/// legal [`ScalarMatmulShape`], including the 128×128 block.
 ///
 /// Template variables for global memory indices:
 const MATMUL_A_FWD: &str = "a_row * params.k + a_col"; // A[m,k] row-major
@@ -1346,17 +1358,16 @@ const MATMUL_B_BT: &str = "b_col * params.k + b_row"; // B^T[k,n] = B[n*K+k]
 
 /// Thread-to-tile mapping for coalesced global memory access.
 ///
-/// Large-tile (64×64) load mappings. Adjacent threads follow each operand's
-/// fast dimension: the selected K extent for A[M,K] and B[N,K], or the
-/// output tile width for A[K,M] and B[K,N].
-const A_ROW_FWD: &str = "flat / $K_TILE_U"; // M varies slowly (good for [M,K])
-const A_COL_FWD: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [M,K])
-const A_ROW_AT: &str = "flat % $BM_U"; // M varies fast (coalesced in [K,M])
-const A_COL_AT: &str = "flat / $BM_U"; // K varies slowly
-const B_ROW_FWD: &str = "flat / $BN_U"; // K varies slowly (good for [K,N])
-const B_COL_FWD: &str = "flat % $BN_U"; // N varies fast (coalesced in [K,N])
-const B_ROW_BT: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [N,K])
-const B_COL_BT: &str = "flat / $K_TILE_U"; // N varies slowly
+/// Adjacent threads follow each operand's fast dimension. The widths are
+/// `$BM_U`, `$BN_U` and `$K_TILE_U`, so one mapping covers every scalar tile.
+const A_ROW_FWD: &str = "(tid / $K_TILE_U) + e * ($THREADS_U / $K_TILE_U)"; // M varies slowly (good for [M,K])
+const A_COL_FWD: &str = "tid % $K_TILE_U"; // K varies fast (coalesced in [M,K])
+const A_ROW_AT: &str = "tid % $BM_U"; // M varies fast (coalesced in [K,M])
+const A_COL_AT: &str = "(tid / $BM_U) + e * ($THREADS_U / $BM_U)"; // K varies slowly
+const B_ROW_FWD: &str = "(tid / $BN_U) + e * ($THREADS_U / $BN_U)"; // K varies slowly (good for [K,N])
+const B_COL_FWD: &str = "tid % $BN_U"; // N varies fast (coalesced in [K,N])
+const B_ROW_BT: &str = "tid % $K_TILE_U"; // K varies fast (coalesced in [N,K])
+const B_COL_BT: &str = "(tid / $K_TILE_U) + e * ($THREADS_U / $K_TILE_U)"; // N varies slowly
 
 /// Tile geometry for the register-tiled scalar matmul skeleton.
 ///
@@ -1395,11 +1406,23 @@ impl MatMulTile {
             MatMulTile::Rect { bn, .. } => bn,
         }
     }
+    fn wg_x(self) -> u32 {
+        16
+    }
+    fn wg_y(self) -> u32 {
+        self.threads() / 16
+    }
     fn tm(self) -> u32 {
-        self.bm() / 16
+        self.bm() / self.wg_y()
     }
     fn tn(self) -> u32 {
-        self.bn() / 16
+        self.bn() / self.wg_x()
+    }
+    fn threads(self) -> u32 {
+        match self {
+            Self::Rect { bm: 256, bn: 128 } | Self::Rect { bm: 128, bn: 256 } => 512,
+            _ => 256,
+        }
     }
 }
 
@@ -1407,9 +1430,9 @@ impl MatMulTile {
 /// own block so the `let` accumulators can be repeated.
 fn unroll_k_math(compute_body: &str, k_tile: u32) -> String {
     let mut out = String::new();
-    for kk in 0..k_tile {
+    for step in 0..k_tile {
         out.push_str("{\n");
-        out.push_str(&compute_body.replace("kk", &format!("{kk}u")));
+        out.push_str(&compute_body.replace("kk", &format!("(kk + {step}u)")));
         out.push_str("}\n");
     }
     out
@@ -1419,16 +1442,82 @@ fn unroll_k_math(compute_body: &str, k_tile: u32) -> String {
 /// the tiled-matmul skeleton for a TM×TN register tile.
 fn tiled_matmul_body(
     tile: MatMulTile,
-    k_tile: u32,
+    _k_tile: u32,
     interleave_columns: bool,
 ) -> (String, String, String) {
-    tiled_gemm_body(
-        tile.tm(),
-        tile.tn(),
-        k_tile + 1,
-        tile.bn() + 1,
-        interleave_columns,
-    )
+    use std::fmt::Write;
+    let tm = tile.tm();
+    let tn = tile.tn();
+    let a_stride = tile.bm() + 4;
+    let b_stride = tile.bn() + 4;
+    let warp_tiled = tile.threads() == 256
+        && ((interleave_columns && tile.bm() >= 64 && tile.bn() >= 64)
+            || (tile.bm() == 128 && tile.bn() == 128));
+    let transpose_warp = tile.threads() == 256 && interleave_columns && tile.bm() == 128 && tile.bn() == 128;
+    let row_group_stride = if transpose_warp { 32 } else { 16 };
+    let col_group_stride = if transpose_warp { 16 } else { 32 };
+
+    let mut acc_decl = String::new();
+    for i in 0..tm {
+        for j in 0..tn {
+            let _ = write!(acc_decl, "var s{i}_{j} = 0.0; ");
+        }
+        acc_decl.push_str("\n    ");
+    }
+
+    let mut body = String::new();
+    if warp_tiled {
+        let _ = writeln!(body, "            let a_base = kk * {a_stride}u + warp_row;");
+        let _ = writeln!(body, "            let b_base = kk * {b_stride}u + warp_col;");
+    }
+    for i in 0..tm {
+        let a_idx = if warp_tiled {
+            format!("a_base + {}u", (i / 4) * row_group_stride + (i % 4))
+        } else {
+            format!("kk * {a_stride}u + ty * {tm}u + {i}u")
+        };
+        let _ = writeln!(body, "            let a{i} = shared_a[{a_idx}];");
+    }
+    for j in 0..tn {
+        let b_idx = if warp_tiled {
+            format!("b_base + {}u", (j / 4) * col_group_stride + (j % 4))
+        } else if interleave_columns {
+            format!("kk * {b_stride}u + tx + {}u", j * 16)
+        } else {
+            format!("kk * {b_stride}u + tx * {tn}u + {j}u")
+        };
+        let _ = writeln!(body, "            let b{j} = shared_b[{b_idx}];");
+    }
+    if warp_tiled && tm >= 8 && tn >= 8 {
+        for qi in (0..tm).step_by(4) {
+            for qj in (0..tn).step_by(4) {
+                for i in qi..qi + 4 {
+                    body.push_str("            ");
+                    for j in qj..qj + 4 {
+                        let _ = write!(body, "s{i}_{j} += a{i} * b{j}; ");
+                    }
+                    body.push('\n');
+                }
+            }
+        }
+    } else {
+        for i in 0..tm {
+            body.push_str("            ");
+            for j in 0..tn {
+                let _ = write!(body, "s{i}_{j} += a{i} * b{j}; ");
+            }
+            body.push('\n');
+        }
+    }
+
+    let mut acc_array = format!("array<array<f32, {tn}>, {tm}>(\n");
+    for i in 0..tm {
+        let cols: Vec<String> = (0..tn).map(|j| format!("s{i}_{j}")).collect();
+        let _ = writeln!(acc_array, "        array<f32, {tn}>({}),", cols.join(", "));
+    }
+    acc_array.push_str("    )");
+
+    (acc_decl, body, acc_array)
 }
 
 /// An optimizer kernel over the segments of one arena chunk.
@@ -1761,10 +1850,10 @@ fn matmul_vars_tiled(
         format!("{}\n{}", fused_decl, epilogue_decl)
     };
     let store_body = if epilogue_body.is_empty() {
-        format!("$C_BUFFER[idx] = s[i * $TN_U + j]{};", fused_expr)
+        format!("$C_BUFFER[idx] = s[i][j]{};", fused_expr)
     } else {
         format!(
-            "var val = s[i * $TN_U + j]{};\n                {}\n                $C_BUFFER[idx] = val;",
+            "var val = s[i][j]{};\n                {}\n                $C_BUFFER[idx] = val;",
             fused_expr, epilogue_body
         )
     };
@@ -1839,9 +1928,341 @@ fn matmul_vars_tiled(
         WeightFormat::Q3K if tile == MatMulTile::Large => Some("dequant_q3k_pack8"),
         _ => None,
     };
-    let b_stage_body = if let Some(pack8) = pack8 {
+    let bm = tile.bm();
+    let bn = tile.bn();
+    let tm = tile.tm();
+    let tn = tile.tn();
+    let threads = tile.threads();
+    let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
+    let warp_tiled = threads == 256
+        && ((interleave_columns && bm >= 64 && bn >= 64) || (bm >= 128 && bn >= 128));
+    let transpose_warp = threads == 256 && interleave_columns && bm == 128 && bn == 128;
+    let (warp_row_expr, warp_col_expr, row_group_stride, col_group_stride) = if warp_tiled && transpose_warp
+    {
+        (
+            "((tid >> 7u) * ($BM_U / 2u)) + (((tid >> 2u) & 7u) * 4u)",
+            "(((tid >> 5u) & 3u) * ($BN_U / 4u)) + ((tid & 3u) * 4u)",
+            32u32,
+            16u32,
+        )
+    } else if warp_tiled {
+        (
+            "((tid >> 6u) * ($BM_U / 4u)) + (((tid >> 3u) & 3u) * 4u)",
+            "(((tid >> 5u) & 1u) * ($BN_U / 2u)) + ((tid & 7u) * 4u)",
+            16,
+            32,
+        )
+    } else {
+        ("ty * $TM_U", "tx * $TN_U", 1, 1)
+    };
+    // Block decoders have fixed layouts; plain F32/F16 share the same skeleton.
+    let k_tile = match b_mode {
+        WeightFormat::F32 | WeightFormat::F16 => knobs.k_stage,
+        _ => 32,
+    };
+    assert!(
+        bm * k_tile % threads == 0 && bn * k_tile % threads == 0,
+        "matmul stage {bm}x{k_tile} and {bn}x{k_tile} must cover whole warps"
+    );
+    assert!(
+        matches!(knobs.k_stage, 8 | 16 | 32),
+        "unsupported scalar matmul K stage: {}",
+        knobs.k_stage
+    );
+    let a_ept = bm * k_tile / threads;
+    let b_ept = bn * k_tile / threads;
+    let b_fast_load_expr = match b_mode {
+        WeightFormat::F32 => format!("$B_BUFFER[{b_idx}]"),
+        WeightFormat::F16 => {
+            format!("unpack2x16float($B_BUFFER[({b_idx}) / 2u] >> ((({b_idx}) & 1u) << 4u)).x")
+        }
+        WeightFormat::Q4 => "dequant_q4(b_row, b_col)".to_string(),
+        WeightFormat::Q8 => "dequant_q8(b_row, b_col)".to_string(),
+        WeightFormat::Q40 => "dequant_q40(b_row, b_col)".to_string(),
+        WeightFormat::Q4K => "dequant_q4k(b_row, b_col)".to_string(),
+        WeightFormat::Q6K => "dequant_q6k(b_row, b_col)".to_string(),
+        WeightFormat::Q5K => "dequant_q5k(b_row, b_col)".to_string(),
+        WeightFormat::Q3K => "dequant_q3k(b_row, b_col)".to_string(),
+    };
+    let stage_a_size = k_tile * (bm + 4);
+    let stage_b_size = k_tile * (bn + 4);
+    let double_buffer_shared = false;
+    let shared_a_size = if double_buffer_shared {
+        2 * stage_a_size
+    } else {
+        stage_a_size
+    };
+    let shared_b_size = if double_buffer_shared {
+        2 * stage_b_size
+    } else {
+        stage_b_size
+    };
+    let read_a_base_expr = if warp_tiled {
+        "warp_row".to_string()
+    } else {
+        format!("ty * {tm}u")
+    };
+    let read_b_base_expr = if warp_tiled {
+        "warp_col".to_string()
+    } else if interleave_columns {
+        "tx".to_string()
+    } else {
+        format!("tx * {tn}u")
+    };
+    let emit_frag_load = |out: &mut String, prefix: &str, kk: u32| {
+        use std::fmt::Write;
+        for i in 0..tm {
+            let row_off = if warp_tiled {
+                (i / 4) * row_group_stride + (i % 4)
+            } else {
+                i
+            };
+            let off = kk * (bm + 4) + row_off;
+            let _ = writeln!(
+                out,
+                "            {prefix}a{i} = shared_a[sa_read_base + {off}u];"
+            );
+        }
+        for j in 0..tn {
+            let col_off = if warp_tiled {
+                (j / 4) * col_group_stride + (j % 4)
+            } else if interleave_columns {
+                j * 16
+            } else {
+                j
+            };
+            let off = kk * (bn + 4) + col_off;
+            let _ = writeln!(
+                out,
+                "            {prefix}b{j} = shared_b[sb_read_base + {off}u];"
+            );
+        }
+    };
+    let emit_frag_fma = |out: &mut String, prefix: &str| {
+        use std::fmt::Write;
+        if warp_tiled && tm >= 8 && tn >= 8 {
+            for qi in (0..tm).step_by(4) {
+                for qj in (0..tn).step_by(4) {
+                    for i in qi..qi + 4 {
+                        out.push_str("            ");
+                        for j in qj..qj + 4 {
+                            let _ = write!(out, "s{i}_{j} += {prefix}a{i} * {prefix}b{j}; ");
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+        } else {
+            for i in 0..tm {
+                out.push_str("            ");
+                for j in 0..tn {
+                    let _ = write!(out, "s{i}_{j} += {prefix}a{i} * {prefix}b{j}; ");
+                }
+                out.push('\n');
+            }
+        }
+    };
+    let mut frag_decl = String::from("        ");
+    for i in 0..tm {
+        frag_decl.push_str(&format!("var a{i} = 0.0; var na{i} = 0.0; "));
+    }
+    frag_decl.push_str("\n        ");
+    for j in 0..tn {
+        frag_decl.push_str(&format!("var b{j} = 0.0; var nb{j} = 0.0; "));
+    }
+    frag_decl.push('\n');
+
+    let fast_loop_body = if double_buffer_shared {
+        let mut body = String::from(
+            "        let a_row0 = tid / $K_TILE_U;\n        let a_col0 = tid % $K_TILE_U;\n        let a_step_idx = ($THREADS_U / $K_TILE_U) * params.k;\n        let b_step_idx = ($THREADS_U / $BN_U) * params.n;\n        let b_tile_step = $K_TILE_U * params.n;\n        let sa_store_base = a_col0 * $A_STRIDE_U + a_row0;\n        let sb_store_base = (tid / $BN_U) * $B_STRIDE_U + (tid % $BN_U);\n        var a_base_idx = (tile_row + a_row0) * params.k + a_col0 + t;\n        var b_base_idx = (t + (tid / $BN_U)) * params.n + tile_col + (tid % $BN_U);\n",
+        );
+        for e in 0..a_ept {
+            body.push_str(&format!(
+                "        var ga_{e} = matrix_a[a_base_idx + {e}u * a_step_idx];\n"
+            ));
+        }
+        for e in 0..b_ept {
+            body.push_str(&format!(
+                "        var gb_{e} = $B_BUFFER[b_base_idx + {e}u * b_step_idx];\n"
+            ));
+        }
+        for e in 0..a_ept {
+            body.push_str(&format!(
+                "        shared_a[sa_store_base + {}u] = ga_{e};\n",
+                e * (threads / k_tile)
+            ));
+        }
+        for e in 0..b_ept {
+            body.push_str(&format!(
+                "        shared_b[sb_store_base + {}u] = gb_{e};\n",
+                e * (threads / bn) * (bn + 4)
+            ));
+        }
+        body.push_str("        workgroupBarrier();\n        var stage = 0u;\n");
+        body.push_str(&format!(
+            "        var sa_read_base = {read_a_base_expr};\n        var sb_read_base = {read_b_base_expr};\n"
+        ));
+        body.push_str(&frag_decl);
+        emit_frag_load(&mut body, "", 0);
+        body.push_str("        loop {\n            t += $K_TILE_U;\n            let has_next = t + $K_TILE_U <= end_k;\n            if has_next {\n                a_base_idx += $K_TILE_U;\n                b_base_idx += b_tile_step;\n");
+        for e in 0..a_ept {
+            body.push_str(&format!(
+                "                ga_{e} = matrix_a[a_base_idx + {e}u * a_step_idx];\n"
+            ));
+        }
+        for e in 0..b_ept {
+            body.push_str(&format!(
+                "                gb_{e} = $B_BUFFER[b_base_idx + {e}u * b_step_idx];\n"
+            ));
+        }
+        body.push_str("            }\n");
+        for kk in 0..(k_tile - 1) {
+            let cur_p = if kk % 2 == 0 { "" } else { "n" };
+            let next_p = if kk % 2 == 0 { "n" } else { "" };
+            emit_frag_load(&mut body, next_p, kk + 1);
+            emit_frag_fma(&mut body, cur_p);
+        }
+        body.push_str(&format!(
+            "            stage = 1u - stage;\n            let sa_write_base = stage * {stage_a_size}u + sa_store_base;\n            let sb_write_base = stage * {stage_b_size}u + sb_store_base;\n"
+        ));
+        for e in 0..a_ept {
+            body.push_str(&format!(
+                "            shared_a[sa_write_base + {}u] = ga_{e};\n",
+                e * (threads / k_tile)
+            ));
+        }
+        for e in 0..b_ept {
+            body.push_str(&format!(
+                "            shared_b[sb_write_base + {}u] = gb_{e};\n",
+                e * (threads / bn) * (bn + 4)
+            ));
+        }
+        body.push_str(&format!(
+            "            workgroupBarrier();\n            sa_read_base = stage * {stage_a_size}u + {read_a_base_expr};\n            sb_read_base = stage * {stage_b_size}u + {read_b_base_expr};\n"
+        ));
+        emit_frag_load(&mut body, "", 0);
+        emit_frag_fma(&mut body, "n");
+        body.push_str("            if !has_next { break; }\n        }\n        workgroupBarrier();");
+        body
+    } else {
+        let (fast_prefetch_decl, fast_stage_load, fast_stage_store) = if let Some(pack8) = pack8 {
+            let mut decl = String::new();
+            let mut load = String::new();
+            let mut store = String::new();
+            for e in 0..a_ept {
+                decl.push_str(&format!("        var ga_{e} = 0.0;\n"));
+                load.push_str(&format!(
+                    "        {{ let e = {e}u; let flat = tid + {}u; let row_local = $A_ROW; let col_local = $A_COL; let a_row = tile_row + row_local; let a_col = t + col_local; ga_{e} = matrix_a[$A_INDEX]; }}\n",
+                    e * threads
+                ));
+                store.push_str(&format!(
+                    "        {{ let e = {e}u; let flat = tid + {}u; let row_local = $A_ROW; let col_local = $A_COL; shared_a[col_local * $A_STRIDE_U + row_local] = ga_{e}; }}\n",
+                    e * threads
+                ));
+            }
+            decl.push_str("        var gb_pack: array<f32, 8>;\n");
+            load.push_str(&format!(
+                "        {{ let n_local = tid % $BN_U; let k_base = (tid / $BN_U) * 8u; let b_col = tile_col + n_local; gb_pack = {pack8}(t + k_base, b_col); }}\n"
+            ));
+            store.push_str(
+                "        { let n_local = tid % $BN_U; let k_base = (tid / $BN_U) * 8u; for (var i = 0u; i < 8u; i++) { shared_b[(k_base + i) * $B_STRIDE_U + n_local] = gb_pack[i]; } }\n",
+            );
+            (decl, load, store)
+        } else if a_row == A_ROW_FWD && b_row == B_ROW_FWD && b_mode == WeightFormat::F32 {
+            let mut decl = String::from(
+                "        let a_row0 = tid / $K_TILE_U;\n        let a_col0 = tid % $K_TILE_U;\n        let a_step_idx = ($THREADS_U / $K_TILE_U) * params.k;\n        let b_step_idx = ($THREADS_U / $BN_U) * params.n;\n        let sa_store_base = a_col0 * $A_STRIDE_U + a_row0;\n        let sb_store_base = (tid / $BN_U) * $B_STRIDE_U + (tid % $BN_U);\n",
+            );
+            let mut load = String::from(
+                "        let a_base_idx = (tile_row + a_row0) * params.k + a_col0 + t;\n        let b_base_idx = (t + (tid / $BN_U)) * params.n + tile_col + (tid % $BN_U);\n",
+            );
+            let mut store = String::new();
+            for e in 0..a_ept {
+                decl.push_str(&format!("        var ga_{e} = 0.0;\n"));
+                load.push_str(&format!(
+                    "        ga_{e} = matrix_a[a_base_idx + {e}u * a_step_idx];\n"
+                ));
+                store.push_str(&format!(
+                    "        shared_a[sa_store_base + {}u] = ga_{e};\n",
+                    e * (threads / k_tile)
+                ));
+            }
+            for e in 0..b_ept {
+                decl.push_str(&format!("        var gb_{e} = 0.0;\n"));
+                load.push_str(&format!(
+                    "        gb_{e} = $B_BUFFER[b_base_idx + {e}u * b_step_idx];\n"
+                ));
+                store.push_str(&format!(
+                    "        shared_b[sb_store_base + {}u] = gb_{e};\n",
+                    e * (threads / bn) * (bn + 4)
+                ));
+            }
+            (decl, load, store)
+        } else {
+            let mut decl = String::new();
+            let mut load = String::new();
+            let mut store = String::new();
+            for e in 0..a_ept {
+                decl.push_str(&format!("        var ga_{e} = 0.0;\n"));
+                load.push_str(&format!(
+                    "        {{ let e = {e}u; let flat = tid + {}u; let row_local = $A_ROW; let col_local = $A_COL; let a_row = tile_row + row_local; let a_col = t + col_local; ga_{e} = matrix_a[$A_INDEX]; }}\n",
+                    e * threads
+                ));
+                store.push_str(&format!(
+                    "        {{ let e = {e}u; let flat = tid + {}u; let row_local = $A_ROW; let col_local = $A_COL; shared_a[col_local * $A_STRIDE_U + row_local] = ga_{e}; }}\n",
+                    e * threads
+                ));
+            }
+            for e in 0..b_ept {
+                decl.push_str(&format!("        var gb_{e} = 0.0;\n"));
+                load.push_str(&format!(
+                    "        {{ let e = {e}u; let flat = tid + {}u; let row_local = $B_ROW; let col_local = $B_COL; let b_row = t + row_local; let b_col = tile_col + col_local; gb_{e} = {b_fast_load_expr}; }}\n",
+                    e * threads
+                ));
+                store.push_str(&format!(
+                    "        {{ let e = {e}u; let flat = tid + {}u; let row_local = $B_ROW; let col_local = $B_COL; shared_b[row_local * $B_STRIDE_U + col_local] = gb_{e}; }}\n",
+                    e * threads
+                ));
+            }
+            (decl, load, store)
+        };
+        let mut body = String::new();
+        body.push_str(&fast_prefetch_decl);
+        body.push_str(&format!(
+            "        let sa_read_base = {read_a_base_expr};\n        let sb_read_base = {read_b_base_expr};\n"
+        ));
+        body.push_str(&frag_decl);
+        body.push_str(&fast_stage_load);
+        body.push_str("        loop {\n");
+        body.push_str(&fast_stage_store);
+        body.push_str("            workgroupBarrier();\n");
+        emit_frag_load(&mut body, "", 0);
+        body.push_str(
+            "            t += $K_TILE_U;\n            let has_next = t + $K_TILE_U <= end_k;\n            if has_next {\n",
+        );
+        body.push_str(&fast_stage_load);
+        body.push_str("            }\n");
+        for kk in 0..(k_tile - 1) {
+            let cur_p = if kk % 2 == 0 { "" } else { "n" };
+            let next_p = if kk % 2 == 0 { "n" } else { "" };
+            emit_frag_load(&mut body, next_p, kk + 1);
+            emit_frag_fma(&mut body, cur_p);
+        }
+        emit_frag_fma(&mut body, "n");
+        body.push_str("            workgroupBarrier();\n            if !has_next { break; }\n        }");
+        body
+    };
+    let stage_body = if let Some(pack8) = pack8 {
         format!(
             "\
+        for (var e = 0u; e < $A_STAGE_EPT_U; e++) {{\n\
+            let flat = tid + e * $THREADS_U;\n\
+            let row_local = $A_ROW;\n\
+            let col_local = $A_COL;\n\
+            let a_row = tile_row + row_local;\n\
+            let a_col = t + col_local;\n\
+            let in_bounds = (a_row < params.m) && (a_col < params.k);\n\
+            shared_a[col_local * $A_STRIDE_U + row_local] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);\n\
+        }}\n\
         let n_local = tid % $BN_U;\n\
         let k_base = (tid / $BN_U) * 8u;\n\
         let b_col = tile_col + n_local;\n\
@@ -1857,8 +2278,17 @@ fn matmul_vars_tiled(
         )
     } else {
         "\
+        for (var e = 0u; e < $A_STAGE_EPT_U; e++) {\n\
+            let flat = tid + e * $THREADS_U;\n\
+            let row_local = $A_ROW;\n\
+            let col_local = $A_COL;\n\
+            let a_row = tile_row + row_local;\n\
+            let a_col = t + col_local;\n\
+            let in_bounds = (a_row < params.m) && (a_col < params.k);\n\
+            shared_a[col_local * $A_STRIDE_U + row_local] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);\n\
+        }\n\
         for (var e = 0u; e < $B_STAGE_EPT_U; e++) {\n\
-            let flat = tid + e * 256u;\n\
+            let flat = tid + e * $THREADS_U;\n\
             let row_local = $B_ROW;\n\
             let col_local = $B_COL;\n\
             let b_row = t + row_local;\n\
@@ -1868,41 +2298,77 @@ fn matmul_vars_tiled(
         }"
         .to_string()
     };
-    let bm = tile.bm();
-    let bn = tile.bn();
-    let tm = tile.tm();
-    let tn = tile.tn();
-    // Block decoders have fixed layouts; plain F32/F16 share the same skeleton.
-    let k_tile = match b_mode {
-        WeightFormat::F32 | WeightFormat::F16 => knobs.k_stage,
-        _ => 32,
-    };
-    assert!(
-        bm * k_tile % 256 == 0 && bn * k_tile % 256 == 0,
-        "matmul stage {bm}x{k_tile} and {bn}x{k_tile} must cover whole warps"
-    );
-    assert!(
-        matches!(knobs.k_stage, 8 | 16 | 32),
-        "unsupported scalar matmul K stage: {}",
-        knobs.k_stage
-    );
-    let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
-    let (acc_decl, compute_body, _) = tiled_matmul_body(tile, k_tile, interleave_columns);
-    // A flat store array: NVIDIA's 595 driver reads rows TN..8 of a nested
-    // `array<array<f32, TN>, 8>` as zero when TN < 8.
-    let acc_array = format!(
-        "array<f32, {}>({})",
-        tm * tn,
-        (0..tm)
-            .flat_map(|i| (0..tn).map(move |j| format!("s{i}_{j}")))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let k_math = if knobs.unroll_k {
-        unroll_k_math(&compute_body, k_tile)
+    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
+    let k_unroll = if knobs.unroll_k { k_tile } else { 1 };
+    let k_math = if k_unroll > 1 {
+        unroll_k_math(&compute_body, k_unroll)
     } else {
-        compute_body
+        compute_body.clone()
     };
+    let mut store_unrolled = String::new();
+    if warp_tiled && c_idx == "row * params.n + col" {
+        store_unrolled.push_str(
+            "    if full_wg {\n        let c_base = (tile_row + warp_row) * params.n + split_id * params.m * params.n + tile_col + warp_col;\n",
+        );
+        for i in 0..tm {
+            let row_const = (i / 4) * row_group_stride + (i % 4);
+            store_unrolled.push_str(&format!(
+                "        {{ let row_base = c_base + {row_const}u * params.n;\n"
+            ));
+            for g in 0..(tn / 4) {
+                let col_const = g * col_group_stride;
+                for c in 0..4 {
+                    let j = g * 4 + c;
+                    let cell_store = store_body
+                        .replace("s[i][j]", &format!("s{i}_{j}"))
+                        .replace("idx", &format!("row_base + {}u", col_const + c));
+                    store_unrolled.push_str(&format!("            {cell_store}\n"));
+                }
+            }
+            store_unrolled.push_str("        }\n");
+        }
+        store_unrolled.push_str("    } else {\n");
+        for i in 0..tm {
+            let row_const = (i / 4) * row_group_stride + (i % 4);
+            store_unrolled.push_str(&format!(
+                "        {{ let row = tile_row + warp_row + {row_const}u; if row < params.m {{ let row_base = row * params.n + split_id * params.m * params.n;\n"
+            ));
+            for j in 0..tn {
+                let col_const = (j / 4) * col_group_stride + (j % 4);
+                let cell_store = store_body.replace("s[i][j]", &format!("s{i}_{j}"));
+                store_unrolled.push_str(&format!(
+                    "            {{ let col = tile_col + warp_col + {col_const}u; if col < params.n {{ let idx = row_base + col; {cell_store} }} }}\n"
+                ));
+            }
+            store_unrolled.push_str("        } }\n");
+        }
+        store_unrolled.push_str("    }\n");
+    } else {
+        for i in 0..tm {
+            let row_offset = if warp_tiled {
+                format!("warp_row + {}u", (i / 4) * row_group_stride + (i % 4))
+            } else {
+                format!("ty * {tm}u + {i}u")
+            };
+            store_unrolled.push_str(&format!(
+                "    {{ let row = tile_row + {row_offset}; if full_wg || row < params.m {{\n"
+            ));
+            for j in 0..tn {
+                let col_offset = if warp_tiled {
+                    format!("warp_col + {}u", (j / 4) * col_group_stride + (j % 4))
+                } else if interleave_columns {
+                    format!("tx + {}u", j * 16)
+                } else {
+                    format!("tx * {tn}u + {j}u")
+                };
+                let cell_store = store_body.replace("s[i][j]", &format!("s{i}_{j}"));
+                store_unrolled.push_str(&format!(
+                    "        {{ let col = tile_col + {col_offset}; if full_wg || col < params.n {{ let idx = ({c_idx}) + split_id * params.m * params.n; {cell_store} }} }}\n"
+                ));
+            }
+            store_unrolled.push_str("    } }\n");
+        }
+    }
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
     } else {
@@ -1911,12 +2377,17 @@ fn matmul_vars_tiled(
     let src = preprocess(
         src,
         &[
+            ("$WARP_ROW_EXPR", warp_row_expr),
+            ("$WARP_COL_EXPR", warp_col_expr),
+            ("$FAST_LOOP_BODY", &fast_loop_body),
+            ("$STORE_UNROLLED", &store_unrolled),
+            ("$STAGE_BODY", &stage_body),
             ("$COMPUTE_BODY", &k_math),
+            ("$TAIL_COMPUTE_BODY", &compute_body),
             (
                 "$K_UNROLL_U",
-                &format!("{}u", if knobs.unroll_k { k_tile } else { 1 }),
+                &format!("{k_unroll}u"),
             ),
-            ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
             ("$B_LOAD_EXPR", &b_load_expr),
             ("$B_DEQUANT_FN", &b_dequant_fn),
@@ -1930,24 +2401,35 @@ fn matmul_vars_tiled(
             ("$B_ROW", b_row),
             ("$B_COL", b_col),
             ("$FUSED_ADD_DECL", &full_decl),
-            ("$STORE_BODY", &store_body),
+            ("$STORE_UNROLLED", &store_unrolled),
             ("$OUTPUT_COLUMN", &output_column),
+            ("$SHARED_ELEM", "f32"),
+            ("$THREADS_U", &format!("{threads}u")),
+            ("$WG_X_U", &format!("{}u", tile.wg_x())),
+            ("$WG_Y_U", &format!("{}u", tile.wg_y())),
             ("$BM_U", &format!("{bm}u")),
             ("$BN_U", &format!("{bn}u")),
             ("$TM_U", &format!("{tm}u")),
             ("$TN_U", &format!("{tn}u")),
-            ("$B_STRIDE_U", &format!("{}u", bn + 1)),
-            ("$A_STRIDE_U", &format!("{}u", k_tile + 1)),
+            ("$B_STRIDE_U", &format!("{}u", bn + 4)),
+            ("$A_STRIDE_U", &format!("{}u", bm + 4)),
             ("$K_TILE_U", &format!("{k_tile}u")),
-            ("$A_STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
-            ("$B_STAGE_EPT_U", &format!("{}u", bn * k_tile / 256)),
-            ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
-            ("$SHARED_B_SIZE", &(k_tile * (bn + 1)).to_string()),
+            ("$A_STAGE_EPT_U", &format!("{a_ept}u")),
+            ("$B_STAGE_EPT_U", &format!("{b_ept}u")),
+            ("$SHARED_A_SIZE", &shared_a_size.to_string()),
+            ("$SHARED_B_SIZE", &shared_b_size.to_string()),
             ("$ACC_DECL", &acc_decl),
             ("$ACC_ARRAY", &acc_array),
         ],
     );
-    matmul_module(&src, b_storage, None, copies)
+    let mut module = matmul_module(&src, b_storage, None, copies);
+    if threads == 512 {
+        let patched = module
+            .source
+            .replace("@workgroup_size(16, 16)", "@workgroup_size(16, 32)");
+        module = ShaderModule::new(&patched);
+    }
+    module
 }
 
 /// f16 → f32 for the packed-weight kernels' block scales.
@@ -3666,7 +4148,7 @@ mod tests {
             ),
             (
                 ShaderGroup::FlashAttention,
-                naga::valid::Capabilities::SUBGROUP,
+                naga::valid::Capabilities::empty(),
             ),
             (
                 ShaderGroup::FlashAttentionCoop,
@@ -3886,91 +4368,38 @@ mod tests {
         }
     }
 
-    /// Scalar backward kernels validate and stay inside the 16 KiB staging
-    /// budget at every head width, cap, precision and default subgroup
-    /// width. A width covering a query's lanes, and only such a width, makes
-    /// a subgroup kernel, which reads the live width to check it.
     #[test]
     fn scalar_attention_backward_staging_fits_16_kib() {
-        use crate::kernels::attention_grad::Part;
         for head_dim in [16, 32, 64, 80, 128, 256, 512, 1024] {
             for cap in [4, 8, 16, 32, 64] {
-                let (_, tpq) = attention_lanes(head_dim, cap);
-                for subgroup in [0, 32, 64] {
-                    for part in [Part::Q, Part::KV] {
-                        for f16 in [false, true] {
-                            let shader =
-                                generate_flash_grad_module(part, head_dim, cap, subgroup, 256, f16);
-                            let what = format!(
-                                "{part:?} head={head_dim} cap={cap} subgroup={subgroup} f16={f16}"
-                            );
-                            naga::valid::Validator::new(
-                                naga::valid::ValidationFlags::all()
-                                    & !naga::valid::ValidationFlags::BINDINGS,
-                                naga::valid::Capabilities::all(),
-                            )
-                            .validate(&shader.module)
-                            .unwrap_or_else(|error| panic!("{what}: {error:?}"));
-                            assert!(workgroup_bytes(&shader) <= 16384, "{what}");
-                            let reads_width = shader.module.entry_points[0]
-                                .function
-                                .arguments
-                                .iter()
-                                .any(|argument| {
-                                    argument.binding
-                                        == Some(naga::Binding::BuiltIn(naga::BuiltIn::SubgroupSize))
-                                });
-                            let covers =
-                                tpq > 1 && subgroup >= tpq && subgroup % tpq == 0 && 256 / tpq > 1;
-                            assert_eq!(reads_width, covers, "{what}");
+                for shader in [
+                    generate_flash_grad_q_module(head_dim, cap),
+                    generate_flash_grad_kv_module(head_dim, cap),
+                ] {
+                    naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all()
+                            & !naga::valid::ValidationFlags::BINDINGS,
+                        naga::valid::Capabilities::all(),
+                    )
+                    .validate(&shader.module)
+                    .unwrap();
+                    let mut layout = naga::proc::Layouter::default();
+                    layout.update(shader.module.to_ctx()).unwrap();
+                    let mut bytes = 0;
+                    for (_, var) in shader.module.global_variables.iter() {
+                        if var.space == naga::AddressSpace::WorkGroup {
+                            let ty = layout[var.ty];
+                            bytes = ty.alignment.round_up(bytes) + ty.size;
                         }
                     }
+                    assert!(
+                        bytes <= 16384,
+                        "{}: head={head_dim}, cap={cap}, bytes={bytes}",
+                        shader.hint
+                    );
                 }
             }
         }
-        // F16 tiles round Q/K/V once at the load. dO stays f32: Whisper's
-        // upstream gradients are smaller than the f16 normal range, and an
-        // f16 dO tile flushes v_proj to zero.
-        let kv = generate_flash_grad_module(Part::KV, 64, 16, 64, 128, true);
-        assert_eq!(
-            workgroup_element(&kv, "shared_q"),
-            (naga::ScalarKind::Float, 2)
-        );
-        assert_eq!(
-            workgroup_element(&kv, "shared_do"),
-            (naga::ScalarKind::Float, 4)
-        );
-    }
-
-    fn workgroup_bytes(shader: &ShaderModule) -> u32 {
-        let mut layout = naga::proc::Layouter::default();
-        layout.update(shader.module.to_ctx()).unwrap();
-        let mut bytes = 0;
-        for (_, var) in shader.module.global_variables.iter() {
-            if var.space == naga::AddressSpace::WorkGroup {
-                let ty = layout[var.ty];
-                bytes = ty.alignment.round_up(bytes) + ty.size;
-            }
-        }
-        bytes
-    }
-
-    /// Kind and byte width of the elements of workgroup array `name`.
-    fn workgroup_element(shader: &ShaderModule, name: &str) -> (naga::ScalarKind, u8) {
-        let module = &shader.module;
-        let (_, var) = module
-            .global_variables
-            .iter()
-            .find(|&(_, var)| var.name.as_deref() == Some(name))
-            .unwrap_or_else(|| panic!("no workgroup array {name}"));
-        let naga::TypeInner::Array { base, .. } = module.types[var.ty].inner else {
-            panic!("{name} is not an array");
-        };
-        let scalar = match module.types[base].inner {
-            naga::TypeInner::Scalar(scalar) | naga::TypeInner::Vector { scalar, .. } => scalar,
-            ref other => panic!("{name} holds {other:?}"),
-        };
-        (scalar.kind, scalar.width)
     }
 
     #[test]
@@ -4039,113 +4468,13 @@ mod tests {
                         naga::valid::Validator::new(
                             naga::valid::ValidationFlags::all()
                                 ^ naga::valid::ValidationFlags::BINDINGS,
-                            naga::valid::Capabilities::SUBGROUP,
+                            naga::valid::Capabilities::empty(),
                         )
                         .validate(&sm.module)
                         .unwrap();
                     }
                 }
             }
-        }
-        // F16 keys widen in the dot product; V stays F32 so a peaked
-        // softmax keeps its value.
-        let keys_only = generate_flash_attention_module_for_device(
-            64,
-            16,
-            FlashAttentionShape {
-                threads: 256,
-                keys: 8,
-                interleave: true,
-            },
-            true,
-            true,
-        );
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
-            naga::valid::Capabilities::SUBGROUP | naga::valid::Capabilities::SHADER_FLOAT16,
-        )
-        .validate(&keys_only.module)
-        .unwrap();
-        assert_eq!(
-            workgroup_element(&keys_only, "shared_k"),
-            (naga::ScalarKind::Float, 2)
-        );
-        assert_eq!(
-            workgroup_element(&keys_only, "shared_v"),
-            (naga::ScalarKind::Float, 4)
-        );
-    }
-
-    #[test]
-    fn flash_f16_staging_keeps_dot_accumulators_f32() {
-        for shader in [
-            generate_flash_attention_module_for_device(
-                64,
-                4,
-                FlashAttentionShape::default(),
-                true,
-                true,
-            ),
-            generate_flash_attention_module_for_device(
-                64,
-                4,
-                FlashAttentionShape::default(),
-                false,
-                true,
-            ),
-            generate_flash_attention_module_for_device(
-                64,
-                4,
-                FlashAttentionShape::default(),
-                true,
-                false,
-            ),
-            generate_flash_grad_module(
-                crate::kernels::attention_grad::Part::Q,
-                64,
-                4,
-                32,
-                256,
-                true,
-            ),
-            generate_flash_grad_module(
-                crate::kernels::attention_grad::Part::KV,
-                64,
-                4,
-                32,
-                256,
-                true,
-            ),
-        ] {
-            let info = naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all() & !naga::valid::ValidationFlags::BINDINGS,
-                naga::valid::Capabilities::all(),
-            )
-            .validate(&shader.module)
-            .unwrap();
-            let mut dots = 0;
-            for (index, entry) in shader.module.entry_points.iter().enumerate() {
-                for (handle, expression) in entry.function.expressions.iter() {
-                    if matches!(
-                        expression,
-                        naga::Expression::Math {
-                            fun: naga::MathFunction::Dot,
-                            ..
-                        }
-                    ) {
-                        dots += 1;
-                        assert_eq!(
-                            info.get_entry_point(index)[handle]
-                                .ty
-                                .inner_with(&shader.module.types),
-                            &naga::TypeInner::Scalar(naga::Scalar::F32),
-                            "{}",
-                            shader.hint
-                        );
-                    }
-                }
-            }
-            assert!(dots > 0, "{}", shader.hint);
         }
     }
 
@@ -4409,10 +4738,7 @@ mod tests {
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::MultiHeadAttn, empty),
-            (
-                ShaderGroup::FlashAttention,
-                naga::valid::Capabilities::SUBGROUP,
-            ),
+            (ShaderGroup::FlashAttention, empty),
             (ShaderGroup::FlashAttentionCoop, coop),
             (ShaderGroup::FlashAttentionCoopF32, coop),
             (ShaderGroup::SwiGLUGrad, empty),
@@ -5681,20 +6007,76 @@ mod tests {
                 "{group:?}: small and large epilogue shaders must differ"
             );
             let k_stage = crate::codegen::MatMulOptions::default().knobs.k_stage;
+            let shared = k_stage * (32 + 4);
             assert!(
                 small
                     .source
-                    .contains(&format!("array<f32, {}>", 32 * (k_stage + 1)))
-                    && small
-                        .source
-                        .contains(&format!("array<f32, {}>", k_stage * 33)),
+                    .contains(&format!("array<f32, {shared}>"))
+                    || (small.source.contains("var<workgroup> shared_a: array<f32,")
+                        && !small.source.contains(&format!("array<f32, {}>", k_stage * (64 + 4)))),
                 "{group:?}: small epilogue must stage 32-wide tiles at the requested K depth"
             );
             assert!(
-                !small.source.contains("flat / 64u") && !small.source.contains("flat % 64u"),
-                "{group:?}: small epilogue must not use 64-wide staging maps"
+                small.source.contains("32u") && !small.source.contains("@workgroup_size(16, 32)"),
+                "{group:?}: small epilogue must use 32-wide tile geometry"
             );
         }
+    }
+
+    /// 128×128 stays on the 16×16 workgroup, so each thread owns an 8×8
+    /// register tile. Shared memory and the staging map have to follow BM/BN,
+    /// or the extra accumulators read the 64-wide tile.
+    #[test]
+    fn wide_tile_is_an_eight_by_eight_register_tile() {
+        let shape = ScalarMatmulShape {
+            tile_size: 128,
+            tile_n: 0,
+            k_stage: 16,
+            interleave_columns: false,
+            unroll_k: false,
+        };
+        assert!(shape.legal());
+        assert_eq!(shape.geometry(), MatMulTile::Rect { bm: 128, bn: 128 });
+        assert!(
+            !ScalarMatmulShape {
+                tile_size: 256,
+                ..shape
+            }
+            .legal()
+        );
+        assert!(
+            !ScalarMatmulShape {
+                tile_n: 96,
+                ..shape
+            }
+            .legal()
+        );
+        let mut wide = generate_matmul_with_epilogue(
+            ShaderGroup::MatMul,
+            None,
+            MatMulOptions {
+                tile: shape.geometry(),
+                knobs: MatmulKnobs {
+                    k_stage: 16,
+                    ..MatmulKnobs::default()
+                },
+                ..MatMulOptions::default()
+            },
+        );
+        assert!(wide.source.contains("var s7_7 = 0.0;"));
+        assert!(!wide.source.contains("var s8_"));
+        let shared = 16 * (128 + 4);
+        assert!(
+            wide.source
+                .contains(&format!("array<f32, {shared}>"))
+                && wide.source.contains("var<workgroup> shared_a:")
+                && wide.source.contains("var<workgroup> shared_b:"),
+            "wide tile must stage 128-wide padded shared tiles"
+        );
+        assert!(wide.source.contains("@workgroup_size(16, 16)"));
+        assert!(wide.source.contains("ty * 16u + tx"));
+        validate_shader_for_test(&mut wide.module, naga::valid::Capabilities::empty(), (1, 3))
+            .unwrap_or_else(|error| panic!("{error}\n{}", wide.source));
     }
 }
 
