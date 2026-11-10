@@ -125,6 +125,7 @@ mod tests {
             name: "exact_division_test",
             data_layouts: &[&Data::layout()],
             compute: shader.at("main"),
+            full_subgroup_size: None,
         });
         let inputs = cases();
         let src = gpu.create_buffer(bg::BufferDesc {

@@ -1772,6 +1772,7 @@ fn create_profiled_pipeline(
         name: &name,
         data_layouts: &[layout],
         compute,
+        full_subgroup_size: None,
     })
 }
 
