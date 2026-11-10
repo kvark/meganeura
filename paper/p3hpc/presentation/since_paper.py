@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SHARED = ["nvidia-5070", "nvidia-h100", "amd-7900xt", "intel-b570", "apple-m3"]
+SHARED = ["nvidia-5070", "nvidia-h100", "nvidia-3050", "amd-7900xt", "intel-b570", "apple-m3"]
 STABLE = SHARED[:-1]  # Apple M3 times vary by tens of percent between processes.
 MODELS = ["SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny"]
 PHASES = ["inference", "latency", "training"]
@@ -39,13 +39,13 @@ def main(paper_csv):
         paired = [(a, b) for a, b in zip(old, new) if a is not None and b is not None]
         return [a for a, _ in paired], [b for _, b in paired]
 
-    for label, devices in (("five shared GPUs", SHARED), ("without the M3", STABLE)):
+    for label, devices in (("six shared GPUs", SHARED), ("without the M3", STABLE)):
         for precision in ("strict", "accelerated"):
             cells = []
             for phase in PHASES:
                 old, new = ratios(devices, precision, phase)
                 cells.append(f"{phase} {statistics.median(old):.2f} -> {statistics.median(new):.2f}")
-            print(f"{label:17s} {precision:11s} " + " | ".join(cells))
+            print(f"{label:16s} {precision:11s} " + " | ".join(cells))
 
     print("\nStrict time change, final cohort / September (median over workloads):")
     for engine, paper_key, talk_key in (("Meganeura", "meganeura", "native_ms"), ("PyTorch", "pytorch", "reference_ms")):

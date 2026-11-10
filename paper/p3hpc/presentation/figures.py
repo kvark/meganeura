@@ -21,7 +21,7 @@ INPUT = HERE / "data"
 TABLES = HERE.parent / "tables"
 OUTPUT = HERE / "figures"
 INK, TEAL, ORANGE, CANVAS, MUTED = "#23343b", "#006b70", "#a44616", "#faf9f6", "#637679"
-DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100",
+DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100", "nvidia-3050": "RTX 3050",
            "amd-7900xt": "RX 7900 XT", "amd-mi300": "MI300X", "intel-b570": "Arc B570", "apple-m3": "Apple M3"}
 MODELS = ["SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny"]
 SHORT = ["SmolLM2", "SmolVLA", "U-Net", "ResNet", "Whisper"]
@@ -35,7 +35,7 @@ plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 14, "text.color"
 ROWS = list(csv.DictReader((TABLES / "results.csv").open()))
 DATA = {(r["archive"], r["model"], r["precision"], r["phase"]): r for r in ROWS}
 assert len(DATA) == 372
-assert sum(bool(r["ratio"]) for r in ROWS) == 201
+assert sum(bool(r["ratio"]) for r in ROWS) == 231
 
 
 def save(fig, name):
@@ -143,11 +143,11 @@ def egraph():
     ax.set(xlim=(0, 720), ylim=(460, 0))
     ax.axis("off")
 
-    def eclass(x, y, width, height, label):
+    def eclass(x, y, width, height, label, label_dx=12):
         ax.add_patch(FancyBboxPatch((x, y), width, height,
                      boxstyle="round,pad=0,rounding_size=12", facecolor=CANVAS,
                      edgecolor=MUTED, linewidth=1.5, linestyle=(0, (4, 3)), zorder=1))
-        ax.text(x + 12, y - 9, label, fontsize=13, weight="bold", color=MUTED, va="bottom")
+        ax.text(x + label_dx, y - 9, label, fontsize=13, weight="bold", color=MUTED, va="bottom")
 
     def enode(x, y, width, label, added=False):
         ax.add_patch(FancyBboxPatch((x - width / 2, y - 19), width, 38,
@@ -168,7 +168,7 @@ def egraph():
     # Dashed boxes are equivalence classes; only operator nodes have outgoing edges.
     eclass(30, 38, 660, 100, "Y: one output e-class, two alternatives")
     eclass(40, 200, 210, 80, "P")
-    eclass(550, 200, 140, 80, "bias")
+    eclass(550, 200, 140, 80, "bias", label_dx=40)
     eclass(40, 348, 170, 64, "input")
     eclass(340, 348, 170, 64, "weights")
     enode(145, 88, 104, "Add")
@@ -179,13 +179,13 @@ def egraph():
     enode(425, 380, 72, "W")
 
     edge([(130, 107), (130, 200)])
-    edge([(175, 107), (205, 166), (590, 166), (590, 200)])
+    edge([(175, 107), (205, 166), (572, 166), (572, 200)])
     edge([(126, 259), (125, 348)])
     edge([(179, 259), (390, 348)])
     # The fused alternative shares X, W and b; it has no dependency on P.
     edge([(410, 107), (300, 180), (300, 310), (170, 348)], added=True)
     edge([(480, 107), (455, 348)], added=True)
-    edge([(550, 107), (650, 200)], added=True)
+    edge([(550, 107), (668, 200)], added=True)
 
     ax.text(30, 448, "Dashed box: e-class  ·  Solid box: e-node  ·  Teal: added by the rewrite",
             fontsize=12.5, va="center", color=MUTED)
@@ -239,14 +239,17 @@ def scaling():
     fig, axes = plt.subplots(1, 2, figsize=(11.56, 4.38))
     fig.subplots_adjust(left=.08, right=.98, top=.83, bottom=.25, wspace=.28)
     for ax, d in zip(axes, ["nvidia-h100", "amd-mi300"]):
-        for phase, title, color, lift in [("inference", "Prefill", TEAL, -17), ("training", "Training", ORANGE, 8)]:
+        for phase, title, color, below in [("inference", "Prefill", TEAL, True), ("training", "Training", ORANGE, False)]:
             rs = [DATA[d if size == "135M" else d + "-large", "SmolLM2-" + size, "strict", phase] for size in ["135M", "360M", "1.7B"]]
             vals = [float(r["ratio"]) for r in rs]
             ax.plot(range(3), vals, "o-", color=color, label=title, linewidth=2)
             for i, (r, v) in enumerate(zip(rs, vals)):
                 spread = ast.literal_eval(r["paired_ratios"])
                 ax.vlines(i, min(spread), max(spread), color=color, linewidth=3)
-                ax.annotate(f"{v:.2f}", (i, v), xytext=(0, lift), textcoords="offset points", ha="center", color=color, fontsize=12)
+                # Beside the point, away from its range bar: right of the first, left of the others.
+                side = 1 if i == 0 else -1
+                ax.annotate(f"{v:.2f}", (i, v), xytext=(6 * side, -15 if below else 6), textcoords="offset points",
+                            ha="left" if i == 0 else "right", color=color, fontsize=12)
         ax.set_title(DEVICES[d], loc="left", weight="bold")
         ax.set_xticks(range(3), ["135M", "360M", "1.7B"])
         ax.set_ylim(.9, 4.3)
@@ -270,7 +273,7 @@ def preparation_models():
             if row["model"] == model and row["precision"] == "strict" and row["reference_complete"] == "True":
                 devices[row["archive"]].append(row)
         devices = {d: group for d, group in devices.items() if len(group) == 3}
-        assert len(devices) == (5 if model in ("ResNet-50", "Whisper-tiny") else 6)
+        assert len(devices) == (6 if model in ("ResNet-50", "Whisper-tiny") else 7)
         assert all(len(group) == 3 for group in devices.values())
         values = [statistics.median(statistics.median(float(r[key]) for r in group)
                                    for group in devices.values())
@@ -284,7 +287,7 @@ def preparation_models():
     ax.spines[["top", "right"]].set_visible(False)
     fig.text(.20, .95, "Meganeura: all preparation, almost all of it search", color=TEAL, fontsize=13, weight="bold")
     fig.text(.20, .89, "PyTorch: compilation and first calls", color=ORANGE, fontsize=13, weight="bold")
-    fig.text(.20, .065, "Median across GPUs of three-process medians. ResNet and Whisper: 5 GPUs with complete PyTorch results.", fontsize=10)
+    fig.text(.20, .065, "Median across GPUs of three-process medians. ResNet and Whisper: 6 GPUs with complete PyTorch results.", fontsize=10)
     fig.text(.20, .018, "The columns cover different work under different limits.", fontsize=10)
     save(fig, "preparation-models.svg")
 
