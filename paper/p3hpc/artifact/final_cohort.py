@@ -22,9 +22,9 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 INFERENA = "a0799e4210eafa25161ec50d475b186c4b19d3da"
 MEGANEURA = "567028b805425375148e88a7e1d464fafdd99777"
-DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100",
+DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100", "nvidia-3050": "RTX 3050",
            "amd-7900xt": "RX 7900 XT", "amd-mi300": "MI300X", "intel-b570": "Arc B570", "apple-m3": "Apple M3"}
-QUALIFIERS = {"nvidia-3050": "RTX 3050", "amd-780m": "Radeon 780M", "amd-9600x": "Ryzen 9600X iGPU",
+QUALIFIERS = {"amd-780m": "Radeon 780M", "amd-9600x": "Ryzen 9600X iGPU",
               "intel-rplu": "Intel RPL-U", "qualcomm-adreno": "Quest 3S / Adreno 740"}
 MODELS = ("SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny")
 PHASES = ("inference", "latency", "training")

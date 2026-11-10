@@ -1,7 +1,8 @@
 # Final P3HPC evidence
 
 The paper and canonical `presentation/` use the October 31–November 1, 2026
-collection in `~/Downloads/p3hpc/`. `artifact/final_cohort.py` imports the
+collection in `~/Downloads/p3hpc/`, with the RTX 3050 archive replaced by a
+November 10 recollection at the same revisions and binaries. `artifact/final_cohort.py` imports the
 measured Inferena validators and regenerates the tables. All ratios are
 **Meganeura time / PyTorch time**; below one favors Meganeura. No older result
 fills a missing cell.
@@ -17,19 +18,19 @@ fills a missing cell.
 - Paired protocol v33, Android v15; 30-second native search per session,
   120-second reference compile allowance. Desktop warmup ten seconds,
   Android two; twenty samples and three processes for performance collection.
-- Sixteen archives, 272 native executions, 14.48 recorded device-hours.
+- Sixteen archives, 292 native executions, 15.56 recorded device-hours.
   All eight shared lockfile/model/corpus hash sets agree. Archive hashes are
   in [final-cohort.sha256](artifact/final-cohort.sha256).
-- Offline replay passes 262 desktop native receipt checks, 735 valid
+- Offline replay passes 282 desktop native receipt checks, 795 valid
   paired-phase receipt checks and ten Android full-tensor comparison receipt
   checks. Desktop before/after binary checks and completed-campaign final
   checks pass. Android archives omit raw NPZ tensors: this audit verifies
   hashed manifests and full comparison coverage, not the original arithmetic.
 
 All 330 core native cells pass (11 GPUs × 5 models × 2 profiles × 3 phases).
-Six GPUs supply 180 core native timing cells and 167 qualified ratios. Larger
-models add 42 native cells and 34 ratios: **222 native performance cells,
-201 paired ratios**, and 21 native times without a complete passing reference.
+Seven GPUs supply 210 core native timing cells and 197 qualified ratios. Larger
+models add 42 native cells and 34 ratios: **252 native performance cells,
+231 paired ratios**, and 21 native times without a complete passing reference.
 
 | Archive (canonical device key) | Native cells | Ratios | Collection |
 |---|---:|---:|---|
@@ -43,7 +44,7 @@ models add 42 native cells and 34 ratios: **222 native performance cells,
 | intel-b570 | 30/30 | 30 | three processes |
 | intel-b570-large | 6/6 | 4 | three processes |
 | intel-rplu | 30/30 | 0 | qualification only |
-| nvidia-3050 | 30/30 | 0 | qualification only |
+| nvidia-3050 | 30/30 | 30 | three processes |
 | nvidia-5070 | 30/30 | 30 | three processes |
 | nvidia-5070-large | 6/6 | 6 | three processes |
 | nvidia-h100 | 30/30 | 27 | three processes |
@@ -51,32 +52,40 @@ models add 42 native cells and 34 ratios: **222 native performance cells,
 | qualcomm-adreno | 30/30 | 0 | qualification only |
 
 The raw MI300X filenames contain `amd-mi300x`; the analyzer normalizes their
-device keys to `amd-mi300` for existing tables. RTX 3050 is now checked
-against CPU f32, without performance collection. Its previous GPU timings
-are not retained in the new tables. The other four correctness-only devices
-are the three integrated GPUs and Quest 3S; they contribute no CPU/GPU ratio.
+device keys to `amd-mi300` for existing tables. The four correctness-only
+devices are the three integrated GPUs and Quest 3S; they contribute no
+CPU/GPU ratio.
+
+The RTX 3050 (Windows 11, driver 610.88) is a timed GPU again. The November 1
+archive checked it against CPU f32 only (`backend = cpu`, one process). The
+November 10 archive (02:43–04:24 UTC) repeats it with compiled CUDA PyTorch
+and CUDA graph replay: three processes, all 30 runs valid, 30/30 ratios. It
+records the same Inferena and Meganeura revisions, the same runner binary
+hashes and the same four input hashes. The CPU-reference archive is kept as
+`nvidia-3050-orig.tgz` (SHA-256 `ae254fdb…fbf0`) and is not in the manifest.
+No other archive changed, and their rows in `results.csv` are byte-identical.
 
 ## Results and precision
 
 | Contract | Inference median (wins/pairs) | Minimal shape | Training |
 |---|---:|---:|---:|
-| Strict | 1.46 (9/30) | 0.97 (15/28) | 1.59 (4/28) |
-| Accelerated | 1.67 (5/27) | 1.01 (13/27) | 1.92 (5/27) |
+| Strict | 1.36 (11/35) | 0.96 (18/33) | 1.57 (4/33) |
+| Accelerated | 1.61 (6/32) | 1.16 (15/32) | 1.90 (5/32) |
 
 These are ratios of engine median process times. The main talk's combined
-inference/training median is 1.60 over 112 comparisons (58 strict, 54
-accelerated), geometric mean 1.66; 71/112 are below 2. This is an aggregate,
+inference/training median is 1.58 over 132 comparisons (68 strict, 64
+accelerated), geometric mean 1.65; 87/132 are below 2. This is an aggregate,
 not a bound. Minimal-shape duplicates are excluded from that combined figure.
 
-Reduced precision gives native median speedups of **1.19 inference / 1.05
-training**, against PyTorch's **1.46 / 1.64**, over each engine's own
+Reduced precision gives native median speedups of **1.26 inference / 1.05
+training**, against PyTorch's **1.50 / 1.56**, over each engine's own
 qualified strict/accelerated pairs. Matrix kernels are selected on every
 timed GPU. Of 42 accelerated core sessions per GPU, counts with matrix work
-are 39 RTX 5070, 36 H100, 36 RX 7900 XT, 37 MI300X, 36 B570 and 37 M3.
-BF16 occurs in three RTX 5070 and five B570 sessions. Selected descriptions
-request reduced derivative products in 9, 9, 8, 3, 7 and 0 sessions in that
-order. Private matrix-storage choices occur in three RX 7900 XT and four
-B570 sessions. Dispatch counts are neither time shares nor utilization.
+are 39 RTX 5070, 36 H100, 37 RTX 3050, 36 RX 7900 XT, 37 MI300X, 36 B570 and
+37 M3. BF16 occurs in three RTX 5070, three RTX 3050 and five B570 sessions.
+Selected descriptions request reduced derivative products in 9, 9, 8, 8, 3,
+7 and 0 sessions in that order. Private matrix-storage choices occur in eight
+RTX 3050, three RX 7900 XT and four B570 sessions. Dispatch counts are neither time shares nor utilization.
 
 The native arithmetic summary in the archived harness is partly stale: it
 still labels backward as f32 and describes private storage as Winograd-only.
@@ -97,8 +106,8 @@ was collected.
 profiles to identical qualified conditions and verifies the per-cell identity
 `R_acc = R_strict × (S_PyTorch / S_Meganeura)`. Geometric means preserve it:
 
-- 27 inference conditions: 1.24 → 1.66, gains 1.62 / 1.21, multiplier 1.34.
-- 25 training conditions: 1.54 → 2.21, gains 1.53 / 1.07, multiplier 1.44.
+- 32 inference conditions: 1.23 → 1.66, gains 1.68 / 1.24, multiplier 1.35.
+- 30 training conditions: 1.53 → 2.24, gains 1.58 / 1.08, multiplier 1.46.
 
 These differ from the main-table medians and are not a causal time partition.
 Reduced precision helps inference, but partial backward coverage and kernel
@@ -148,6 +157,7 @@ group medians and counts exceeding 10% are:
 |---|---:|---:|
 | RTX 5070 | 2.06% | 0/60 |
 | H100 | 0.45% | 0/57 |
+| RTX 3050 | 0.52% | 0/60 |
 | RX 7900 XT | 0.78% | 4/58 |
 | MI300X | 2.37% | 1/52 |
 | B570 | 0.58% | 1/60 |
@@ -156,17 +166,19 @@ group medians and counts exceeding 10% are:
 All repeats remain. M3 had sleep prevention enabled; no clock/power trace
 establishes the cause. Avoid interpreting small M3 differences as stable wins.
 
-The 504 core sessions measure 22,112 program trials; 248 (49%) select a
-non-default graph, and 396 (79%) end at the deadline. There are 46 numerical
-rejections and 15 scratch-limit trials. Search receipts sum to 186.6 minutes.
+The 588 core sessions measure 25,727 program trials; 297 (51%) select a
+non-default graph, and 462 (79%) end at the deadline. There are 56 numerical
+rejections and 38 scratch-limit trials (23 on the RTX 3050, 15 on the B570).
+Search receipts sum to 218.9 minutes.
 Strict preparation by workload, median across GPUs of complete three-process
-groups, spans 47–67 s native and 8–50 s PyTorch compilation/first calls;
+groups, spans 49–68 s native and 13–54 s PyTorch compilation/first calls;
 reference graph preparation is recorded separately. Non-search native work
 has median 1.7 s and range 0.18–70.87 s across all campaigns, so search does
-not dominate every process. The longest recorded reference compile is 100 s.
+not dominate every process. The longest recorded reference compile is 102 s
+(RTX 3050, accelerated U-Net).
 
-Core memo-state groups are 60 first-session misses and 120 reused decisions;
-all campaigns total 124 misses and 148 reused decisions. Native preparation
+Core memo-state groups are 70 first-session misses and 140 reused decisions;
+all campaigns total 124 misses and 168 reused decisions. Native preparation
 medians differ by 1.6–3.6 s per GPU, without a randomized cache control.
 Driver/page-cache coldness is not controlled. Selected programs are not
 persisted by this campaign memo; graph/program search repeats.
