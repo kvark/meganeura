@@ -19,9 +19,9 @@ Pick the closest entries to these:
 Can machine learning on NVIDIA GPUs run without CUDA? Meganeura, a 19 MiB Rust
 engine, compiles training and inference graphs to Vulkan compute shaders. It
 passes every numerical check on an RTX 3050 under Windows and on an RTX 5070
-and an H100 under Linux. Against compiled PyTorch 2.13 with CUDA graphs, it matches
-strict-f32 inference on the RTX 5070 (1.02×) and trails training by 1.5–1.8×,
-or 2.8–5.2× with BF16. Single-operation probes locate the losses in f32 GEMM
+and an H100 under Linux. Against compiled PyTorch 2.13 with CUDA graphs on all
+three, strict-f32 inference takes 1.02–1.30× as long and training 1.5–1.8×, or
+2.4–5.2× with BF16. Single-operation probes locate the losses in f32 GEMM
 kernels and host submission.
 
 ## Extended abstract and results
@@ -47,11 +47,11 @@ and three phases, 30 cells per GPU. Every native cell passes the numerical
 gates: 30 on the RTX 3050 (Ampere, Windows 11, driver 610.88), 36 on the
 RTX 5070 (Blackwell, Linux, driver 595.91.07, adding SmolLM2-360M), and 42 on
 the H100 80GB HBM3 (Hopper, Linux, 595.91.07, adding SmolLM2-360M and 1.7B;
-1.7B does not fit the RTX 5070's 12 GB). The RTX 3050 cells are checked
-against CPU PyTorch f32 and have no GPU timing comparison.
+1.7B does not fit the RTX 5070's 12 GB). All three are timed against CUDA
+PyTorch.
 
-**Benchmarking methodology.** Timing uses the RTX 5070 and H100, with driver
-595.91.07 serving both Vulkan and CUDA. The reference is PyTorch 2.13 with
+**Benchmarking methodology.** On each GPU one driver serves both Vulkan and
+CUDA: 610.88 under Windows and 595.91.07 under Linux. The reference is PyTorch 2.13 with
 `torch.compile` and CUDA graph replay. The five workloads are SmolLM2-135M
 (public checkpoint), the SmolVLA action expert, a scaled 10.9M-parameter
 Stable Diffusion 1.x U-Net, ResNet-50 with folded normalization, and the
@@ -67,21 +67,24 @@ reference build, using token KL for the language model at reduced precision.
 PyTorch checks its forward against eager f32 and its training against a
 matched SGD trajectory. Across engines, sampled outputs, loss and gradient
 norms must agree. Timing uses a 10 s warmup, 20 samples and three processes. We report Meganeura time
-divided by PyTorch time, so values below 1 favor Meganeura. Seventy-two NVIDIA
-ratios qualified: 57 in the core suite and 15 for the larger SmolLM2 models.
+divided by PyTorch time, so values below 1 favor Meganeura. Of the NVIDIA
+ratios, 102 qualified: 87 in the core suite and 15 for the larger SmolLM2 models.
 
-**Model results.** Strict-f32 geometric means are 1.02 (inference), 0.96
-(minimal shape) and 1.49 (training) on RTX 5070, and 1.30, 1.06 and 1.81 on
-H100. Meganeura is faster on RTX 5070 for ResNet-50 (0.74) and U-Net (0.80)
-inference and for the one-token SmolLM2 forward (0.84). Under reduced precision, the
-training ratios become 2.81 and 5.24. Over the same qualified models, BF16
-speeds PyTorch up 2.1–3.0× and Meganeura's searched precision policy 1.1–1.4×.
+**Model results.** Strict-f32 geometric means are 1.16 (inference), 0.97
+(minimal shape) and 1.53 (training) on the RTX 3050, 1.02, 0.96 and 1.49 on
+the RTX 5070, and 1.30, 1.06 and 1.81 on the H100. The Ampere card under
+Windows lands close to the Blackwell card under Linux. Meganeura is faster on
+RTX 5070 for ResNet-50 (0.74) and U-Net (0.80) inference and for the one-token
+SmolLM2 forward (0.84), and on RTX 3050 for U-Net (0.95) and ResNet-50 (0.98)
+inference. Under reduced precision, the training ratios become 2.42, 2.81 and
+5.24. Over the same qualified models, BF16 speeds PyTorch's inference and
+training up 1.9–3.0× and Meganeura's searched precision policy 1.1–1.4×.
 These are whole-model times that include unconverted operations, partial
 backward coverage and conversions, so they do not measure tensor-core kernels.
 The
 ratios compose exactly: RTX 5070 training goes from 1.49 to 1.49 × 2.27 / 1.20
-= 2.81. Whisper is the outlier, at 3.2× on RTX 5070 and 7.4× on H100 under
-reduced precision; the search has not found a competitive long-sequence
+= 2.81. Whisper is the outlier, at 3.1× on RTX 3050, 3.2× on RTX 5070 and 7.4×
+on H100 under reduced precision; the search has not found a competitive long-sequence
 attention. Larger models do not close the gap on H100: strict
 training goes from 1.86 at SmolLM2-135M to 1.96 at 360M and 3.77 at 1.7B
 (135.0 against 35.8 ms). On the RTX 5070, 360M strict ratios are 1.11
@@ -113,10 +116,10 @@ array (`array<array<f32,4>,8>`) reads zero for outer indices at or above the
 inner length. Our 8×4 GEMM tile first looked fast because it dropped half its
 rows. A flat accumulator avoids it. A raw-Vulkan reproducer is reported.
 
-**Significance.** Through Vulkan, an NVIDIA GPU already runs these
-strict-f32 inference workloads at CUDA PyTorch's speed, without vendor
-libraries, in a 19 MiB Linux binary that also drives other vendors' GPUs. The
-measured gaps point to the next steps. Persistent megakernels, now in
+**Significance.** Through Vulkan, NVIDIA GPUs from three generations already
+run these strict-f32 inference workloads at 1.02–1.30× CUDA PyTorch's time,
+under Windows and Linux, without vendor libraries. The Linux binary is 19 MiB
+and also drives other vendors' GPUs. The measured gaps point to the next steps. Persistent megakernels, now in
 development, run a region of the graph in one launch and schedule dependent
 tiles on the GPU through device-side queues, to cut submissions and barriers
 per step. Kernel discovery would let the search compose new kernels from tile,
@@ -127,5 +130,6 @@ Fused attention targets the long-sequence Whisper gap.
 archives and offline replay are in the companion P3HPC workshop paper at SC26,
 "Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training
 and Inference". Model results come from the October 31 – November 1, 2026
-cohort (Meganeura `567028b8`). Single operations were measured on November 8,
+cohort (Meganeura `567028b8`); the RTX 3050 was collected on November 10 at the
+same revisions. Single operations were measured on November 8,
 2026 (Meganeura `d32a495`).

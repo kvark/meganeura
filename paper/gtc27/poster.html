@@ -13,36 +13,36 @@
       <p class="byline">Dzmitry Malyshau · Independent Researcher · kvark@fastmail.com · <b>github.com/kvark/meganeura</b></p>
     </div>
     <div class="claim">
-      <p><b>A 19 MiB Rust engine</b> trains and runs models on NVIDIA GPUs through the Vulkan driver alone. Strict-f32 inference matches CUDA PyTorch on RTX&nbsp;5070; the gap is in training, reduced precision and a few kernels.</p>
+      <p><b>A 19 MiB Rust engine</b> trains and runs models on three NVIDIA GPUs, under Windows and Linux, through the Vulkan driver alone. In strict f32 it takes 1.0–1.3× CUDA PyTorch's time for inference and 1.5–1.8× for training. The gap widens at reduced precision.</p>
     </div>
   </header>
 
   <section class="col">
     <h2><span>1</span>Three NVIDIA GPUs, one engine</h2>
     <div class="gpus">
-      <div class="win">
+      <div>
         <p class="arch">Ampere · desktop</p>
         <h3>RTX 3050</h3>
-        <p class="os">Windows 11 · driver 610.88</p>
+        <p class="os"><b>Windows 11</b><br>driver 610.88</p>
         <p class="pass">30/30</p>
-        <p class="ref">checked against CPU PyTorch f32<br>core 30</p>
+        <p class="ref">five core workloads</p>
       </div>
       <div>
         <p class="arch">Blackwell · desktop</p>
         <h3>RTX 5070</h3>
-        <p class="os">Linux · driver 595.91.07</p>
+        <p class="os"><b>Linux</b><br>driver 595.91.07</p>
         <p class="pass">36/36</p>
-        <p class="ref">timed against PyTorch CUDA<br>core 30 + SmolLM2-360M</p>
+        <p class="ref">core + SmolLM2-360M</p>
       </div>
       <div>
         <p class="arch">Hopper · data center</p>
         <h3>H100 SXM</h3>
-        <p class="os">Linux · driver 595.91.07</p>
+        <p class="os"><b>Linux</b><br>driver 595.91.07</p>
         <p class="pass">42/42</p>
-        <p class="ref">timed against PyTorch CUDA<br>core 30 + SmolLM2-360M, 1.7B</p>
+        <p class="ref">core + SmolLM2-360M, 1.7B</p>
       </div>
     </div>
-    <p class="caption">Cells that pass the numerical gates; each workload has 2 precisions × 3 phases. The same Vulkan code path runs on Linux and Windows drivers.</p>
+    <p class="caption">Cells that pass the numerical gates: each workload runs at 2 precisions × 3 phases, and all three GPUs are timed against PyTorch CUDA. The same Vulkan code path serves the Windows and Linux drivers.</p>
 
     <div class="flow">
       <div>Tensor graph<small>+ autodiff</small></div>
@@ -70,25 +70,26 @@
         <tr><td>ResNet-50, folded norm</td><td>25.5M</td><td>4 images / 1 image, 224²</td><td>synthetic</td></tr>
         <tr><td>Whisper-tiny encoder</td><td>8.2M</td><td>80×3000 mel</td><td>synthetic</td></tr>
       </table>
-      <p><b>Phases:</b> full-shape forward; minimal-shape forward (one LLM token without a KV cache, so not decode latency); forward, loss and backward at full shape, without an optimizer update.</p>
+      <p><b>Phases:</b> inference is a full-shape forward; training is forward, loss and backward, without an optimizer update. A third phase, a minimal-shape forward (one LLM token without a KV cache, so not decode latency), is summarized under the grid.</p>
       <p><b>Gates:</b> Meganeura checks full outputs and single-step gradients against an f32 build; PyTorch checks its forward against eager f32 and its training against an SGD trajectory; across engines, sampled outputs, loss and gradient norms must agree. <b>Timing:</b> 10 s warmup, 20 samples, 3 processes.</p>
     </div>
   </section>
 
   <section class="col">
     <h2><span>2</span>Against CUDA PyTorch</h2>
-    <figure>
-      <img src="figures/ratios.svg" alt="Ratio grid: seven workloads by three phases, strict and reduced precision, on RTX 5070 and H100">
-      <figcaption>Meganeura time / PyTorch time (<b>below 1: Meganeura faster</b>). <b>Larger models do not close the gap on H100:</b> strict training goes from 1.86 at 135M to 3.77 at 1.7B. –: 1.7B does not fit the RTX 5070's 12 GB. n/q: no PyTorch result passed its gates.</figcaption>
-    </figure>
     <div class="tiles">
-      <div><p class="label">RTX 5070 · strict</p><p class="big">1.02<span>×</span></p><p>inference, geo. mean</p><p class="small">training 1.49</p></div>
-      <div><p class="label">H100 · strict</p><p class="big">1.30<span>×</span></p><p>inference</p><p class="small">training 1.81</p></div>
-      <div class="warm"><p class="label">RTX 5070 · reduced</p><p class="big">2.81<span>×</span></p><p>training</p><p class="small">H100 5.24</p></div>
+      <div><p class="label">RTX 3050 · Windows</p><p class="pair"><span>inference<b>1.16×</b></span><span>training<b>1.53×</b></span></p><p class="pair reduced"><span>reduced <b>1.64×</b></span><span>reduced <b>2.42×</b></span></p></div>
+      <div><p class="label">RTX 5070 · Linux</p><p class="pair"><span>inference<b>1.02×</b></span><span>training<b>1.49×</b></span></p><p class="pair reduced"><span>reduced <b>1.89×</b></span><span>reduced <b>2.81×</b></span></p></div>
+      <div><p class="label">H100 · Linux</p><p class="pair"><span>inference<b>1.30×</b></span><span>training<b>1.81×</b></span></p><p class="pair reduced"><span>reduced <b>3.55×</b></span><span>reduced <b>5.24×</b></span></p></div>
     </div>
+    <p class="caption">Meganeura time / PyTorch time, geometric mean over the five core workloads: strict f32 in large type, reduced precision below it. <b>The Ampere card under Windows lands close to the Blackwell card under Linux.</b></p>
+    <figure>
+      <img src="figures/ratios.svg" alt="Ratio grid: seven workloads, inference and training, strict and reduced precision, on RTX 3050, RTX 5070 and H100">
+      <figcaption>Every ratio (<b>below 1: Meganeura faster</b>). <b>Larger models do not close the gap on H100:</b> strict training goes from 1.86 at 135M to 3.77 at 1.7B. –: not run; 1.7B does not fit the RTX 5070's 12 GB, and the RTX 3050 ran the core suite. n/q: no PyTorch result passed its gates. Minimal-shape forwards, not shown, average 0.96–1.06× in strict f32.</figcaption>
+    </figure>
     <figure>
       <img src="figures/precision-gains.svg" alt="Speedup each engine gains from reduced precision, by GPU and phase">
-      <figcaption><b>The gap opens at reduced precision.</b> BF16 speeds PyTorch up 2.1–3.0×; Meganeura's precision policy 1.1–1.4×. These are whole-model gains (partial coverage, conversions included), not tensor-core kernel measurements.</figcaption>
+      <figcaption><b>The gap opens at reduced precision.</b> BF16 speeds PyTorch up 1.9–3.0×; Meganeura's precision policy 1.1–1.4×. These are whole-model gains (partial coverage, conversions included), not tensor-core kernel measurements.</figcaption>
     </figure>
   </section>
 
@@ -126,7 +127,7 @@
   </section>
 
   <footer>
-    <p>Model results: P3HPC cohort, October 31 – November 1, 2026 (Meganeura <code>567028b8</code>, PyTorch 2.13.0), 72 qualified NVIDIA ratios (57 core, 15 larger SmolLM2). Single operations: November 8, 2026, Meganeura <code>d32a495</code> on RX 7900 XT, RTX 5070 and Arc B570; they locate losses and do not partition model time. Protocol, archives and replay: D. Malyshau, “Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training and Inference,” P3HPC at SC26.</p>
+    <p>Model results: P3HPC cohort, October 31 – November 1, 2026, with the RTX 3050 collected November 10 (Meganeura <code>567028b8</code>, PyTorch 2.13.0): 102 qualified NVIDIA ratios (87 core, 15 larger SmolLM2). Single operations: November 8, 2026, Meganeura <code>d32a495</code> on RX 7900 XT, RTX 5070 and Arc B570; they locate losses and do not partition model time. Protocol, archives and replay: D. Malyshau, “Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training and Inference,” P3HPC at SC26.</p>
   </footer>
 </main>
 </body>
