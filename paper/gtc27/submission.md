@@ -27,7 +27,7 @@ computing; and the research framework above.
 
 ## Title (15 words maximum)
 
-Training and Inference on NVIDIA GPUs Through Vulkan: Where the Gap to CUDA Lies
+Training and Inference on NVIDIA GPUs Through Vulkan, Measured Against CUDA PyTorch
 
 ## Topics (up to two, from the portal's list)
 

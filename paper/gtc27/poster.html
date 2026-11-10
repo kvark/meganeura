@@ -9,7 +9,7 @@
 <main class="poster">
   <header class="masthead">
     <div>
-      <h1>Training and Inference on NVIDIA GPUs Through Vulkan: Where the Gap to CUDA Lies</h1>
+      <h1>Training and Inference on NVIDIA GPUs Through Vulkan, Measured Against CUDA PyTorch</h1>
       <p class="byline">Dzmitry Malyshau · Independent Researcher · kvark@fastmail.com · <b>github.com/kvark/meganeura</b></p>
     </div>
     <div class="claim">
@@ -110,12 +110,12 @@
     </div>
     <p class="caption">Geometric mean over the five core workloads: strict f32 in large type, reduced precision below it. <b>The Ampere card under Windows lands close to the Blackwell card under Linux.</b></p>
     <figure>
-      <img src="figures/ratios.svg" alt="Ratio grid: seven workloads, inference and training, strict and reduced precision, on RTX 3050, RTX 5070 and H100">
-      <figcaption>Every ratio (<b>below 1: Meganeura faster</b>). <b>Larger models do not close the gap on H100:</b> strict training goes from 1.86 at 135M to 3.77 at 1.7B. –: not run; 1.7B does not fit the RTX 5070's 12 GB, and the RTX 3050 ran the core suite. n/q: no PyTorch result passed its gates. Minimal-shape forwards, not shown, average 0.96–1.06× in strict f32.</figcaption>
+      <img src="figures/ratios.svg" alt="Strict-f32 ratio grid: seven workloads, inference and training, on RTX 3050, RTX 5070 and H100">
+      <figcaption>Strict f32, every workload (<b>below 1: Meganeura faster</b>). <b>Larger models do not close the gap on H100:</b> training goes from 1.86 at 135M to 3.77 at 1.7B. –: not run; 1.7B does not fit the RTX 5070's 12 GB, and the RTX 3050 ran the core suite. Minimal-shape forwards, not shown, average 0.96–1.06×.</figcaption>
     </figure>
     <figure>
       <img src="figures/precision-gains.svg" alt="Speedup each engine gains from reduced precision, by GPU and phase">
-      <figcaption><b>The gap opens at reduced precision.</b> BF16 speeds PyTorch up 1.9–3.0×; Meganeura's precision policy 1.1–1.4×. These are whole-model gains (partial coverage, conversions included), not tensor-core kernel measurements.</figcaption>
+      <figcaption><b>The gap opens at reduced precision.</b> BF16 speeds PyTorch up 1.9–3.0×; Meganeura's precision policy 1.1–1.4×. These are whole-model gains (partial coverage, conversions included), not tensor-core kernel measurements. Whisper is the widest case: its reduced-precision inference takes 3.1–7.4× PyTorch's time.</figcaption>
     </figure>
   </section>
 

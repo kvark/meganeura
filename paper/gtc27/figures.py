@@ -25,7 +25,7 @@ ROWS = [("SmolLM2-135M", "SmolLM2-135M", ""), ("SmolLM2-360M", "SmolLM2-360M", "
         ("SmolLM2-1.7B", "SmolLM2-1.7B", "-large"), ("SmolVLA", "SmolVLA", ""),
         ("SD U-Net", "StableDiffusion", ""), ("ResNet-50", "ResNet-50", ""), ("Whisper", "Whisper-tiny", "")]
 PROFILES = [("strict", "strict f32"), ("accelerated", "reduced")]
-PHASES = [("inference", "infer"), ("training", "train")]
+PHASES = ["inference", "training"]
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 22, "text.color": INK,
     "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
     "figure.facecolor": CANVAS, "axes.facecolor": CANVAS,
@@ -62,38 +62,37 @@ def shade(value):
 
 
 def ratio_grid():
-    """One heat grid per GPU: workloads by (precision, phase). Minimal-shape ratios stay in the caption."""
-    columns = [(profile, phase) for profile, _ in PROFILES for phase, _ in PHASES]
-    offsets = [0, 1, 2.2, 3.2]  # a gap between the strict and reduced pairs
-    height = (len(ROWS) + 1.6) * .9 + .08  # 0.9 in per row, header included
+    """One strict-f32 heat grid per GPU: workloads by phase.
+
+    Reduced precision is covered by the tiles and the gains chart, and minimal-shape ratios by the caption.
+    """
+    height = (len(ROWS) + 1.15) * .95 + .08  # 0.95 in per row, header included
     fig, axes = plt.subplots(1, len(DEVICES), figsize=(13.2, height), gridspec_kw={"wspace": .09})
     for ax, (device, (label, system)) in zip(axes, DEVICES.items()):
         for row, (_, model, suffix) in enumerate(ROWS):
-            for x, (profile, phase) in zip(offsets, columns):
-                if (device + suffix, model, profile, phase) not in DATA:
-                    ax.text(x + .5, row + .5, "–", ha="center", va="center", fontsize=21, color=MUTED)
+            for x, phase in enumerate(PHASES):
+                if (device + suffix, model, "strict", phase) not in DATA:
+                    ax.text(x + .5, row + .5, "–", ha="center", va="center", fontsize=24, color=MUTED)
                     continue
-                pair = times(device + suffix, model, profile, phase)
-                value = pair[0] / pair[1] if pair else None
+                native, reference = times(device + suffix, model, "strict", phase)
+                value = native / reference
                 fill, ink = shade(value)
-                ax.add_patch(Rectangle((x + .04, row + .05), .92, .9, facecolor=fill, linewidth=0))
-                text = "n/q" if value is None else f"{value:.2f}" if value < 10 else f"{value:.1f}"
-                ax.text(x + .5, row + .5, text, ha="center", va="center", fontsize=22, color=ink,
-                        weight="bold" if value and value < 1 else "normal")
-        ax.set_xlim(0, 4.2)
-        ax.set_ylim(len(ROWS), -1.6)
+                ax.add_patch(Rectangle((x + .025, row + .05), .95, .9, facecolor=fill, linewidth=0))
+                ax.text(x + .5, row + .5, f"{value:.2f}", ha="center", va="center", fontsize=26, color=ink,
+                        weight="bold" if value < 1 else "normal")
+        ax.set_xlim(0, len(PHASES))
+        ax.set_ylim(len(ROWS), -1.15)
         ax.set_xticks([])
         ax.set_yticks([r + .5 for r in range(len(ROWS))], [r[0] for r in ROWS] if ax is axes[0] else [],
                       fontsize=21)
         ax.tick_params(length=0)
         ax.spines[:].set_visible(False)
-        ax.text(.04, -1.3, label, ha="left", va="center", fontsize=27, weight="bold", color=INK)
-        ax.text(4.16, -1.3, system, ha="right", va="center", fontsize=19, color=MUTED)
-        for start, (_, name) in zip((0, 2.2), PROFILES):
-            ax.text(start + 1, -.82, name, ha="center", va="center", fontsize=20, color=INK)
-            ax.plot([start + .04, start + 1.96], [-.56, -.56], color=GRID, linewidth=2)
-            for i, (_, phase) in enumerate(PHASES):
-                ax.text(start + i + .5, -.27, phase, ha="center", va="center", fontsize=18, color=MUTED)
+        ax.text(.025, -.82, label, ha="left", va="center", fontsize=27, weight="bold", color=INK)
+        ax.text(len(PHASES) - .025, -.82, system, ha="right", va="center", fontsize=19, color=MUTED)
+        for x, phase in enumerate(PHASES):
+            ax.text(x + .5, -.27, phase, ha="center", va="center", fontsize=19, color=MUTED)
+    axes[0].text(-.04, -.27, "strict f32", transform=axes[0].get_yaxis_transform(), ha="right", va="center",
+                 fontsize=19, weight="bold", color=INK)
     fig.subplots_adjust(left=.175, right=.997, top=1 - .04 / height, bottom=.04 / height)
     save(fig, "ratios.svg")
 
@@ -102,7 +101,7 @@ def precision_gains():
     """Speedup each engine gets from its own reduced-precision path over strict f32, same conditions."""
     groups = []
     for device, (label, _) in DEVICES.items():
-        for phase, _ in PHASES:
+        for phase in PHASES:
             torch, native = [], []
             for model in MODELS:
                 strict, accel = times(device, model, "strict", phase), times(device, model, "accelerated", phase)
@@ -112,13 +111,13 @@ def precision_gains():
             groups.append((label, phase, geomean(torch), geomean(native)))
             print(f"{label:9s} {phase:9s} PyTorch {geomean(torch):.2f}  Meganeura {geomean(native):.2f}  n={len(torch)}")
     fig, ax = plt.subplots(figsize=(13.2, 5.5))
-    bar = .34
+    bar, gap = .31, .055  # each bar sits `gap` away from the group's centre line
     positions = [i + .45 * (i // len(PHASES)) for i in range(len(groups))]
     for y, (_, _, torch, native) in zip(positions, groups):
-        ax.barh(y - bar / 2 - .03, torch, bar, color=BROWN)
-        ax.barh(y + bar / 2 + .03, native, bar, color=TEAL)
-        ax.text(torch + .04, y - bar / 2 - .03, f"{torch:.2f}×", va="center", fontsize=17, color=INK)
-        ax.text(native + .04, y + bar / 2 + .03, f"{native:.2f}×", va="center", fontsize=17, color=INK)
+        ax.barh(y - bar / 2 - gap, torch, bar, color=BROWN)
+        ax.barh(y + bar / 2 + gap, native, bar, color=TEAL)
+        ax.text(torch + .04, y - bar / 2 - gap, f"{torch:.2f}×", va="center", fontsize=17, color=INK)
+        ax.text(native + .04, y + bar / 2 + gap, f"{native:.2f}×", va="center_baseline", fontsize=17, color=INK)
     ax.set_yticks(positions, [phase for _, phase, _, _ in groups], fontsize=18)
     for i, (label, _) in enumerate(DEVICES.values()):
         middle = (positions[i * len(PHASES)] + positions[(i + 1) * len(PHASES) - 1]) / 2
