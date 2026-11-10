@@ -1,12 +1,11 @@
 # Final qualification coverage
 
 All eleven GPUs pass five core models, two profiles and three phases:
-**330/330 cells**. Six GPUs provide performance samples; five are
+**330/330 cells**. Seven GPUs provide performance samples; four are
 correctness-only, with no published CPU/GPU timing ratio.
 
 | Qualification device | Native path | Independent oracle | Cells |
 |---|---|---|---:|
-| RTX 3050 | Vulkan | CPU PyTorch f32 | 30/30 |
 | Radeon 780M | Vulkan | CPU PyTorch f32 | 30/30 |
 | Ryzen 9600X iGPU | Vulkan | CPU PyTorch f32 | 30/30 |
 | Intel RPL-U | Vulkan | CPU PyTorch f32 | 30/30 |
@@ -18,8 +17,14 @@ omit raw NPZ tensors; replay audits the receipts, not original arithmetic.
 Configuration-specific GPU-reference availability does not turn CPU-oracle
 qualification into a paired GPU performance measurement.
 
-All 222 measured native cells, including 42 larger-model cells, qualify;
-201 have complete qualified PyTorch comparisons. B570 360M now completes:
+The RTX 3050 (Windows 11, driver 610.88) moved to the timed set. Its
+November 10 archive repeats the collection at the same revisions with
+compiled CUDA PyTorch as the reference: 30/30 native cells and 30 ratios.
+The earlier CPU-reference archive is `nvidia-3050-orig.tgz`, outside the
+manifest.
+
+All 252 measured native cells, including 42 larger-model cells, qualify;
+231 have complete qualified PyTorch comparisons. B570 360M now completes:
 all six native cells and four ratios, including every accelerated phase.
 One strict reference process fails gradient repeatability; strict training
 and its later one-token phase have no aggregated ratio. RTX 5070 accelerated

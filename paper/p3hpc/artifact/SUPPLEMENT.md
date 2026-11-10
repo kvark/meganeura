@@ -1,6 +1,7 @@
 # Meganeura P3HPC final supplement
 
-Final October 31–November 1, 2026 framework evidence for the P3HPC paper. Frozen sources:
+Final October 31–November 1, 2026 framework evidence for the P3HPC paper, with the
+RTX 3050 recollected on November 10 against compiled CUDA PyTorch. Frozen sources:
 Meganeura 567028b805425375148e88a7e1d464fafdd99777 and
 Inferena a0799e4210eafa25161ec50d475b186c4b19d3da. The old
 paper-p3hpc-2026-final tags point to earlier measurements.
@@ -32,7 +33,7 @@ python3 final_cohort.py archives --inferena /path/to/frozen/inferena \
   --check tables --output regenerated
 ```
 
-The command checks all archive digests, 262 desktop native receipts, 735
+The command checks all archive digests, 282 desktop native receipts, 795
 paired-phase receipts and ten Android full-tensor receipts, then reproduces
 the supplied tables and unrounded summaries. Android raw NPZ tensors are
 absent, so the audit verifies hashed manifests and complete comparison
@@ -44,9 +45,9 @@ one strict reference process fails gradient repeatability.
 
 All published ratios are Meganeura / PyTorch time: below one favors native.
 A cell is a model/profile/phase, with three processes when measured. All 330
-core native cells qualify across eleven GPUs. Six timed GPUs plus completed
-larger models contribute 222 native performance cells and 201 paired ratios.
-The other five devices are correctness-only. No outliers are removed; CSV
+core native cells qualify across eleven GPUs. Seven timed GPUs plus completed
+larger models contribute 252 native performance cells and 231 paired ratios.
+The other four devices are correctness-only. No outliers are removed; CSV
 process medians and paired ratios retain ranges, especially important on M3.
 Numerical gates affect both eligibility and search selection. Native
 single-step full-gradient fidelity is not the same as PyTorch's AMP training

@@ -33,8 +33,11 @@ these are not confidence intervals. No outliers are dropped.
 
 ## Interpretation
 
-- Eleven GPUs pass 330/330 core native cells. Six measured GPUs plus completed
-  larger models supply 222 native performance cells and 201 paired ratios.
+- Eleven GPUs pass 330/330 core native cells. Seven measured GPUs plus completed
+  larger models supply 252 native performance cells and 231 paired ratios.
+- The RTX 3050 archive is a November 10 recollection at the same revisions and
+  binaries, with compiled CUDA PyTorch in place of the earlier CPU reference.
+  `nvidia-3050-orig.tgz`, the CPU-reference archive, is not in the manifest.
 - B570 360M completes all six native cells; four have ratios. One strict
   reference process fails gradient repeatability, leaving no aggregated
   strict training or subsequent latency ratio. All accelerated phases pass.
@@ -51,7 +54,7 @@ these are not confidence intervals. No outliers are dropped.
   full-tensor comparison receipts, not the original tensor arithmetic.
 
 The [result ledger](../RESULTS.md) and paper give failure details and policy.
-The five correctness-only GPUs never contribute CPU/GPU timing ratios.
+The four correctness-only GPUs never contribute CPU/GPU timing ratios.
 
 ## Separate warmup diagnostic
 
@@ -68,7 +71,7 @@ study archive; this supplement carries the summary and provenance only.
 After building the paper, `submission.py` requires `--inferena` and validates
 the data against the checked-in tables before writing a source ZIP and a
 supplement. The supplement retains the original sixteen archives (about
-147 MiB compressed), the analyzers and compact generated inputs. It does not
+157 MiB compressed), the analyzers and compact generated inputs. It does not
 include the old search ablation. It also carries the separate single-op
 summary, available process rows and runners as a repository-shaped overlay.
 See [SUPPLEMENT.md](SUPPLEMENT.md).

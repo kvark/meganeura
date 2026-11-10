@@ -10,10 +10,10 @@
 \subsection{Paper's Main Contributions}
 \begin{description}
 \item[$C_1$] A numerically qualified Vulkan/Metal training and inference
-comparison with compiled PyTorch on six GPUs, including models up to 1.7B.
+comparison with compiled PyTorch on seven GPUs, including models up to 1.7B.
 \item[$C_2$] Search selection and preparation measurements, with explicit
 kernel-decision cache states and numerical-policy limitations.
-\item[$C_3$] Additional qualification on RTX~3050, three integrated GPUs and Quest~3S,
+\item[$C_3$] Additional qualification on three integrated GPUs and Quest~3S,
 experimental MI300X Vulkan support, and an XR queue-sharing application.
 \item[$C_4$] Matched-condition gap accounting and a separate single-operation
 study identifying kernel losses.
@@ -57,10 +57,10 @@ are not substituted for missing final-cohort measurements.
 
 \artexp
 Offline replay regenerates eight TeX fragments, a CSV with all process medians
-and paired-ratio ranges, and coverage/search summaries. It rechecks 262
-desktop native receipts, 735 valid paired-phase receipts, and ten Android
+and paired-ratio ranges, and coverage/search summaries. It rechecks 282
+desktop native receipts, 795 valid paired-phase receipts, and ten Android
 full-tensor comparison receipts. All 330 core native cells qualify, as do
-222 completed measured native cells including larger models; 201 have ratios.
+252 completed measured native cells including larger models; 231 have ratios.
 B570 360M completes all native cells; one strict reference process fails
 repeatability. All rejected references remain visible.
 Android archives omit the raw NPZ tensors: replay verifies hashes and
@@ -69,16 +69,17 @@ reproduce the procedure, not the exact timing noise or driver failures.
 
 \arttime
 Offline analysis takes minutes and needs no GPU. The recorded campaigns sum
-to 14.48 device-hours; setup, downloads, and unarchived bring-up are excluded.
+to 15.56 device-hours; setup, downloads, and unarchived bring-up are excluded.
 A fresh full collection needs access to all eleven devices. It is not
 required to regenerate the paper's results.
 
 \artin
 \artinpart{Hardware}
 A CPU and several GiB of temporary disk suffice for offline replay.
-Performance devices are RTX~5070, H100, RX~7900~XT, MI300X,
-Arc~B570, and M3. RTX~3050, Radeon~780M, Ryzen~9600X iGPU, RPL-U, and Quest~3S
-supply qualification only. Device and driver identities are in the manifests.
+Performance devices are RTX~5070, H100, RTX~3050, RX~7900~XT, MI300X,
+Arc~B570, and M3. Radeon~780M, Ryzen~9600X iGPU, RPL-U, and Quest~3S
+supply qualification only. The RTX~3050 archive is a November~10 recollection
+at the same revisions. Device and driver identities are in the manifests.
 MI300X needs the experimental Mesa and AMDGPU patches of
 Section~\ref{sec:availability}; both are public in a draft Mesa merge request.
 

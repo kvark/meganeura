@@ -3,7 +3,8 @@
 ## P3HPC (SC26 workshop)
 
 The current paper is [p3hpc/main.tex](p3hpc/main.tex). It and the
-[presentation](p3hpc/presentation/slides.md) use the final October 31–November 1, 2026 cohort:
+[presentation](p3hpc/presentation/slides.md) use the final October 31–November 1, 2026 cohort,
+with the RTX 3050 recollected on November 10 against compiled CUDA PyTorch:
 Inferena `a0799e4210eafa25161ec50d475b186c4b19d3da`, Meganeura
 `567028b805425375148e88a7e1d464fafdd99777`, and PyTorch 2.13.0 at `cf30153c`.
 The older `paper-p3hpc-2026-final` tags do **not** identify this collection.
@@ -13,9 +14,9 @@ and provenance are documented in [RESULTS.md](p3hpc/RESULTS.md).
 
 [RESULTS.md](p3hpc/RESULTS.md) records the audit, failures, numerical-policy
 limits, timing uncertainty, footprint and MI300X driver provenance. [QUALIFICATION.md](p3hpc/QUALIFICATION.md)
-separates the five correctness-only platforms from the six timed GPUs.
+separates the four correctness-only platforms from the seven timed GPUs.
 All 330 core native cells pass; core plus completed large-model runs supply
-222 native performance cells and 201 qualified paired comparisons.
+252 native performance cells and 231 qualified paired comparisons.
 Raw archives, PDFs and ZIPs stay outside Git.
 
 ### Presentation
