@@ -157,6 +157,7 @@ figcaption b { color: var(--ink); }
   line-height: 1.27;
 }
 .box p { margin: 0; }
+.box p + p { margin-top: 0.08in; }
 .box.next { background: var(--tint); border-left-color: var(--teal); }
 
 footer {
@@ -238,4 +239,3 @@ table.models th { text-align: left; color: var(--muted); font-size: 17pt; text-t
 table.models td { padding: 7pt 6pt; border-bottom: 1pt solid var(--line); }
 table.models td:first-child { font-weight: bold; color: var(--deep); }
 table.models td:nth-child(2) { text-align: right; white-space: nowrap; }
-table.models tr.large td { background: #e3ecda; }

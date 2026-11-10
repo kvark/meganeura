@@ -20,6 +20,13 @@
   <section class="col">
     <h2><span>1</span>Three NVIDIA GPUs, one engine</h2>
     <div class="gpus">
+      <div class="win">
+        <p class="arch">Ampere · desktop</p>
+        <h3>RTX 3050</h3>
+        <p class="os">Windows 11 · driver 610.88</p>
+        <p class="pass">30/30</p>
+        <p class="ref">checked against CPU PyTorch f32<br>core 30</p>
+      </div>
       <div>
         <p class="arch">Blackwell · desktop</p>
         <h3>RTX 5070</h3>
@@ -33,13 +40,6 @@
         <p class="os">Linux · driver 595.91.07</p>
         <p class="pass">42/42</p>
         <p class="ref">timed against PyTorch CUDA<br>core 30 + SmolLM2-360M, 1.7B</p>
-      </div>
-      <div class="win">
-        <p class="arch">Ampere · desktop</p>
-        <h3>RTX 3050</h3>
-        <p class="os">Windows 11 · driver 610.88</p>
-        <p class="pass">30/30</p>
-        <p class="ref">checked against CPU PyTorch f32<br>core 30</p>
       </div>
     </div>
     <p class="caption">Cells that pass the numerical gates; each workload has 2 precisions × 3 phases. The same Vulkan code path runs on Linux and Windows drivers.</p>
@@ -64,13 +64,11 @@
       <p><b>Reference:</b> PyTorch 2.13, <code>torch.compile</code>, CUDA graph replay. <b>Strict:</b> f32 throughout, TF32 off. <b>Reduced:</b> PyTorch autocast BF16; Meganeura searches F16/BF16 products, with f32 parameters, loss and accumulation.</p>
       <table class="models">
         <tr><th>Workload</th><th>Params</th><th>Full / minimal shape</th><th>Weights</th></tr>
-        <tr><td>SmolLM2-135M</td><td>134.5M</td><td>128-token prefill / 1 token</td><td>public</td></tr>
+        <tr><td>SmolLM2</td><td>135M, 360M, 1.7B</td><td>128-token prefill / 1 token</td><td>public</td></tr>
         <tr><td>SmolVLA action expert</td><td>99.9M</td><td>50 actions / 1 action</td><td>synthetic</td></tr>
         <tr><td>SD 1.x U-Net, scaled</td><td>10.9M</td><td>4×32×32 latent, 77-token context</td><td>synthetic</td></tr>
         <tr><td>ResNet-50, folded norm</td><td>25.5M</td><td>4 images / 1 image, 224²</td><td>synthetic</td></tr>
         <tr><td>Whisper-tiny encoder</td><td>8.2M</td><td>80×3000 mel</td><td>synthetic</td></tr>
-        <tr class="large"><td>SmolLM2-360M</td><td>362M</td><td colspan="2">as 135M · RTX 5070 and H100</td></tr>
-        <tr class="large"><td>SmolLM2-1.7B</td><td>1.71B</td><td colspan="2">as 135M · H100</td></tr>
       </table>
       <p><b>Phases:</b> full-shape forward; minimal-shape forward (one LLM token without a KV cache, so not decode latency); forward, loss and backward at full shape, without an optimizer update.</p>
       <p><b>Gates:</b> Meganeura checks full outputs and single-step gradients against an f32 build; PyTorch checks its forward against eager f32 and its training against an SGD trajectory; across engines, sampled outputs, loss and gradient norms must agree. <b>Timing:</b> 10 s warmup, 20 samples, 3 processes.</p>
@@ -80,12 +78,8 @@
   <section class="col">
     <h2><span>2</span>Against CUDA PyTorch</h2>
     <figure>
-      <img src="figures/ratios.svg" alt="Ratio grid: five workloads by three phases, strict and reduced precision, on RTX 5070 and H100">
-      <figcaption>Meganeura time / PyTorch time (<b>below 1: Meganeura faster</b>). n/q: no qualified PyTorch reference.</figcaption>
-    </figure>
-    <figure>
-      <img src="figures/sizes.svg" alt="SmolLM2 ratios at 135M, 360M and 1.7B on RTX 5070 and H100">
-      <figcaption><b>Larger models do not close the gap on H100:</b> strict training goes from 1.86 at 135M to 3.77 at 1.7B (135 vs 36 ms). –: 1.7B does not fit the RTX 5070's 12 GB. n/q: PyTorch failed the worst-token KL gate.</figcaption>
+      <img src="figures/ratios.svg" alt="Ratio grid: seven workloads by three phases, strict and reduced precision, on RTX 5070 and H100">
+      <figcaption>Meganeura time / PyTorch time (<b>below 1: Meganeura faster</b>). <b>Larger models do not close the gap on H100:</b> strict training goes from 1.86 at 135M to 3.77 at 1.7B. –: 1.7B does not fit the RTX 5070's 12 GB. n/q: no PyTorch result passed its gates.</figcaption>
     </figure>
     <div class="tiles">
       <div><p class="label">RTX 5070 · strict</p><p class="big">1.02<span>×</span></p><p>inference, geo. mean</p><p class="small">training 1.49</p></div>
@@ -111,7 +105,7 @@
       <tr><td>Dependent dispatch</td><td>Tiny add after a barrier</td><td class="near">0.28×</td><td class="nv">1.1×</td><td class="near">0.20×</td></tr>
       <tr><td>Submit and wait</td><td>One tiny add, host time</td><td>1.4×</td><td class="nv far">2.8×</td><td class="far">5.1×</td></tr>
     </table>
-    <p class="lead"><b>The submission round trip is now the clearest target.</b> Split-K took the worst small GEMM from 4.4× to 2.0×, and a larger tile took the Arc's 4096³ GEMM from 2.2× to 1.3×.</p>
+    <p class="lead"><b>Submitting work costs more than running it.</b> Inside one command buffer, a dependent dispatch costs 1.1× what it does in a CUDA graph. A host submit-and-wait round trip costs 2.8×.</p>
     <div class="nvstats">
       <div><p class="big">11.8 <span>vs</span> 19.9</p><p>TFLOP/s, 4096³ GEMM<br>Meganeura vs cuBLAS</p></div>
       <div><p class="big">11 <span>vs</span> 6</p><p>µs, 64×1024×256 GEMM<br>was 25 before split-K</p></div>
@@ -125,7 +119,9 @@
     </div>
     <div class="box next">
       <h3>Next</h3>
-      <p>Cooperative-matrix GEMM against cuBLAS BF16 · fused attention · <code>VK_NV_cooperative_matrix2</code> · fewer round trips per step.</p>
+      <p><b>Persistent megakernels</b> (in progress): one launch runs a region of the graph, and the GPU schedules dependent tiles through device-side queues, to cut submissions and barriers per step.</p>
+      <p><b>Kernel discovery:</b> let the search compose new kernels from tile, staging and fusion choices, beyond the hand-written variants it times today.</p>
+      <p><b>Fused attention</b> for long sequences, where Whisper trails most.</p>
     </div>
   </section>
 

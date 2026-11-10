@@ -18,8 +18,8 @@ Pick the closest entries to these:
 
 Can machine learning on NVIDIA GPUs run without CUDA? Meganeura, a 19 MiB Rust
 engine, compiles training and inference graphs to Vulkan compute shaders. It
-passes every numerical check on an RTX 5070 and an H100 under Linux and on an
-RTX 3050 under Windows. Against compiled PyTorch 2.13 with CUDA graphs, it matches
+passes every numerical check on an RTX 3050 under Windows and on an RTX 5070
+and an H100 under Linux. Against compiled PyTorch 2.13 with CUDA graphs, it matches
 strict-f32 inference on the RTX 5070 (1.02×) and trails training by 1.5–1.8×,
 or 2.8–5.2× with BF16. Single-operation probes locate the losses in f32 GEMM
 kernels and host submission.
@@ -44,12 +44,11 @@ the poster covers NVIDIA.
 
 **Three NVIDIA GPUs.** The core suite is five workloads under two precisions
 and three phases, 30 cells per GPU. Every native cell passes the numerical
-gates: 36 on the RTX 5070 (Blackwell, Linux, driver 595.91.07, adding
-SmolLM2-360M), 42 on the H100 80GB HBM3 (Hopper, Linux, 595.91.07, adding
-SmolLM2-360M and 1.7B; 1.7B does not fit the RTX 5070's 12 GB), and 30 on the
-RTX 3050 (Ampere, Windows 11, driver
-610.88). The RTX 3050 cells are checked against CPU PyTorch f32 and have no
-GPU timing comparison.
+gates: 30 on the RTX 3050 (Ampere, Windows 11, driver 610.88), 36 on the
+RTX 5070 (Blackwell, Linux, driver 595.91.07, adding SmolLM2-360M), and 42 on
+the H100 80GB HBM3 (Hopper, Linux, 595.91.07, adding SmolLM2-360M and 1.7B;
+1.7B does not fit the RTX 5070's 12 GB). The RTX 3050 cells are checked
+against CPU PyTorch f32 and have no GPU timing comparison.
 
 **Benchmarking methodology.** Timing uses the RTX 5070 and H100, with driver
 595.91.07 serving both Vulkan and CUDA. The reference is PyTorch 2.13 with
@@ -99,11 +98,13 @@ context; both engines run 30 serial copies. On the RTX 5070:
   4.40× to 1.88×, adding one reduction dispatch per product.
 - Winograd 3×3 convolutions take 0.34–0.64× of cuDNN's batch-1 time.
 - A dependent dispatch with a barrier costs 0.97 µs, against 0.85 µs per op
-  inside a CUDA graph. One host submit-and-wait takes 19.4 µs against 6.9 µs.
+  inside a CUDA graph. One host submit-and-wait takes 19.4 µs against 6.9 µs,
+  so submitting work costs more than running it.
 - These probes run with cooperative matrices off, so tensor-core kernel
-  efficiency is not yet isolated. The WGSL/SPIR-V path exposes 16×16 F16/BF16
-  tiles, but no TF32 inputs and no control of Hopper warpgroup MMA, TMA or
-  clusters. How much of the H100 gap these explain needs kernel-level profiles.
+  efficiency is not yet isolated. The search already times 16×16 F16/BF16
+  subgroup tiles and larger workgroup tiles from `VK_NV_cooperative_matrix2`,
+  but the path has no TF32 inputs and no control of Hopper warpgroup MMA, TMA
+  or clusters. How much of the H100 gap these explain needs kernel-level profiles.
 
 These ratios locate implementation losses. They do not partition model time.
 
@@ -115,9 +116,12 @@ rows. A flat accumulator avoids it. A raw-Vulkan reproducer is reported.
 **Significance.** Through Vulkan, an NVIDIA GPU already runs these
 strict-f32 inference workloads at CUDA PyTorch's speed, without vendor
 libraries, in a 19 MiB Linux binary that also drives other vendors' GPUs. The
-measured gaps point to concrete work: f32 GEMM tiles, cooperative-matrix GEMM
-probes against cuBLAS BF16, fused attention, `VK_NV_cooperative_matrix2`, and
-fewer host round trips per step.
+measured gaps point to the next steps. Persistent megakernels, now in
+development, run a region of the graph in one launch and schedule dependent
+tiles on the GPU through device-side queues, to cut submissions and barriers
+per step. Kernel discovery would let the search compose new kernels from tile,
+staging and fusion choices, beyond the hand-written variants it times today.
+Fused attention targets the long-sequence Whisper gap.
 
 **Availability.** Source: https://github.com/kvark/meganeura. Full protocol,
 archives and offline replay are in the companion P3HPC workshop paper at SC26,

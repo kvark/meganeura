@@ -84,7 +84,7 @@ def ratio_grid(rows, name, height):
         ax.text(3.125, -1.0, label, ha="center", va="center", fontsize=25, weight="bold", color=INK)
         ax.text(1.5, -.45, "strict f32", ha="center", va="center", fontsize=19, color=MUTED)
         ax.text(4.75, -.45, "reduced precision", ha="center", va="center", fontsize=19, color=MUTED)
-    # Keep the cell size of the five-row grid: 8.6 in holds 6.15 grid units plus axis labels.
+    # 1.2 in per grid unit (rows plus the 1.15 header) and 1.2 in of axis labels.
     fig.subplots_adjust(left=.19, right=.995, top=1 - .08 / height, bottom=1.12 / height)
     save(fig, name)
 
@@ -127,7 +127,7 @@ def precision_gains():
     save(fig, "precision-gains.svg")
 
 
-ratio_grid([(short, model, "") for short, model in zip(SHORT, MODELS)], "ratios.svg", 8.6)
-ratio_grid([("SmolLM2-360M", "SmolLM2-360M", "-large"), ("SmolLM2-1.7B", "SmolLM2-1.7B", "-large")],
-           "sizes.svg", 5.0)
+LARGE = [("SmolLM2-360M", "SmolLM2-360M", "-large"), ("SmolLM2-1.7B", "SmolLM2-1.7B", "-large")]
+CORE = [(short, model, "") for short, model in zip(SHORT, MODELS)]
+ratio_grid(CORE[:1] + LARGE + CORE[1:], "ratios.svg", 11.0)
 precision_gains()
