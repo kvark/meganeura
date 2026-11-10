@@ -3482,6 +3482,11 @@ pub struct SessionOptions {
     pub no_alias: bool,
     /// Keep every buffer host-visible instead of device-local.
     pub no_device_local: bool,
+    /// Place parameters, inputs, outputs and loss in device-local memory and
+    /// access them through staging transfers. Reduces host-visible/BAR traffic
+    /// for GPU-bound inference and benchmarks; `input_host_ptr()` returns
+    /// `None` for device-local inputs.
+    pub device_local_io: bool,
     /// Fill every allocation that holds no parameter with NaN (all bits set)
     /// instead of zero at session build. Constants are still uploaded, and
     /// inputs are whatever the caller writes. A kernel that reads memory no
@@ -4331,15 +4336,26 @@ impl Session {
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
         let memory_plan_span = tracing::info_span!("memory_plan").entered();
+        let device_local_io = opts.device_local_io && !opts.no_device_local;
         let mut alias = if opts.debug || opts.no_alias {
             if opts.debug {
                 log::info!("debug session: buffer aliasing disabled");
             } else {
                 log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
             }
-            crate::memplan::plan_no_alias(&plan, &groups, opts.pin_buffers.as_deref())
+            crate::memplan::plan_no_alias(
+                &plan,
+                &groups,
+                opts.pin_buffers.as_deref(),
+                device_local_io,
+            )
         } else {
-            crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
+            crate::memplan::plan_buffer_aliasing(
+                &plan,
+                &groups,
+                opts.pin_buffers.as_deref(),
+                device_local_io,
+            )
         };
         alias.pack_arena(
             &plan,
@@ -6039,14 +6055,14 @@ mod split_k_tests {
         crate::compile::schedule_dispatches(&mut plan, false, false);
         let groups = plan.groups.clone();
         assert_eq!(groups, [0..1, 1..2, 2..3, 3..4]);
-        let alias = crate::memplan::plan_buffer_aliasing(&plan, &groups, None);
+        let alias = crate::memplan::plan_buffer_aliasing(&plan, &groups, None, false);
         assert_eq!(alias.map[4], alias.map[5]);
         assert_eq!(alias.sizes[alias.map[4]], bytes * 2);
         assert!(alias.device_local[alias.map[4]]);
         for i in 0..4 {
             assert_ne!(alias.map[i], alias.map[4]);
         }
-        let no_alias = crate::memplan::plan_no_alias(&plan, &groups, None);
+        let no_alias = crate::memplan::plan_no_alias(&plan, &groups, None, false);
         assert_eq!(
             no_alias.physical_bytes() - alias.physical_bytes(),
             bytes * 2
