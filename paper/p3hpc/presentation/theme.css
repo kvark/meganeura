@@ -120,8 +120,9 @@ section.limits table { font-size: 29px; margin-bottom: 24px; }
 section.limits th, section.limits td { padding: 19px 16px; }
 section.paths { font-size: 25px; }
 section.paths table { font-size: 23px; }
-section.paths th, section.paths td { padding: 9px 12px; }
-section.paths th:last-child { width: 22%; }
+section.paths th, section.paths td { padding: 6px 12px; }
+section.paths th:last-child { width: 30%; }
+section.paths td:first-child { white-space: nowrap; }
 
 .game-intro { display: grid; grid-template-columns: 1fr 1.1fr; gap: 38px; align-items: center; }
 .game-intro blockquote { font-size: 33px; margin: 20px 0 25px; padding: 5px 18px; }
@@ -190,6 +191,7 @@ table.tiles { font-size: 21px; margin: 0; }
 table.tiles th, table.tiles td { padding: 8px 10px; }
 table.tiles td:not(:first-child), table.tiles th:not(:first-child) { text-align: center; }
 table.tiles td.tile { color: #637679; font-size: 18px; }
+table.tiles td:first-child { white-space: nowrap; }
 .dot { color: #006b70; font-size: 26px; line-height: 1; }
 .no { color: #c3cccb; }
 section.features > p { font-size: 23px; margin: 12px 0 0; }

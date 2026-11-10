@@ -30,7 +30,8 @@ learning on a device, where the policy keeps learning after deployment.
 
 If asked:
 - The numbers come from the Oct 31–Nov 1 runs: Inferena a0799e42, Meganeura
-  567028b8, PyTorch 2.13.0 at cf30153c. The published paper used the
+  567028b8, PyTorch 2.13.0 at cf30153c. The RTX 3050 was rerun on November 10
+  with the same binaries, against CUDA PyTorch. The published paper used the
   September 25 runs; the "Since the paper" slide compares the two.
 -->
 
@@ -402,7 +403,7 @@ If asked:
 
 ![Candidate programs, the e-graph forms combined with layouts, fusion, matrix types and submissions, go through four steps each: build, validate, tune and measure. An invalid candidate is dropped; the winner is the fastest validated program.](figures/search.svg)
 
-**30s per session.** 49% of sessions pick a non-default program.
+**30s per session.** 51% of sessions pick a non-default program.
 
 **No code for a particular GPU or platform:** choices follow reported capabilities and measured time.
 
@@ -422,12 +423,12 @@ A kernel variant must win by 5 percent, a whole program by 1 percent plus the
 measured noise. Kernel decisions are saved and reused; the program race runs
 on every build.
 
-In the final runs, 504 sessions measured 22,112 programs. In 248 of them,
-49 percent, the winner differs from the ordinary extracted program, so the
+In the final runs, 588 sessions measured 25,727 programs. In 297 of them,
+51 percent, the winner differs from the ordinary extracted program, so the
 alternatives do get used.
 
 If asked:
-- Up to 16 graph forms and 64 programs per session. In 396 sessions (79%)
+- Up to 16 graph forms and 64 programs per session. In 462 sessions (79%)
   the deadline arrived before every program was measured.
 - The search costs about a minute per workload: backup "What search costs".
 - The final runs have no search-off comparison. The paper's September
@@ -449,10 +450,10 @@ If asked:
 
 <div class="tier selected"><h3>Selected in accelerated runs</h3>
 <table class="selected-paths">
-<tr><th>GPU</th><th>Sessions with matrices</th></tr>
-<tr><td>RTX 5070 · H100</td><td>39/42 · 36/42</td></tr>
-<tr><td>RX 7900 XT · MI300X</td><td>36/42 · 37/42</td></tr>
-<tr><td>Arc B570 · Apple M3</td><td>36/42 · 37/42</td></tr>
+<tr><th>GPU</th><th>Sessions of 42</th></tr>
+<tr><td>RTX 5070 · 3050 · H100</td><td>39 · 37 · 36</td></tr>
+<tr><td>RX 7900 XT · MI300X</td><td>36 · 37</td></tr>
+<tr><td>Arc B570 · Apple M3</td><td>36 · 37</td></tr>
 </table>
 <small>At least one matrix dispatch; counts do not measure utilization.</small>
 </div>
@@ -462,7 +463,7 @@ If asked:
 <div class="tier"><h3>Exposed by the driver</h3>
 <table class="tiles">
 <tr><th>GPU</th><th>f16 tile shapes</th><th>f16</th><th>BF16</th><th>f32</th></tr>
-<tr><td>RTX 5070 · H100 · RTX 3050</td><td class="tile">16×16×16<br>16×8×16 · 16×8×8</td><td class="dot">●</td><td class="dot">●</td><td class="no">○</td></tr>
+<tr><td>All NVIDIA</td><td class="tile">16×16×16<br>16×8×16 · 16×8×8</td><td class="dot">●</td><td class="dot">●</td><td class="no">○</td></tr>
 <tr><td>RX 7900 XT</td><td class="tile">16×16×16</td><td class="dot">●</td><td class="no">○</td><td class="no">○</td></tr>
 <tr><td>MI300X</td><td class="tile">16×16×16</td><td class="dot">●</td><td class="no">○</td><td class="dot f32">●</td></tr>
 <tr><td>Arc B570</td><td class="tile">8×16×16</td><td class="dot">●</td><td class="dot">●</td><td class="no">○</td></tr>
@@ -634,7 +635,7 @@ If asked:
 
 <div class="measure-rows">
 <div><b>Models</b><span class="kinds"><i><b>LLM</b>SmolLM2-135M</i><i><b>Robot policy</b>SmolVLA</i><i><b>Image diffusion</b>SD U-Net</i><i><b>Vision</b>ResNet-50</i><i><b>Speech</b>Whisper-tiny</i></span></div>
-<div><b>GPUs</b><span class="gpu-groups"><i><b>NVIDIA</b>RTX 5070 · H100 · <u>RTX 3050</u> <span class="os">⊞ Windows</span></i><i><b>AMD</b>RX 7900 XT · MI300X · <u>780M · 9600X</u></i><i><b>Intel</b>Arc B570 · <u>RPL-U</u></i><i><b>Apple</b>M3</i><i><b>Qualcomm</b><u>Quest 3S</u></i><em>Native: 30/30 core cells on each GPU. <u>Underlined</u>: checked against CPU references, no PyTorch GPU timing: Windows (RTX 3050), ROCm failed on the Radeon iGPUs, no XPU device on RPL-U, Android on Quest.</em></span></div>
+<div><b>GPUs</b><span class="gpu-groups"><i><b>NVIDIA</b>RTX 5070 · H100 · RTX 3050 <span class="os">⊞ Windows</span></i><i><b>AMD</b>RX 7900 XT · MI300X · <u>780M · 9600X</u></i><i><b>Intel</b>Arc B570 · <u>RPL-U</u></i><i><b>Apple</b>M3</i><i><b>Qualcomm</b><u>Quest 3S</u></i><em>Native: 30/30 core cells on each GPU. <u>Underlined</u>: checked against CPU references, no PyTorch GPU timing: ROCm failed on the Radeon iGPUs, no XPU device on RPL-U, Android on Quest.</em></span></div>
 <div><b>Baseline</b><span>PyTorch 2.13 · <code>torch.compile</code> + graph replay where available</span></div>
 <div><b>Each run</b><span class="flow">Check → warm up 10s → time 20 calls → 3 fresh process pairs</span></div>
 </div>
@@ -656,9 +657,10 @@ inference at the full shape and a training step: forward, loss and backward,
 without the optimizer update.
 
 The same engine passes every check on eleven GPUs from five vendors, from a
-headset to a datacenter accelerator. Six are timed against PyTorch 2.13
-with torch.compile and, where available, graph replay; the three integrated
-GPUs, the RTX 3050 and the Quest are checked for correctness only. Our harness, Inferena, runs
+headset to a datacenter accelerator. Seven are timed against PyTorch 2.13
+with torch.compile and, where available, graph replay, the RTX 3050 among
+them under Windows; the three integrated GPUs and the Quest are checked for
+correctness only. Our harness, Inferena, runs
 both engines. Each must pass its numerical checks before it is timed. Then it
 warms up for ten seconds and times 20 calls, each waiting for the GPU to
 finish. That repeats in three fresh pairs of processes, alternating which
@@ -674,8 +676,10 @@ If asked:
   f32 build. PyTorch must repeat within fixed bounds and, with reduced precision, track
   f32 over matched SGD trajectories. Across engines, sampled outputs, loss and
   gradient norms must agree. Backup "What the checks admit".
-- Correctness-only references: CPU PyTorch f32 for the RTX 3050 and integrated GPUs, CPU
+- Correctness-only references: CPU PyTorch f32 for the integrated GPUs, CPU
   f64 full tensors for the Quest; 330 of 330 core results pass.
+- The RTX 3050 was collected on November 10, nine days after the others, with
+  the same binaries. Its first archive used a CPU reference.
 -->
 
 ---
@@ -689,23 +693,24 @@ If asked:
 <div class="ratio-keys"><span><i class="ours"></i>Meganeura faster</span><span><i class="theirs"></i>PyTorch faster</span><span><i class="missing">—</i>No ratio</span></div>
 </div>
 
-![Strict f32 time ratios for six GPUs and five workloads, inference and training](figures/strict-ratios.svg)
+![Strict f32 time ratios for seven GPUs and five workloads, inference and training](figures/strict-ratios.svg)
 
-Medians: <span class="slower">1.46×</span> inference · <span class="slower">1.59×</span> training. Faster in **13 of 58** comparisons.
+Medians: <span class="slower">1.36×</span> inference · <span class="slower">1.57×</span> training. Faster in **15 of 68** comparisons.
 
 <!--
 Time: 1:20.
 
 Strict f32 fixes arithmetic width, with TF32 and reduced matrix inputs off.
 Each cell is Meganeura time divided by PyTorch time; below one is faster.
-The RX 7900 XT wins most comparisons. Intel and the server GPUs retain
-substantial gaps. The Arc U-Net is now 2.95 times PyTorch's time.
+The RX 7900 XT wins most comparisons. The RTX 3050 under Windows stays close
+to the RTX 5070 under Linux. Intel and the server GPUs retain substantial
+gaps: the Arc U-Net takes 2.95 times PyTorch's time.
 
 If asked:
-- Inference medians: RTX 5070 1.05, H100 1.11, RX 7900 XT 0.63,
-  MI300X 2.19, B570 2.18, M3 1.34. Training: 1.47, 1.86, 0.61,
+- Inference medians: RTX 5070 1.05, H100 1.11, RTX 3050 1.11, RX 7900 XT
+  0.63, MI300X 2.19, B570 2.18, M3 1.34. Training: 1.47, 1.86, 1.57, 0.61,
   2.19, 3.00, 1.24.
-- 30 inference comparisons, 28 training; 9 and 4 nominal wins respectively.
+- 35 inference comparisons, 33 training; 11 and 4 nominal wins respectively.
 -->
 
 ---
@@ -719,9 +724,9 @@ If asked:
 <div class="ratio-keys"><span><i class="ours"></i>Meganeura faster</span><span><i class="theirs"></i>PyTorch faster</span><span><i class="missing">—</i>No ratio</span></div>
 </div>
 
-![Reduced-precision time ratios for six GPUs and five workloads, inference and training](figures/accelerated-ratios.svg)
+![Reduced-precision time ratios for seven GPUs and five workloads, inference and training](figures/accelerated-ratios.svg)
 
-Median ratio: <span class="slower">1.67× inference · 1.92× training</span>. Native gains over f32: **1.19× · 1.05×**.
+Median ratio: <span class="slower">1.61× inference · 1.90× training</span>. Native gains over f32: **1.26× · 1.05×**.
 
 <!--
 Time: 1:10.
@@ -739,7 +744,7 @@ training step is 20.52 milliseconds against PyTorch's 3.33.
 
 If asked:
 - Gains use each engine's own qualified strict/accelerated pairs: native
-  1.19 and 1.05; PyTorch 1.46 and 1.64. Matched-population geometric means
+  1.26 and 1.05; PyTorch 1.50 and 1.56. Matched-population geometric means
   are in “Two gaps”; do not divide these medians to obtain that accounting.
 - Public tensors, masters and accumulation stay f32. Private reduced storage
   and selected transposed backward products are searched; NN derivatives
@@ -765,7 +770,7 @@ If asked:
 <tr><td>Submit and wait</td><td>One tiny add, host time</td><td>1.4×</td><td class="far">2.8×</td><td class="far">5.1×</td></tr>
 </table>
 
-**The submission round trip is now the clearest target.** Split-K took the worst small GEMM from 4.4× to 2.0×, and a larger tile took the Arc's 4096³ GEMM from 2.2× to 1.3×.
+**Kernels are within 2× of the vendor libraries; a host round trip costs up to 5×.** Split-K took the worst small GEMM from 4.4× to 2.0×; a larger tile took the Arc's 4096³ GEMM from 2.2× to 1.3×.
 
 <small>Both engines time 30 serial ops, except the round trip. All three GPUs are d32a495. Ratios do not partition model time.</small>
 
@@ -870,13 +875,13 @@ If asked:
 
 # Since the paper
 
-| | Paper · Sept 25 | Talk · Oct 31–Nov 1 |
+| | Paper · Sept 25 | Talk · Oct 31–Nov 10 |
 |---|---:|---:|
-| Strict inference, five shared GPUs | 1.33× | **1.12×** |
-| Strict training, same qualified conditions | 1.94× | **1.47×** |
+| Strict inference, six shared GPUs | 1.27× | **1.12×** |
+| Strict training, same qualified conditions | 1.92× | **1.48×** |
 | Code: Rust · WGSL lines | 42k · 4.7k | 54k · 7k |
 | Search budget per session | 60s | 30s |
-| Preparation per workload | about 2 min | 47–67s |
+| Preparation per workload | about 2 min | 49–68s |
 
 **Also changed:** MI300X added · BF16 autocast, not TF32 · 10s warmup
 
@@ -884,19 +889,19 @@ If asked:
 Time: 0:50.
 
 These are the submitted paper's September measurements against the final
-collection. Hold the five shared timed GPUs and qualified conditions fixed;
-the RTX 3050 is correctness-only now and MI300X is new. Strict inference
-and training ratios improve to 1.12 and 1.47.
+collection. Hold the six shared timed GPUs and qualified conditions fixed;
+MI300X is new. Strict inference and training ratios improve to 1.12 and
+1.48.
 
-Across the four shared GPUs other than the noisy M3, our strict times fall
-by a median 7.7 percent for inference and 16.4 percent for training.
+Across the five shared GPUs other than the noisy M3, our strict times fall
+by a median 7.9 percent for inference and 16.8 percent for training.
 PyTorch strict times move by less than one percent at the median. The
 protocol also changed, so this is not a controlled compiler ablation.
 
 If asked:
-- Without M3, matched strict ratios: inference 1.27 → 1.12; training
-  2.05 → 1.62. The five-GPU aggregate has different platform coverage from
-  the six-GPU main table.
+- Without M3, matched strict ratios: inference 1.21 → 1.11; training
+  1.99 → 1.60. The six-GPU aggregate has different platform coverage from
+  the seven-GPU main table.
 - Native runner: 13.5 MiB in the paper, 19.4 MiB now (14.9 stripped).
 -->
 
@@ -910,7 +915,7 @@ If asked:
 **Broad hardware coverage. Performance depends on the paths we implement.**
 
 <div class="verdicts">
-<div><h3>Reached</h3><div class="answer">Competitive</div><p>RX 7900 XT, M3: 20/39 nominal wins</p><p>M3 timings vary between processes</p></div>
+<div><h3>Reached</h3><div class="answer">Competitive</div><p>RX 7900 XT, M3: 20/39 nominal wins</p><p>RTX 5070, RTX 3050: strict inference 1.05×, 1.11×</p><p>M3 timings vary between processes</p></div>
 <div class="open"><h3>Kernels</h3><div class="answer">Main targets</div><p>Small GEMMs and Intel convolutions</p><p>Long attention and backward coverage</p></div>
 <div class="open"><h3>Driver access</h3><div class="answer">Constraints</div><p>Shared-memory limits · Hopper instructions</p><p>MI300X requires experimental patches</p></div>
 </div>
@@ -919,8 +924,9 @@ If asked:
 Time: 0:40.
 
 On the RX 7900 XT and M3 we are faster in 20 of 39 inference/training
-comparisons, though M3 timings are noisy. Elsewhere we have concrete kernel
-targets: small products and Intel convolutions, long-sequence attention and
+comparisons, though M3 timings are noisy. On the two consumer NVIDIA cards
+the median strict inference ratio is 1.05 and 1.11. Elsewhere we have
+concrete kernel targets: small products and Intel convolutions, long-sequence attention and
 incomplete backward acceleration.
 
 API limits and driver quality can matter too. We cannot explicitly request
@@ -930,7 +936,7 @@ an exact fraction of the measured gap to the API. More kernel engineering
 has gone into consumer AMD and NVIDIA than Intel or server hardware.
 
 If asked:
-- Matrix paths are selected on all six timed GPUs; using them is not enough.
+- Matrix paths are selected on all seven timed GPUs; using them is not enough.
 - The single-op study fixes f32 arithmetic and identifies implementation
   losses. Driver attribution still needs matched kernels and timelines.
 -->
@@ -946,7 +952,7 @@ If asked:
 <div class="verdicts">
 <div><h3>Productivity</h3><div class="answer">19 MiB</div><p>One executable</p><p>C runtime + system GPU driver</p></div>
 <div><h3>Portability</h3><div class="answer">Mobile to server</div><p>11 GPUs, 5 vendors</p><p>Training checks pass on all</p></div>
-<div><h3>Performance</h3><div class="answer">1.60× median</div><p>112 inference/training comparisons</p><p>Both profiles, 6 timed GPUs</p></div>
+<div><h3>Performance</h3><div class="answer">1.58× median</div><p>132 inference/training comparisons</p><p>Both profiles, 7 timed GPUs</p></div>
 </div>
 
 [github.com/kvark/meganeura](https://github.com/kvark/meganeura)
@@ -959,13 +965,13 @@ to an MI300X. It needs the C runtime and the system GPU driver, without
 Python or a vendor SDK. All 330 core checks pass, including backward.
 DinoVision demonstrates the full train-on-desktop, deploy-in-headset cycle.
 
-Across 112 qualified core inference and training comparisons, both profiles,
-our median time is 1.60 times PyTorch's. That is an aggregate, not an upper
+Across 132 qualified core inference and training comparisons, both profiles,
+our median time is 1.58 times PyTorch's. That is an aggregate, not an upper
 bound: the table includes much larger losses. Reduced precision helps
 inference more than training, which is where the next work belongs.
 
 If asked:
-- Correctness-only: RTX 3050, three integrated GPUs and Quest. Full Adam
+- Correctness-only: three integrated GPUs and Quest. Full Adam
   cycle evidence is the separately pinned desktop DinoVision study.
 - MI300X uses experimental drivers; this is not a stock-support claim.
 -->
@@ -1143,7 +1149,7 @@ takes a median 1.7 seconds per process across the collection. The long tail
 is 70.9 seconds, so this is not a bound on build time.
 
 If asked:
-- 1.7s is the median across all 272 native processes, including large
+- 1.7s is the median across all 292 native processes, including large
   models and correctness-only runs; the range is 0.18–70.87s.
 - A September 10 study on the RTX 5070, with fresh caches, broke this down:
   Naga takes about 0.15 ms per kernel and the driver's pipeline builds take
@@ -1161,12 +1167,13 @@ If asked:
 |---|---:|---:|---:|
 | RTX 5070 | 39 | 482 | 20 |
 | H100 | 36 | 482 | 14 |
+| RTX 3050 | 37 | 482 | 8 |
 | RX 7900 XT | 36 | 482 | 0 |
 | MI300X | 37 | 543 | 0 |
 | Arc B570 | 36 | 482 | 0 |
 | Apple M3 | 37 | 513 | 0 |
 
-<small>Accelerated core sessions. BF16 selected in 3 RTX 5070 sessions and 5 B570 sessions.</small>
+<small>Accelerated core sessions. BF16 selected in 3 RTX 5070, 3 RTX 3050 and 5 B570 sessions.</small>
 
 <!--
 Backup, for “do you actually use the matrix units?”
@@ -1177,12 +1184,13 @@ contains at least one matrix dispatch. Counts do not measure time share,
 throughput or the fraction of FLOPs on matrix units.
 
 The workgroup column counts selected programs with reused workgroup tuning
-choices, not every possible use of workgroup kernels. RTX 3050 is outside
-this timing cohort. Under strict, only MI300X and M3 use f32 matrix tiles.
+choices, not every possible use of workgroup kernels. Under strict, only
+MI300X and M3 use f32 matrix tiles.
 
 Selected descriptions also request reduced transposed backward products in
-9 RTX 5070, 9 H100, 8 RX 7900 XT, 3 MI300X and 7 B570 sessions. Private
-matrix-storage choices occur in 3 RX 7900 XT and 4 B570 sessions.
+9 RTX 5070, 9 H100, 8 RTX 3050, 8 RX 7900 XT, 3 MI300X and 7 B570 sessions.
+Private matrix-storage choices occur in 8 RTX 3050, 3 RX 7900 XT and 4 B570
+sessions.
 -->
 
 ---
@@ -1225,7 +1233,7 @@ If asked:
 
 ![Preparation by workload: native preparation against PyTorch compilation and first calls](figures/preparation-models.svg)
 
-Meganeura: <span class="mega">47–67s</span> per workload. PyTorch compiles in <span class="torch">8–50s</span>.
+Meganeura: <span class="mega">49–68s</span> per workload. PyTorch compiles in <span class="torch">13–54s</span>.
 
 <!--
 Backup, for “how long does the search take?”
@@ -1241,7 +1249,7 @@ The search's 30-second allowance is per session, not per model or process.
 It is a soft deadline; reference preparation is outside it.
 
 If asked:
-- Core search receipts total 186.6 minutes; no 15-second or search-off arm
+- Core search receipts total 218.9 minutes; no 15-second or search-off arm
   exists in this cohort, so it does not establish an optimal budget.
 -->
 
@@ -1318,7 +1326,7 @@ tolerance-sweep experiment, so the effect of looser bounds is unmeasured.
 
 # Timing variability
 
-![Between-process spread of native and reference times on six GPUs](figures/timing-spread.svg)
+![Between-process spread of native and reference times on seven GPUs](figures/timing-spread.svg)
 
 Apple M3: **43 of 60** groups exceed 10% spread; median **16%**, despite sleep prevention. Every repeat stays.
 
@@ -1329,7 +1337,7 @@ Each point is (max minus min) divided by the median of three process medians.
 Both engines move on M3; no clock/power trace identifies the cause, so do
 not claim small M3 wins. Other GPUs' median spreads are at most 2.4%.
 Four RX 7900 XT groups exceed 10%, one B570 and one MI300X group; none on
-RTX 5070 or H100. No outlier is removed.
+the three NVIDIA GPUs. No outlier is removed.
 -->
 
 ---

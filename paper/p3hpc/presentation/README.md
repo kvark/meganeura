@@ -24,7 +24,8 @@ needs the adjacent `figures/`, `assets/` and
 
 ## Evidence
 
-The paper and talk share the October 31–November 1, 2026 cohort: Inferena
+The paper and talk share the October 31–November 1, 2026 cohort, with the
+RTX 3050 recollected on November 10 against CUDA PyTorch: Inferena
 `a0799e42`, Meganeura `567028b8`, Blade `eae0c6f7`, Naga `a489554c`, PyTorch
 2.13.0 (`cf30153c`). Charts read the paper analyzer's audited outputs in
 `../tables/`; the [result ledger](../RESULTS.md) documents the audit and
@@ -46,7 +47,7 @@ Talk-only evidence in `data/`:
 - **Hardware:** `hardware.json` holds device queries and the native runner's
   identity; `limits.json` separates queried from documented limits.
 - **Since the paper:** `since_paper.py` compares the tagged September 25
-  supplement (`paper-p3hpc-work`) with current results on the five shared
+  supplement (`paper-p3hpc-work`) with current results on the six shared
   timed GPUs, restricted to the same qualified conditions.
 - **DinoVision:** the separately pinned
   [study](https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/REPORT.md)
