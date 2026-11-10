@@ -234,6 +234,7 @@ impl Session {
                     name: "parameter_blend",
                     data_layouts: &[&BlendData::layout()],
                     compute: shader.at("main"),
+                    full_subgroup_size: None,
                 },
             ));
         }

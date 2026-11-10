@@ -134,6 +134,7 @@ fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, ent
         name: entry.entry_point(),
         data_layouts: &[&layout],
         compute: shader.at(entry.entry_point()),
+        full_subgroup_size: None,
     });
     let stats = gpu.get_pipeline_statistics(&pipeline);
     if stats.is_empty() {
