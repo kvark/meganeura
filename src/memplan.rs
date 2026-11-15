@@ -290,6 +290,7 @@ pub fn plan_buffer_aliasing(
     plan: &ExecutionPlan,
     groups: &[Range<usize>],
     pin_spec: Option<&str>,
+    device_local_io: bool,
 ) -> AliasPlan {
     let (pinned, uses) = compute_pinned(plan, groups, pin_spec);
     let constant_aliases = uniform_constant_aliases(plan);
@@ -308,7 +309,7 @@ pub fn plan_buffer_aliasing(
     let mut map = vec![usize::MAX; n];
     let mut sizes = Vec::new();
     let mut device_local = Vec::new();
-    let device_ok = device_local_eligible(plan);
+    let device_ok = device_local_eligible(plan, device_local_io);
     for i in 0..n {
         if pinned[i] && constant_aliases[i].is_none() {
             map[i] = sizes.len();
@@ -483,9 +484,10 @@ pub fn plan_no_alias(
     plan: &ExecutionPlan,
     groups: &[Range<usize>],
     pin_spec: Option<&str>,
+    device_local_io: bool,
 ) -> AliasPlan {
     let (pinned, _) = compute_pinned(plan, groups, pin_spec);
-    let device_ok = device_local_eligible(plan);
+    let device_ok = device_local_eligible(plan, device_local_io);
     AliasPlan {
         map: (0..plan.buffers.len()).collect(),
         offsets: vec![0; plan.buffers.len()],
@@ -503,13 +505,30 @@ pub fn plan_no_alias(
 ///
 /// Parameter gradients are pinned so clip/Adam can find them after the
 /// plan, but those passes are GPU-only. Host diagnostics go through the
-/// staging readback path.
-fn device_local_eligible(plan: &ExecutionPlan) -> Vec<bool> {
+/// staging readback path. With `device_local_io`, parameters, inputs,
+/// outputs and loss may also live in device-local memory; host access uses
+/// staging transfers. Constants always remain host-visible because session
+/// initialization writes them through mapped pointers.
+fn device_local_eligible(plan: &ExecutionPlan, device_local_io: bool) -> Vec<bool> {
     let mut ok = vec![false; plan.buffers.len()];
     for &(_, grad) in &plan.param_grad_pairs {
         let i = grad.0 as usize;
         if i < ok.len() {
             ok[i] = true;
+        }
+    }
+    if device_local_io {
+        for &(_, b) in &plan.param_buffers {
+            ok[b.0 as usize] = true;
+        }
+        for &(_, b) in &plan.input_buffers {
+            ok[b.0 as usize] = true;
+        }
+        for &b in &plan.output_buffers {
+            ok[b.0 as usize] = true;
+        }
+        if let Some(b) = plan.loss_buffer {
+            ok[b.0 as usize] = true;
         }
     }
     // A gradient seed can also be a compile-time constant. Session setup
@@ -757,7 +776,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(4));
         let groups: Vec<Range<usize>> = (0..4).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
 
         assert_eq!(alias.map[1], alias.map[3], "t1 and t3 should alias");
         assert_ne!(alias.map[2], alias.map[1], "t2 overlaps t1");
@@ -784,7 +803,7 @@ mod tests {
         // the tuner must be free to evaluate the same operation unsplit.
         p.dispatches[1].shader = ShaderEntry::CachedBlockAttentionSplit;
         p.dispatches[2].shader = ShaderEntry::CachedBlockAttentionCombine;
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
         assert_ne!(alias.map[1], alias.map[3]);
         check_disjoint(&p, &groups, &alias);
     }
@@ -805,7 +824,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(4));
         let groups: Vec<Range<usize>> = (0..4).map(|i| i..i + 1).collect();
-        let alias = plan_no_alias(&p, &groups, None);
+        let alias = plan_no_alias(&p, &groups, None, false);
         assert_eq!(alias.map, vec![0, 1, 2, 3, 4]);
         assert_eq!(alias.sizes, p.buffers);
         assert_eq!(alias.device_local, vec![false, true, true, true, false]);
@@ -819,7 +838,7 @@ mod tests {
         p.output_buffers.push(BufferRef(3));
         let groups = std::iter::once(0..1).collect::<Vec<_>>();
 
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
 
         assert_eq!(alias.map[1], alias.map[2]);
         assert_eq!(alias.sizes[alias.map[1]], 128);
@@ -836,7 +855,7 @@ mod tests {
         p.output_buffers.push(BufferRef(3));
         let groups = std::iter::once(0..1).collect::<Vec<_>>();
 
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
 
         assert_ne!(alias.map[1], alias.map[2]);
         assert_eq!(alias.sizes[alias.map[1]], 64);
@@ -849,7 +868,7 @@ mod tests {
         p.constant_buffers.push((BufferRef(0), vec![1.0; 4]));
         p.constant_buffers.push((BufferRef(1), vec![1.0; 4]));
 
-        let alias = plan_buffer_aliasing(&p, &[], None);
+        let alias = plan_buffer_aliasing(&p, &[], None, false);
 
         assert_eq!(alias.map[0], alias.map[1]);
         assert_eq!(alias.sizes, [16]);
@@ -861,7 +880,7 @@ mod tests {
         p.constant_buffers.push((BufferRef(0), vec![1.0; 4]));
         p.constant_buffers.push((BufferRef(1), vec![2.0; 4]));
 
-        let alias = plan_buffer_aliasing(&p, &[], None);
+        let alias = plan_buffer_aliasing(&p, &[], None, false);
 
         assert_ne!(alias.map[0], alias.map[1]);
     }
@@ -874,7 +893,7 @@ mod tests {
         p.param_buffers.push(("weight".into(), BufferRef(2)));
         p.param_grad_pairs.push((BufferRef(2), BufferRef(1)));
 
-        let alias = plan_buffer_aliasing(&p, &[], None);
+        let alias = plan_buffer_aliasing(&p, &[], None, false);
 
         assert_ne!(alias.map[0], alias.map[1]);
     }
@@ -890,7 +909,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
         let groups = vec![0..2, 2..3];
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
         assert_ne!(alias.map[1], alias.map[2]);
         check_disjoint(&p, &groups, &alias);
     }
@@ -906,7 +925,7 @@ mod tests {
         p.input_buffers.push(("x".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
         let groups: Vec<Range<usize>> = (0..3).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
         // Buffer 2 dies at group 2 and nothing later could reuse buffer 1's
         // slot anyway; the property under test: 1 keeps a dedicated slot.
         assert!(alias.map.iter().filter(|&&m| m == alias.map[1]).count() == 1);
@@ -923,7 +942,7 @@ mod tests {
         p.input_buffers.push(("kv".into(), BufferRef(0)));
         p.output_buffers.push(BufferRef(3));
         let groups: Vec<Range<usize>> = (0..3).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
         assert!(alias.map.iter().filter(|&&m| m == alias.map[1]).count() == 1);
     }
 
@@ -938,7 +957,7 @@ mod tests {
         p.param_grad_pairs.push((BufferRef(1), BufferRef(4)));
         p.output_buffers.push(BufferRef(3));
         let groups: Vec<Range<usize>> = (0..3).map(|i| i..i + 1).collect();
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
         for pinned in [0usize, 1, 3, 4] {
             assert!(
                 alias
@@ -970,7 +989,7 @@ mod tests {
             p.param_grad_pairs.push((BufferRef(param), BufferRef(grad)));
         }
         p.constant_buffers.push((BufferRef(7), vec![1.0; 4]));
-        let mut alias = plan_buffer_aliasing(&p, &[], None);
+        let mut alias = plan_buffer_aliasing(&p, &[], None, false);
         let before = alias.sizes.len();
         alias.pack_arena(&p, 1024);
 
@@ -1012,10 +1031,10 @@ mod tests {
         p.constant_buffers.push((BufferRef(1), vec![1.0]));
         let groups = std::iter::once(0..1).collect::<Vec<_>>();
 
-        let alias = plan_buffer_aliasing(&p, &groups, None);
+        let alias = plan_buffer_aliasing(&p, &groups, None, false);
         assert!(!alias.device_local[alias.map[1]]);
 
-        let no_alias = plan_no_alias(&p, &groups, None);
+        let no_alias = plan_no_alias(&p, &groups, None, false);
         assert!(!no_alias.device_local[1]);
     }
 
