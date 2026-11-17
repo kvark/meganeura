@@ -43,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 14;
+const KERNEL_MEMO_REVISION: u32 = 15;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -456,6 +456,9 @@ pub(super) fn tile_module(
                 )
             }
             MatmulTile::CooperativeChecked { .. } => {
+                let mut selected = dispatch.clone();
+                tile.configure(&mut selected);
+                let dispatch = &selected;
                 let types = super::checked_matrix_types(dispatch).expect("checked tile types");
                 crate::codegen::generate_module_coop_typed_with_layout(
                     entry.shader_group(),
@@ -530,6 +533,19 @@ fn retain_tunable_classes(
     let shared_limit = capabilities.max_compute_shared_memory_size;
     for class in classes.iter_mut() {
         class.challengers.retain(|tile| match *tile {
+            MatmulTile::CooperativeChecked {
+                specialize: true, ..
+            } => {
+                // The native16 generator stages all operands. Specialize
+                // only the generator that can load cooperative tiles directly.
+                class.key.matrix_types.is_some_and(|types| {
+                    crate::codegen::checked_cooperative_shape(super::cooperative_shapes(
+                        &capabilities.cooperative_matrix,
+                        types.multiply,
+                    ))
+                    .is_some_and(|shape| shape != [16, 16, 16])
+                })
+            }
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
@@ -2758,7 +2774,13 @@ mod tests {
             };
             key.binding_bytes = key.buffer_sizes().unwrap();
             let (initial, config) = if types.is_some() {
-                (MatmulTile::CooperativeChecked { splits: 1 }, None)
+                (
+                    MatmulTile::CooperativeChecked {
+                        splits: 1,
+                        specialize: false,
+                    },
+                    None,
+                )
             } else if automatic {
                 (MatmulTile::CooperativeF16 { tile_size: 16 }, Some(&reduced))
             } else {
@@ -4351,7 +4373,11 @@ mod tests {
                 };
                 let dispatch = Dispatch {
                     shader: ShaderEntry::MatMulBT,
-                    kernel: Kernel::CooperativeTyped { types, splits: 4 },
+                    kernel: Kernel::CooperativeTyped {
+                        types,
+                        splits: 4,
+                        specialize: false,
+                    },
                     input_buffers: vec![BufferRef(0), BufferRef(1)],
                     output_buffer: BufferRef(2),
                     params: vec![3, 5, 1031, 0],
@@ -4364,8 +4390,17 @@ mod tests {
                 // The compiled partial buffer holds four partitions.
                 *class.binding_bytes.last_mut().unwrap() *= 4;
                 assert_eq!(
-                    class.challengers(MatmulTile::CooperativeChecked { splits: 4 }, None),
-                    vec![MatmulTile::CooperativeChecked { splits: 2 }]
+                    class.challengers(
+                        MatmulTile::CooperativeChecked {
+                            splits: 4,
+                            specialize: false
+                        },
+                        None
+                    ),
+                    vec![MatmulTile::CooperativeChecked {
+                        splits: 2,
+                        specialize: false
+                    }]
                 );
                 assert!(!MatmulTile::Tile32.fits(&class));
                 let mut locked = dispatch.clone();
@@ -4463,7 +4498,10 @@ mod tests {
         // The four compiled partitions bound the partial buffer.
         assert_eq!(
             classes[0].challengers,
-            [MatmulTile::CooperativeChecked { splits: 2 }]
+            [MatmulTile::CooperativeChecked {
+                splits: 2,
+                specialize: false
+            }]
         );
         assert_eq!(classes[0].reductions.len(), 1);
     }

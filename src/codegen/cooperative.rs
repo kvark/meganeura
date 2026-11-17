@@ -614,7 +614,7 @@ mod tests {
             }
         }
         for (group, types, shape, index) in cases {
-            let layout = [
+            let mut layout = [
                 super::super::TypedMatmulLayout::default(),
                 super::super::TypedMatmulLayout {
                     vectorized: true,
@@ -627,10 +627,19 @@ mod tests {
                     [64, 64, 64],
                 ),
             ][index % 3];
+            if coop_shape(group).is_some() && index % 2 == 0 {
+                layout.dimensions = Some([64, 96, 32]);
+            }
             let subgroup = if layout.vectorized { 16 } else { 32 };
             let mut module = super::super::generate_module_coop_typed_with_subgroup(
                 group, types, shape, layout, subgroup,
             );
+            if layout.dimensions.is_some() {
+                for field in ["params.m", "params.n", "params.k"] {
+                    assert!(!module.source.contains(field));
+                }
+                assert!(module.source.contains("params.splits"));
+            }
             if shape[0] == 8 && group.is_checked_convolution() {
                 assert_eq!(
                     module.module.entry_points[0].workgroup_size,

@@ -1246,7 +1246,7 @@ fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout
         ));
         return crate::codegen::TypedMatmulLayout::default();
     };
-    crate::codegen::TypedMatmulLayout::for_product(
+    let mut layout = crate::codegen::TypedMatmulLayout::for_product(
         types,
         matches!(
             dispatch.shader,
@@ -1255,7 +1255,17 @@ fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout
                 | ShaderEntry::FusedMatMulBTAdd
         ),
         [m, n, k],
-    )
+    );
+    if matches!(
+        dispatch.kernel,
+        crate::compile::Kernel::CooperativeTyped {
+            specialize: true,
+            ..
+        }
+    ) {
+        layout.dimensions = Some([m, n, k]);
+    }
+    layout
 }
 
 /// Reduced storage types, and the multiplication types of checked
@@ -1614,7 +1624,11 @@ mod precision_requirement_tests {
     fn distinguishes_storage_from_cooperative_products() {
         let typed = |types| Dispatch {
             shader: ShaderEntry::MatMul,
-            kernel: Kernel::CooperativeTyped { types, splits: 1 },
+            kernel: Kernel::CooperativeTyped {
+                types,
+                splits: 1,
+                specialize: false,
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -1690,7 +1704,12 @@ mod precision_requirement_tests {
                 .iter()
                 .find(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 .unwrap();
-            let Kernel::CooperativeTyped { types, splits } = product.kernel else {
+            let Kernel::CooperativeTyped {
+                types,
+                splits,
+                specialize: false,
+            } = product.kernel
+            else {
                 unreachable!()
             };
             assert!(product.use_coop());
@@ -1730,7 +1749,10 @@ mod precision_requirement_tests {
                         crate::tune::MatmulTile::selected(product, config.as_ref()).unwrap();
                     assert_eq!(
                         initial,
-                        crate::tune::MatmulTile::CooperativeChecked { splits }
+                        crate::tune::MatmulTile::CooperativeChecked {
+                            splits,
+                            specialize: false
+                        }
                     );
                     let mut class = class;
                     class.binding_bytes = initial.buffer_sizes(&class).unwrap();
@@ -5498,6 +5520,7 @@ mod variant_tests {
             kernel: crate::compile::Kernel::CooperativeTyped {
                 types: crate::codegen::MatrixTypes::reduced(crate::DType::F16),
                 splits: 1,
+                specialize: false,
             },
             params: vec![m, 64, 64, 0],
             ..Default::default()
@@ -5513,6 +5536,30 @@ mod variant_tests {
             Pipelines::key(&make(64), &caps),
             Pipelines::key(&make(48), &caps)
         );
+    }
+
+    #[test]
+    fn specialized_dimensions_and_generic_kernels_have_distinct_pipelines() {
+        use crate::compile::Kernel;
+        let make = |m, splits, specialize| Dispatch {
+            shader: ShaderEntry::MatMul,
+            kernel: Kernel::CooperativeTyped {
+                types: crate::codegen::MatrixTypes::reduced(crate::DType::F16),
+                splits,
+                specialize,
+            },
+            params: vec![m, 256, 64, 0],
+            ..Default::default()
+        };
+        for native in [[16, 16, 16], [8, 16, 16]] {
+            let mut caps = blade_graphics::Capabilities::default();
+            caps.cooperative_matrix.f16_f32_shapes = vec![native];
+            let key = |m, splits, specialize| Pipelines::key(&make(m, splits, specialize), &caps);
+            assert_eq!(key(64, 1, false), key(96, 1, false));
+            assert_ne!(key(64, 1, true), key(96, 1, true));
+            assert_ne!(key(64, 1, true), key(64, 1, false));
+            assert_eq!(key(64, 1, true), key(64, 4, true));
+        }
     }
 
     #[test]
@@ -5632,11 +5679,13 @@ mod variant_tests {
                     Kernel::CooperativeTyped {
                         types: MatrixTypes::BF16,
                         splits: 1,
+                        specialize: false,
                     },
                     WeightFormat::F32,
                 ),
                 (
                     Kernel::CooperativeTyped {
+                        specialize: false,
                         types: MatrixTypes {
                             output: crate::DType::BF16,
                             ..MatrixTypes::BF16
@@ -5649,6 +5698,7 @@ mod variant_tests {
                     Kernel::CooperativeTyped {
                         types: MatrixTypes::reduced(crate::DType::F16),
                         splits: 1,
+                        specialize: false,
                     },
                     WeightFormat::F32,
                 ),
@@ -5681,6 +5731,7 @@ mod variant_tests {
                 kernel: crate::compile::Kernel::CooperativeTyped {
                     types: crate::codegen::MatrixTypes::BF16,
                     splits: 1,
+                    specialize: false,
                 },
                 params: vec![m, k, n, 0],
                 ..Default::default()

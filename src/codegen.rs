@@ -1078,11 +1078,14 @@ pub struct TypedMatmulLayout {
     pub direct_output: bool,
     /// Native operands may bypass staging when all 32x32 K/output tiles fit.
     pub direct_inputs: bool,
+    /// Shape-specialized alternative to uniform dimensions. Part of pipeline identity.
+    pub dimensions: Option<[u32; 3]>,
 }
 
 impl TypedMatmulLayout {
     pub fn for_product(types: MatrixTypes, addend: bool, [m, n, k]: [u32; 3]) -> Self {
         Self {
+            dimensions: None,
             vectorized: (u64::from(m) * u64::from(k)).is_multiple_of(4)
                 && (u64::from(k) * u64::from(n)).is_multiple_of(4),
             direct_inputs: matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
@@ -1118,11 +1121,11 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
         coop_shape(group).is_some() || group.is_checked_convolution(),
         "no cooperative form for {group:?}"
     );
-    if let Some((addend, variant)) = coop_shape(group)
+    let module = if let Some((addend, variant)) = coop_shape(group)
         && shape == [16, 16, 16]
         && layout.vectorized
     {
-        return gen_matmul_coop_stored(
+        gen_matmul_coop_stored(
             addend,
             variant,
             &CoopConfig {
@@ -1134,9 +1137,30 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             1,
             WeightFormat::F32,
             Some((types, layout)),
+        )
+    } else {
+        cooperative::generate(group, types, shape, subgroup, layout)
+    };
+    if let Some([m, n, k]) = layout.dimensions {
+        assert!(
+            coop_shape(group).is_some(),
+            "dimension specialization is for dense products"
         );
+        assert!(m > 0 && n > 0 && k > 0);
+        ShaderModule::with_hint(
+            preprocess(
+                &module.source,
+                &[
+                    ("params.m", &format!("{m}u")),
+                    ("params.n", &format!("{n}u")),
+                    ("params.k", &format!("{k}u")),
+                ],
+            ),
+            module.hint,
+        )
+    } else {
+        module
     }
-    cooperative::generate(group, types, shape, subgroup, layout)
 }
 
 pub(crate) fn generate_checked_conv(
