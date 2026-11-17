@@ -95,15 +95,24 @@ impl WorkgroupMatmulShape {
         !m.is_multiple_of(self.rows)
     }
 
+    fn stages(self, storage: DType, multiply: DType) -> bool {
+        self.stage_operands || storage != multiply
+    }
+
+    fn pitch(self, cols: u32) -> Option<u32> {
+        // Eight half elements rotate the shared-memory bank assignment.
+        cols.checked_add(if self.stage_operands { 8 } else { 0 })
+    }
+
     pub fn shared_bytes(self, types: MatrixTypes, row_bounds: bool) -> Option<u32> {
         let mut bytes = 0u32;
         for (storage, rows, cols, bounded) in [
             (types.a, self.rows, self.k_stage, row_bounds),
             (types.b, self.k_stage, self.columns, false),
         ] {
-            if self.stage_operands || storage != types.multiply || bounded {
+            if self.stages(storage, types.multiply) || bounded {
                 bytes = bytes.checked_add(
-                    rows.checked_mul(cols.checked_add(if self.stage_operands { 8 } else { 0 })?)?
+                    rows.checked_mul(self.pitch(cols)?)?
                         .checked_mul(MatrixTypes::bytes(types.multiply) as u32)?,
                 )?;
             }
@@ -131,7 +140,7 @@ pub fn generate_workgroup_matmul(
         columns: n,
         k_stage: k,
         threads,
-        stage_operands,
+        ..
     } = shape;
     assert!([m, n, k].iter().all(|&s| s > 0 && s.is_multiple_of(4)) && threads > 0);
     let multiply = MatrixTypes::name(types.multiply);
@@ -145,19 +154,18 @@ pub fn generate_workgroup_matmul(
     }
     source +=
         "struct Params { m: u32, n: u32, k: u32, splits: u32 }\nvar<uniform> params: Params;\n";
-    let padding = if stage_operands { 8 } else { 0 };
     for (name, storage, rows, cols) in [("a", types.a, m, k), ("b", types.b, k, n)] {
         let scalar = MatrixTypes::name(storage);
-        let storage_name = if stage_operands || storage != types.multiply {
+        let storage_name = if shape.stages(storage, types.multiply) {
             format!("vec4<{scalar}>")
         } else {
             scalar.to_owned()
         };
         source += &format!("var<storage> matrix_{name}: array<{storage_name}>;\n");
-        if stage_operands || storage != types.multiply || (name == "a" && row_bounds) {
+        if shape.stages(storage, types.multiply) || (name == "a" && row_bounds) {
             source += &format!(
                 "var<workgroup> s{name}: array<{multiply}, {}>;\n",
-                rows * (cols + padding)
+                rows * shape.pitch(cols).expect("workgroup operand pitch overflow")
             );
         }
     }
@@ -185,10 +193,8 @@ pub fn generate_workgroup_matmul(
         } else {
             ("b", k, n, "B")
         };
-        if stage_operands || storage != types.multiply {
-            // Eight half elements rotate the shared-memory bank assignment
-            // between rows while preserving the matrix-load alignment.
-            let pitch = cols + padding;
+        let pitch = shape.pitch(cols).expect("workgroup operand pitch overflow");
+        if shape.stages(storage, types.multiply) {
             let width = if transpose { rows } else { cols };
             let index = match (a, transpose) {
                 (true, false) => "(row + r) * k + t + c",
@@ -241,12 +247,12 @@ pub fn generate_workgroup_matmul(
         } else if a && row_bounds {
             let width = if transpose { rows } else { cols };
             let (index, stage, axis) = if transpose {
-                ("(t + r) * m + row + c", format!("c * {cols}u + r"), "c")
+                ("(t + r) * m + row + c", format!("c * {pitch}u + r"), "c")
             } else {
-                ("(row + r) * k + t + c", format!("r * {cols}u + c"), "r")
+                ("(row + r) * k + t + c", format!("r * {pitch}u + c"), "r")
             };
             source += &format!(
-                "for (var i = lid; i < {}u; i += {threads}u) {{\nlet r = i / {width}u;\nlet c = i % {width}u;\nvar value = {multiply}(0.0);\nif (row + {axis} < m) {{ value = matrix_a[{index}]; }}\nsa[{stage}] = value;\n}}\nworkgroupBarrier();\nlet a = coopLoadT<coop_mat{cols}x{rows}<{multiply},A,workgroup>>(&sa[0], {cols}u);\n",
+                "for (var i = lid; i < {}u; i += {threads}u) {{\nlet r = i / {width}u;\nlet c = i % {width}u;\nvar value = {multiply}(0.0);\nif (row + {axis} < m) {{ value = matrix_a[{index}]; }}\nsa[{stage}] = value;\n}}\nworkgroupBarrier();\nlet a = coopLoadT<coop_mat{cols}x{rows}<{multiply},A,workgroup>>(&sa[0], {pitch}u);\n",
                 rows * cols
             );
         } else {
@@ -263,7 +269,8 @@ pub fn generate_workgroup_matmul(
         }
     }
     source += "acc = coopMultiplyAdd(a,b,acc);\n";
-    if stage_operands || row_bounds || types.a != types.multiply || types.b != types.multiply {
+    if row_bounds || shape.stages(types.a, types.multiply) || shape.stages(types.b, types.multiply)
+    {
         source += "workgroupBarrier();\n";
     }
     source += "}\n";
