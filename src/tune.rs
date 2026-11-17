@@ -1063,7 +1063,7 @@ impl TuneClass {
                 .filter(|&tile| tile != initial && tile.fits(self))
                 .collect();
         }
-        if self.effective_matrix_types().is_some() {
+        if let Some(types) = self.effective_matrix_types() {
             let mut candidates = Vec::new();
             if self.matrix_types.is_some() {
                 candidates.extend(
@@ -1083,6 +1083,13 @@ impl TuneClass {
             };
             candidates.extend(
                 crate::codegen::WorkgroupMatmulShape::all()
+                    // Converted operands already use vector staging. Spend
+                    // these extra probes on native operands' scalar loads.
+                    .filter(|shape| {
+                        !shape.stage_operands
+                            || types.a == types.multiply
+                            || types.b == types.multiply
+                    })
                     .map(|shape| MatmulTile::CooperativeWorkgroup { shape, splits }),
             );
             if let MatmulTile::CooperativeWorkgroup { shape, .. } = initial {
@@ -1776,6 +1783,10 @@ mod tests {
             let candidates = class.challengers(initial, None);
             for shape in WorkgroupMatmulShape::all() {
                 let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 1 };
+                if shape.stage_operands && types == MatrixTypes::F32_AS_F16 {
+                    assert!(!candidates.contains(&tile));
+                    continue;
+                }
                 assert!(candidates.contains(&tile));
                 let original = Dispatch {
                     params: vec![256, 256, 512, 0],

@@ -5522,6 +5522,7 @@ mod variant_tests {
             columns: 64,
             k_stage: 32,
             threads: 64,
+            stage_operands: false,
         };
         let make = |m| Dispatch {
             shader: ShaderEntry::MatMul,

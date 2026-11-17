@@ -81,6 +81,7 @@ mod tests {
         columns: 64,
         k_stage: 32,
         threads: 64,
+        stage_operands: false,
     };
 
     fn caps() -> blade_graphics::Capabilities {
@@ -131,6 +132,7 @@ mod tests {
             columns: 256,
             k_stage: 32,
             threads: 256,
+            stage_operands: false,
         };
         assert!(tile.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
         let deeper = WorkgroupMatmulShape {
@@ -139,6 +141,13 @@ mod tests {
         };
         assert!(!deeper.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
         assert!(deeper.supports(&device, MatrixTypes::BF16, 1536, 512, 384));
+        assert!(
+            !WorkgroupMatmulShape {
+                stage_operands: true,
+                ..deeper
+            }
+            .supports(&device, MatrixTypes::BF16, 1536, 512, 384)
+        );
         device.cooperative_matrix.workgroup.max_dimension = 128;
         assert!(!tile.supports(&device, MatrixTypes::BF16, 1536, 512, 384));
         assert!(!tile.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
