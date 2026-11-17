@@ -1756,7 +1756,7 @@ mod precision_requirement_tests {
                     );
                     let mut class = class;
                     class.binding_bytes = initial.buffer_sizes(&class).unwrap();
-                    assert!(class.challengers(initial, config.as_ref()).iter().all(
+                    assert!(class.challengers(initial, config.as_ref(), &[]).iter().all(
                         |tile| matches!(
                             tile,
                             crate::tune::MatmulTile::CooperativeChecked { .. }

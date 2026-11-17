@@ -51,6 +51,14 @@ pub(super) fn generate_with_params(
     let vector_dense = layout.vectorized && variant.is_some();
     let global_a = layout.direct_inputs && vector_dense && types.a == types.multiply;
     let global_b = layout.direct_inputs && vector_dense && types.b == types.multiply;
+    let specialized_dimensions = layout.dimensions.map(|[m, n, k]| {
+        assert!(
+            coop_shape(group).is_some(),
+            "dimension specialization is for dense products"
+        );
+        assert!(m > 0 && n > 0 && k > 0);
+        format!("let m = {m}u; let n = {n}u; let k = {k}u;")
+    });
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -79,7 +87,9 @@ pub(super) fn generate_with_params(
             }
             (
                 declaration,
-                "let m = params.m; let n = params.n; let k = params.k;",
+                specialized_dimensions
+                    .as_deref()
+                    .unwrap_or("let m = params.m; let n = params.n; let k = params.k;"),
                 split_range.as_str(),
                 if variant == MatMulCoopVariant::AT {
                     "$DENSE_A_AT"
@@ -627,7 +637,7 @@ mod tests {
                     [64, 64, 64],
                 ),
             ][index % 3];
-            if coop_shape(group).is_some() && index % 2 == 0 {
+            if coop_shape(group).is_some() && shape != [16, 16, 16] && index % 2 == 0 {
                 layout.dimensions = Some([64, 96, 32]);
             }
             let subgroup = if layout.vectorized { 16 } else { 32 };

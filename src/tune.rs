@@ -1006,6 +1006,7 @@ impl TuneClass {
         &self,
         initial: MatmulTile,
         config: Option<&CoopConfig>,
+        native_shapes: &[[u32; 3]],
     ) -> Vec<MatmulTile> {
         if let MatmulTile::Gemv(shape) = initial {
             use crate::codegen::{GemvReduction, GemvShape};
@@ -1074,7 +1075,9 @@ impl TuneClass {
             if self.matrix_types.is_some() {
                 // A single additional pipeline specializes dimensions; K
                 // partition counts remain uniforms and share that pipeline.
-                let specialize = types.b == types.multiply
+                let specialize = crate::codegen::checked_cooperative_shape(native_shapes)
+                    .is_some_and(|shape| shape != [16, 16, 16])
+                    && types.b == types.multiply
                     && matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
                     && [self.m, self.n, self.k]
                         .into_iter()
@@ -1794,8 +1797,23 @@ mod tests {
         let mut class = class(64, 1024, 256);
         class.matrix_types = Some(MatrixTypes::reduced(DType::F16));
         class.binding_bytes = class.buffer_sizes().unwrap();
-        assert!(class.challengers(generic, None).contains(&specialized));
-        assert!(class.challengers(specialized, None).contains(&generic));
+        for shapes in [&[][..], &[[16, 16, 16]][..]] {
+            assert!(
+                !class
+                    .challengers(generic, None, shapes)
+                    .contains(&specialized)
+            );
+        }
+        assert!(
+            class
+                .challengers(generic, None, &[[8, 16, 16]])
+                .contains(&specialized)
+        );
+        assert!(
+            class
+                .challengers(specialized, None, &[[8, 16, 16]])
+                .contains(&generic)
+        );
         let mut dispatch = Dispatch {
             params: vec![class.m, class.k, class.n, 0],
             kernel: Kernel::CooperativeTyped {
@@ -1831,7 +1849,11 @@ mod tests {
                 class.matrix_types = Some(MatrixTypes::F32_AS_F16);
             }
             class.binding_bytes = class.buffer_sizes().unwrap();
-            assert!(!class.challengers(generic, None).contains(&specialized));
+            assert!(
+                !class
+                    .challengers(generic, None, &[[8, 16, 16]])
+                    .contains(&specialized)
+            );
         }
     }
 
@@ -1861,7 +1883,7 @@ mod tests {
                 splits: 1,
                 specialize: false,
             };
-            let candidates = class.challengers(initial, None);
+            let candidates = class.challengers(initial, None, &[]);
             for shape in WorkgroupMatmulShape::all() {
                 let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 1 };
                 if shape.stage_operands && types == MatrixTypes::F32_AS_F16 {
@@ -1912,7 +1934,7 @@ mod tests {
         };
         assert!(
             automatic
-                .challengers(MatmulTile::Tile64, Some(&native))
+                .challengers(MatmulTile::Tile64, Some(&native), &[])
                 .iter()
                 .all(|tile| !matches!(
                     tile,
@@ -1929,7 +1951,7 @@ mod tests {
         assert!(!MatmulTile::Tile64.fits(&automatic));
         assert!(
             automatic
-                .challengers(legacy, Some(&reduced))
+                .challengers(legacy, Some(&reduced), &[])
                 .iter()
                 .all(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
         );
@@ -1989,7 +2011,7 @@ mod tests {
             );
 
             let initial = MatmulTile::selected(dispatch, None).unwrap();
-            let mut seen = class.challengers(initial, None);
+            let mut seen = class.challengers(initial, None, &[]);
             seen.push(initial);
             for threads in GemvShape::WIDTHS {
                 for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
@@ -2046,7 +2068,7 @@ mod tests {
             .map(|b| plan.buffers[b.0 as usize])
             .collect();
         let has_subgroup = |class: &TuneClass, initial| {
-            class.challengers(initial, None).iter().any(|tile| {
+            class.challengers(initial, None, &[]).iter().any(|tile| {
                 matches!(
                     tile,
                     MatmulTile::Gemv(GemvShape {
@@ -2113,7 +2135,7 @@ mod tests {
         let mut class = TuneClass::from_dispatch(&d, None).unwrap();
         assert_eq!((class.m, class.n, class.k), (33, 65, 17));
         class.binding_bytes = class.buffer_sizes().unwrap();
-        for candidate in class.challengers(MatmulTile::Tile64, None) {
+        for candidate in class.challengers(MatmulTile::Tile64, None, &[]) {
             candidate.apply(&mut d, &class);
             assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
             assert_eq!(d.use_small_tiles(), d.workgroups == [3, 2, 1]);
@@ -2269,7 +2291,7 @@ mod tests {
                     90
                 }
             );
-            let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
+            let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)), &[]);
             // Plain tiles and specialized K stages; 32/64-wide tiles also
             // challenge column interleaving. Exclude the incumbent.
             assert_eq!(candidates.len(), 12);
@@ -2707,12 +2729,12 @@ mod tests {
         for class in [class(32, 32, 8), class(2048, 32, 17)] {
             assert!(
                 class
-                    .challengers(MatmulTile::Tile64, Some(&config))
+                    .challengers(MatmulTile::Tile64, Some(&config), &[])
                     .contains(&native)
             );
             assert!(
                 !class
-                    .challengers(MatmulTile::Tile64, None)
+                    .challengers(MatmulTile::Tile64, None, &[])
                     .contains(&native)
             );
             let f16 = CoopConfig {
@@ -2721,7 +2743,7 @@ mod tests {
             };
             assert!(
                 !class
-                    .challengers(MatmulTile::Tile64, Some(&f16))
+                    .challengers(MatmulTile::Tile64, Some(&f16), &[])
                     .contains(&native)
             );
         }

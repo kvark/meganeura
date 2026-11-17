@@ -1121,11 +1121,15 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
         coop_shape(group).is_some() || group.is_checked_convolution(),
         "no cooperative form for {group:?}"
     );
-    let module = if let Some((addend, variant)) = coop_shape(group)
+    if let Some((addend, variant)) = coop_shape(group)
         && shape == [16, 16, 16]
         && layout.vectorized
     {
-        gen_matmul_coop_stored(
+        assert!(
+            layout.dimensions.is_none(),
+            "native16 staging is not shape-specialized"
+        );
+        return gen_matmul_coop_stored(
             addend,
             variant,
             &CoopConfig {
@@ -1137,30 +1141,9 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             1,
             WeightFormat::F32,
             Some((types, layout)),
-        )
-    } else {
-        cooperative::generate(group, types, shape, subgroup, layout)
-    };
-    if let Some([m, n, k]) = layout.dimensions {
-        assert!(
-            coop_shape(group).is_some(),
-            "dimension specialization is for dense products"
         );
-        assert!(m > 0 && n > 0 && k > 0);
-        ShaderModule::with_hint(
-            preprocess(
-                &module.source,
-                &[
-                    ("params.m", &format!("{m}u")),
-                    ("params.n", &format!("{n}u")),
-                    ("params.k", &format!("{k}u")),
-                ],
-            ),
-            module.hint,
-        )
-    } else {
-        module
     }
+    cooperative::generate(group, types, shape, subgroup, layout)
 }
 
 pub(crate) fn generate_checked_conv(
