@@ -47,18 +47,20 @@ pub(super) fn generate_with_params(
         coop_shape(group).map(|(_, variant)| variant)
     };
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
+    assert!(
+        layout.dimensions.is_none() || coop_shape(group).is_some(),
+        "only dense products specialize dimensions"
+    );
+    let dense_dimensions = match layout.dimensions {
+        Some([rows, columns, depth]) => {
+            format!("let m = {rows}u; let n = {columns}u; let k = {depth}u;")
+        }
+        None => "let m = params.m; let n = params.n; let k = params.k;".to_owned(),
+    };
     let vector_conv = !pointwise && params.is_some_and(Params::vectorized_forward);
     let vector_dense = layout.vectorized && variant.is_some();
     let global_a = layout.direct_inputs && vector_dense && types.a == types.multiply;
     let global_b = layout.direct_inputs && vector_dense && types.b == types.multiply;
-    let specialized_dimensions = layout.dimensions.map(|[m, n, k]| {
-        assert!(
-            coop_shape(group).is_some(),
-            "dimension specialization is for dense products"
-        );
-        assert!(m > 0 && n > 0 && k > 0);
-        format!("let m = {m}u; let n = {n}u; let k = {k}u;")
-    });
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -87,9 +89,7 @@ pub(super) fn generate_with_params(
             }
             (
                 declaration,
-                specialized_dimensions
-                    .as_deref()
-                    .unwrap_or("let m = params.m; let n = params.n; let k = params.k;"),
+                dense_dimensions.as_str(),
                 split_range.as_str(),
                 if variant == MatMulCoopVariant::AT {
                     "$DENSE_A_AT"
@@ -624,22 +624,22 @@ mod tests {
             }
         }
         for (group, types, shape, index) in cases {
-            let mut layout = [
-                super::super::TypedMatmulLayout::default(),
-                super::super::TypedMatmulLayout {
-                    vectorized: true,
-                    direct_output: false,
-                    ..Default::default()
-                },
-                super::super::TypedMatmulLayout::for_product(
-                    types,
-                    coop_shape(group).is_some_and(|(addend, _)| addend),
-                    [64, 64, 64],
-                ),
-            ][index % 3];
-            if coop_shape(group).is_some() && shape != [16, 16, 16] && index % 2 == 0 {
-                layout.dimensions = Some([64, 96, 32]);
-            }
+            let layout = super::super::TypedMatmulLayout {
+                dimensions: (coop_shape(group).is_some() && index % 2 == 0).then_some([64, 96, 32]),
+                ..[
+                    super::super::TypedMatmulLayout::default(),
+                    super::super::TypedMatmulLayout {
+                        vectorized: true,
+                        direct_output: false,
+                        ..Default::default()
+                    },
+                    super::super::TypedMatmulLayout::for_product(
+                        types,
+                        coop_shape(group).is_some_and(|(addend, _)| addend),
+                        [64, 64, 64],
+                    ),
+                ][index % 3]
+            };
             let subgroup = if layout.vectorized { 16 } else { 32 };
             let mut module = super::super::generate_module_coop_typed_with_subgroup(
                 group, types, shape, layout, subgroup,

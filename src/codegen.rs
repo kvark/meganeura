@@ -1121,14 +1121,13 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
         coop_shape(group).is_some() || group.is_checked_convolution(),
         "no cooperative form for {group:?}"
     );
+    // The native16 stored kernel reads uniform dimensions; constant
+    // dimensions belong to the checked generator.
     if let Some((addend, variant)) = coop_shape(group)
         && shape == [16, 16, 16]
         && layout.vectorized
+        && layout.dimensions.is_none()
     {
-        assert!(
-            layout.dimensions.is_none(),
-            "native16 staging is not shape-specialized"
-        );
         return gen_matmul_coop_stored(
             addend,
             variant,

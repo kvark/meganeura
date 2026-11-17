@@ -1237,7 +1237,7 @@ fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTyp
     }
 }
 
-fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout {
+fn typed_matmul_layout(dispatch: &Dispatch, specialize: bool) -> crate::codegen::TypedMatmulLayout {
     let types = checked_matrix_types(dispatch).expect("typed matrix product");
     let Some((m, n, k)) = dispatch.mnk() else {
         assert!(matches!(
@@ -1246,26 +1246,19 @@ fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout
         ));
         return crate::codegen::TypedMatmulLayout::default();
     };
-    let mut layout = crate::codegen::TypedMatmulLayout::for_product(
-        types,
-        matches!(
-            dispatch.shader,
-            ShaderEntry::FusedMatMulAdd
-                | ShaderEntry::FusedMatMulATAdd
-                | ShaderEntry::FusedMatMulBTAdd
-        ),
-        [m, n, k],
-    );
-    if matches!(
-        dispatch.kernel,
-        crate::compile::Kernel::CooperativeTyped {
-            specialize: true,
-            ..
-        }
-    ) {
-        layout.dimensions = Some([m, n, k]);
+    crate::codegen::TypedMatmulLayout {
+        dimensions: specialize.then_some([m, n, k]),
+        ..crate::codegen::TypedMatmulLayout::for_product(
+            types,
+            matches!(
+                dispatch.shader,
+                ShaderEntry::FusedMatMulAdd
+                    | ShaderEntry::FusedMatMulATAdd
+                    | ShaderEntry::FusedMatMulBTAdd
+            ),
+            [m, n, k],
+        )
     }
-    layout
 }
 
 /// Reduced storage types, and the multiplication types of checked
@@ -2370,14 +2363,17 @@ impl Pipelines {
                 dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
             );
         }
-        if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
+        if let crate::compile::Kernel::CooperativeTyped {
+            types, specialize, ..
+        } = dispatch.kernel
+        {
             if matches!(
                 entry,
                 ShaderEntry::Conv2dGemmCoopGen(..) | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
             ) {
                 return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
             }
-            let mut layout = typed_matmul_layout(dispatch);
+            let mut layout = typed_matmul_layout(dispatch, specialize);
             // The native16 stored generator does not use direct_inputs.
             // Normalize it before any pipeline lookup, including tuning reuse.
             if crate::codegen::checked_cooperative_shape(cooperative_shapes(

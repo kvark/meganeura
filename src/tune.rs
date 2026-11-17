@@ -1073,8 +1073,9 @@ impl TuneClass {
         if let Some(types) = self.effective_matrix_types() {
             let mut candidates = Vec::new();
             if self.matrix_types.is_some() {
-                // A single additional pipeline specializes dimensions; K
-                // partition counts remain uniforms and share that pipeline.
+                // Constant dimensions serve the direct-load generator; native16
+                // devices keep the stored kernel. Partition counts stay uniforms,
+                // so one extra pipeline serves every count.
                 let specialize = crate::codegen::checked_cooperative_shape(native_shapes)
                     .is_some_and(|shape| shape != [16, 16, 16])
                     && types.b == types.multiply
@@ -1086,15 +1087,18 @@ impl TuneClass {
                         self.shader,
                         ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
                     );
-                candidates.extend([1, 2, 4, 8, 16].into_iter().flat_map(|splits| {
-                    [false, true]
-                        .into_iter()
-                        .filter(move |&s| !s || specialize)
-                        .map(move |specialize| MatmulTile::CooperativeChecked {
+                for splits in [1, 2, 4, 8, 16] {
+                    candidates.push(MatmulTile::CooperativeChecked {
+                        splits,
+                        specialize: false,
+                    });
+                    if specialize {
+                        candidates.push(MatmulTile::CooperativeChecked {
                             splits,
-                            specialize,
-                        })
-                }));
+                            specialize: true,
+                        });
+                    }
+                }
             } else if let Some(config) = config.filter(|c| c.use_f16_input) {
                 candidates.push(MatmulTile::CooperativeF16 {
                     tile_size: config.tile_size,

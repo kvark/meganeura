@@ -455,16 +455,13 @@ pub(super) fn tile_module(
                     &tile.coop_config().expect("cooperative candidate"),
                 )
             }
-            MatmulTile::CooperativeChecked { .. } => {
-                let mut selected = dispatch.clone();
-                tile.configure(&mut selected);
-                let dispatch = &selected;
+            MatmulTile::CooperativeChecked { specialize, .. } => {
                 let types = super::checked_matrix_types(dispatch).expect("checked tile types");
                 crate::codegen::generate_module_coop_typed_with_layout(
                     entry.shader_group(),
                     types,
                     [16, 16, 16],
-                    super::typed_matmul_layout(dispatch),
+                    super::typed_matmul_layout(dispatch, specialize),
                 )
             }
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
