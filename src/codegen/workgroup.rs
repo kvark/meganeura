@@ -8,6 +8,9 @@ pub struct WorkgroupMatmulShape {
     pub columns: u32,
     pub k_stage: u32,
     pub threads: u32,
+    /// Read both operands as vectors into padded shared-memory tiles.
+    #[serde(default)]
+    pub stage_operands: bool,
 }
 
 impl WorkgroupMatmulShape {
@@ -26,11 +29,19 @@ impl WorkgroupMatmulShape {
         ]
         .into_iter()
         .flat_map(|(rows, columns, threads)| {
-            [32, 64].map(|k_stage| Self {
-                rows,
-                columns,
-                k_stage,
-                threads,
+            [32, 64].into_iter().flat_map(move |k_stage| {
+                [false, true]
+                    .into_iter()
+                    // Keep staging to one small and one tall tile. Expanding
+                    // every tile spends the model search budget on compilation.
+                    .filter(move |&stage| !stage || (columns == 64 && matches!(rows, 32 | 128)))
+                    .map(move |stage_operands| Self {
+                        rows,
+                        columns,
+                        k_stage,
+                        threads,
+                        stage_operands,
+                    })
             })
         })
     }
@@ -86,14 +97,13 @@ impl WorkgroupMatmulShape {
 
     pub fn shared_bytes(self, types: MatrixTypes, row_bounds: bool) -> Option<u32> {
         let mut bytes = 0u32;
-        for (storage, extent, bounded) in [
-            (types.a, self.rows, row_bounds),
-            (types.b, self.columns, false),
+        for (storage, rows, cols, bounded) in [
+            (types.a, self.rows, self.k_stage, row_bounds),
+            (types.b, self.k_stage, self.columns, false),
         ] {
-            if storage != types.multiply || bounded {
+            if self.stage_operands || storage != types.multiply || bounded {
                 bytes = bytes.checked_add(
-                    extent
-                        .checked_mul(self.k_stage)?
+                    rows.checked_mul(cols.checked_add(if self.stage_operands { 8 } else { 0 })?)?
                         .checked_mul(MatrixTypes::bytes(types.multiply) as u32)?,
                 )?;
             }
@@ -121,6 +131,7 @@ pub fn generate_workgroup_matmul(
         columns: n,
         k_stage: k,
         threads,
+        stage_operands,
     } = shape;
     assert!([m, n, k].iter().all(|&s| s > 0 && s.is_multiple_of(4)) && threads > 0);
     let multiply = MatrixTypes::name(types.multiply);
@@ -134,18 +145,19 @@ pub fn generate_workgroup_matmul(
     }
     source +=
         "struct Params { m: u32, n: u32, k: u32, splits: u32 }\nvar<uniform> params: Params;\n";
-    for (name, storage, extent) in [("a", types.a, m), ("b", types.b, n)] {
+    let padding = if stage_operands { 8 } else { 0 };
+    for (name, storage, rows, cols) in [("a", types.a, m, k), ("b", types.b, k, n)] {
         let scalar = MatrixTypes::name(storage);
-        let storage_name = if storage != types.multiply {
+        let storage_name = if stage_operands || storage != types.multiply {
             format!("vec4<{scalar}>")
         } else {
             scalar.to_owned()
         };
         source += &format!("var<storage> matrix_{name}: array<{storage_name}>;\n");
-        if storage != types.multiply || (name == "a" && row_bounds) {
+        if stage_operands || storage != types.multiply || (name == "a" && row_bounds) {
             source += &format!(
                 "var<workgroup> s{name}: array<{multiply}, {}>;\n",
-                extent * k
+                rows * (cols + padding)
             );
         }
     }
@@ -173,7 +185,10 @@ pub fn generate_workgroup_matmul(
         } else {
             ("b", k, n, "B")
         };
-        if storage != types.multiply {
+        if stage_operands || storage != types.multiply {
+            // Eight half elements rotate the shared-memory bank assignment
+            // between rows while preserving the matrix-load alignment.
+            let pitch = cols + padding;
             let width = if transpose { rows } else { cols };
             let index = match (a, transpose) {
                 (true, false) => "(row + r) * k + t + c",
@@ -181,7 +196,9 @@ pub fn generate_workgroup_matmul(
                 (false, false) => "(t + r) * n + col + c",
                 (false, true) => "(col + r) * k + t + c",
             };
-            let cast = if types.multiply == DType::BF16 {
+            let cast = if storage == types.multiply {
+                ""
+            } else if types.multiply == DType::BF16 {
                 "round_bf16"
             } else {
                 multiply
@@ -211,15 +228,15 @@ pub fn generate_workgroup_matmul(
             }
             for (lane, field) in ["x", "y", "z", "w"].iter().enumerate() {
                 let index = if transpose {
-                    format!("(c + {lane}u) * {cols}u + r")
+                    format!("(c + {lane}u) * {pitch}u + r")
                 } else {
-                    format!("r * {cols}u + c + {lane}u")
+                    format!("r * {pitch}u + c + {lane}u")
                 };
                 source += &format!("s{name}[{index}] = {cast}(v.{field});\n");
             }
             source += "}\nworkgroupBarrier();\n";
             source += &format!(
-                "let {name} = coopLoadT<coop_mat{cols}x{rows}<{multiply},{role},workgroup>>(&s{name}[0], {cols}u);\n"
+                "let {name} = coopLoadT<coop_mat{cols}x{rows}<{multiply},{role},workgroup>>(&s{name}[0], {pitch}u);\n"
             );
         } else if a && row_bounds {
             let width = if transpose { rows } else { cols };
@@ -246,7 +263,7 @@ pub fn generate_workgroup_matmul(
         }
     }
     source += "acc = coopMultiplyAdd(a,b,acc);\n";
-    if row_bounds || types.a != types.multiply || types.b != types.multiply {
+    if stage_operands || row_bounds || types.a != types.multiply || types.b != types.multiply {
         source += "workgroupBarrier();\n";
     }
     source += "}\n";
@@ -292,10 +309,8 @@ pub fn generate_workgroup_matmul(
 mod tests {
     use super::*;
 
-    /// Every group meets every operand conversion with both row-bound
-    /// variants; the multiply type alternates so each group and conversion
-    /// meets both, and outputs and shapes cycle so each shape meets every
-    /// output and each tile both row-bound variants.
+    /// Cycle tiles and output storage through layouts and operand conversions,
+    /// exercising both staging modes and guarded rows.
     #[test]
     fn rectangular_typed_modules_validate_and_emit_spirv() {
         let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
@@ -323,21 +338,26 @@ mod tests {
                 let multiply = [DType::F16, DType::BF16][(g + p) % 2];
                 let operand = |f32| if f32 { DType::F32 } else { multiply };
                 for row_bounds in [false, true] {
-                    let types = MatrixTypes {
-                        a: operand(a_f32),
-                        b: operand(b_f32),
-                        multiply,
-                        output: outputs[index % outputs.len()],
-                    };
-                    let shape = shapes[index % shapes.len()];
-                    index += 1;
-                    let mut module = generate_workgroup_matmul(group, shape, types, row_bounds);
-                    super::super::validate_shader_for_test(
-                        &mut module.module,
-                        capabilities,
-                        (1, 6),
-                    )
-                    .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
+                    for stage_operands in [false, true] {
+                        let types = MatrixTypes {
+                            a: operand(a_f32),
+                            b: operand(b_f32),
+                            multiply,
+                            output: outputs[index % outputs.len()],
+                        };
+                        let shape = WorkgroupMatmulShape {
+                            stage_operands,
+                            ..shapes[(index / 2) % shapes.len()]
+                        };
+                        index += 1;
+                        let mut module = generate_workgroup_matmul(group, shape, types, row_bounds);
+                        super::super::validate_shader_for_test(
+                            &mut module.module,
+                            capabilities,
+                            (1, 6),
+                        )
+                        .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
+                    }
                 }
             }
         }

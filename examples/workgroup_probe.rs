@@ -45,6 +45,7 @@ fn session(
 
 fn main() {
     let gpu = meganeura::reference::gpu::shared_context();
+    let stage_operands = std::env::args().any(|arg| arg == "--stage-operands");
     eprintln!("capabilities {:?}", gpu.capabilities().cooperative_matrix);
     let sweep = std::env::var_os("SWEEP").is_some();
     let smoke = std::env::var_os("SMOKE").is_some();
@@ -59,6 +60,7 @@ fn main() {
             columns: values[1],
             k_stage: values[2],
             threads: values[3],
+            stage_operands,
         }]
     } else if sweep {
         [
@@ -78,6 +80,7 @@ fn main() {
             columns,
             k_stage,
             threads,
+            stage_operands,
         })
         .to_vec()
     } else {
@@ -86,6 +89,7 @@ fn main() {
             columns: 64,
             k_stage: 32,
             threads: 64,
+            stage_operands,
         }]
     };
     if search {

@@ -5,6 +5,7 @@ use serde_json::json;
 fn main() {
     let gpu = meganeura::reference::gpu::shared_context();
     let large = std::env::args().any(|arg| arg == "--large-tile");
+    let stage_operands = std::env::args().any(|arg| arg == "--stage-operands");
     for bf16 in [false, true] {
         let tile = if large {
             WorkgroupMatmulShape {
@@ -12,6 +13,7 @@ fn main() {
                 columns: 256,
                 k_stage: if bf16 { 64 } else { 32 },
                 threads: 256,
+                stage_operands,
             }
         } else {
             WorkgroupMatmulShape {
@@ -19,20 +21,27 @@ fn main() {
                 columns: 64,
                 k_stage: 32,
                 threads: 64,
+                stage_operands,
             }
         };
-        let shapes = if large {
-            [
+        let shapes: &[(usize, usize, usize)] = if large {
+            &[
                 (128, 256, 64),
                 (256, 512, 128),
                 (129, 256, 64),
                 (128, 257, 64),
             ]
         } else {
-            [(64, 64, 32), (128, 576, 576), (192, 320, 96), (65, 96, 33)]
+            &[
+                (64, 64, 32),
+                (128, 576, 576),
+                (192, 320, 96),
+                (65, 64, 32),
+                (65, 96, 33),
+            ]
         };
         for layout in ["nn", "at", "bt"] {
-            for (m, n, k) in shapes {
+            for &(m, n, k) in shapes {
                 let mut graph = Graph::new();
                 let a = graph.input("a", &if layout == "at" { [k, m] } else { [m, k] });
                 let b = graph.parameter("b", &if layout == "bt" { [n, k] } else { [k, n] });

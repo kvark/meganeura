@@ -43,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 13;
+const KERNEL_MEMO_REVISION: u32 = 14;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -2806,6 +2806,7 @@ mod tests {
             columns: 128,
             k_stage: 64,
             threads: 128,
+            stage_operands: false,
         };
         let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 2 };
         assert!(tile.fits(&class.key));
