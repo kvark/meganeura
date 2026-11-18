@@ -2373,17 +2373,22 @@ impl Pipelines {
             ) {
                 return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
             }
-            let mut layout = typed_matmul_layout(dispatch, specialize);
-            // The native16 stored generator does not use direct_inputs.
-            // Normalize it before any pipeline lookup, including tuning reuse.
-            if crate::codegen::checked_cooperative_shape(cooperative_shapes(
+            let layout = typed_matmul_layout(dispatch, specialize);
+            // The stored kernel does not read direct_inputs. Normalize it
+            // before any pipeline lookup, including tuning reuse.
+            let stored = crate::codegen::checked_cooperative_shape(cooperative_shapes(
                 &caps.cooperative_matrix,
                 types.multiply,
-            )) == Some([16, 16, 16])
-            {
-                layout.direct_inputs = false;
-            }
-            return Variant::CoopTyped(entry, types, layout);
+            ))
+            .is_some_and(|shape| layout.uses_stored_kernel(shape));
+            return Variant::CoopTyped(
+                entry,
+                types,
+                crate::codegen::TypedMatmulLayout {
+                    direct_inputs: layout.direct_inputs && !stored,
+                    ..layout
+                },
+            );
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
             return Variant::CoopTiled(

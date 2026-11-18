@@ -1073,20 +1073,22 @@ impl TuneClass {
         if let Some(types) = self.effective_matrix_types() {
             let mut candidates = Vec::new();
             if self.matrix_types.is_some() {
-                // Constant dimensions serve the direct-load generator; native16
-                // devices keep the stored kernel. Partition counts stay uniforms,
-                // so one extra pipeline serves every count.
-                let specialize = crate::codegen::checked_cooperative_shape(native_shapes)
-                    .is_some_and(|shape| shape != [16, 16, 16])
+                // Constant dimensions specialize the checked generator's direct
+                // native B loads. Partition counts stay uniforms, so one extra
+                // pipeline serves every count.
+                let generic = crate::codegen::TypedMatmulLayout::for_product(
+                    types,
+                    self.has_addend(),
+                    [self.m, self.n, self.k],
+                );
+                let specialize = generic.direct_inputs
                     && types.b == types.multiply
-                    && matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
-                    && [self.m, self.n, self.k]
-                        .into_iter()
-                        .all(|s| s.is_multiple_of(32))
                     && !matches!(
                         self.shader,
                         ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
-                    );
+                    )
+                    && crate::codegen::checked_cooperative_shape(native_shapes)
+                        .is_some_and(|shape| !generic.uses_stored_kernel(shape));
                 for splits in [1, 2, 4, 8, 16] {
                     candidates.push(MatmulTile::CooperativeChecked {
                         splits,

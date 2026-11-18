@@ -1097,6 +1097,13 @@ impl TypedMatmulLayout {
                 && n.is_multiple_of(16),
         }
     }
+
+    /// Vector products with uniform dimensions on a 16×16×16 tile use the
+    /// stored dense kernel, which stages every operand; all others use the
+    /// checked generator.
+    pub(crate) fn uses_stored_kernel(self, shape: [u32; 3]) -> bool {
+        shape == [16, 16, 16] && self.vectorized && self.dimensions.is_none()
+    }
 }
 
 /// Generate the shared staged dense kernel, or the checked rectangular/
@@ -1121,12 +1128,8 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
         coop_shape(group).is_some() || group.is_checked_convolution(),
         "no cooperative form for {group:?}"
     );
-    // The native16 stored kernel reads uniform dimensions; constant
-    // dimensions belong to the checked generator.
     if let Some((addend, variant)) = coop_shape(group)
-        && shape == [16, 16, 16]
-        && layout.vectorized
-        && layout.dimensions.is_none()
+        && layout.uses_stored_kernel(shape)
     {
         return gen_matmul_coop_stored(
             addend,
