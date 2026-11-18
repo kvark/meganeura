@@ -72,6 +72,7 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
             } else if let Kernel::CooperativeTyped {
                 ref mut types,
                 splits: 1,
+                ..
             } = producer.kernel
             {
                 assert_eq!(types.output, crate::DType::F32);

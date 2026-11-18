@@ -1078,11 +1078,14 @@ pub struct TypedMatmulLayout {
     pub direct_output: bool,
     /// Native operands may bypass staging when all 32x32 K/output tiles fit.
     pub direct_inputs: bool,
+    /// Shape-specialized alternative to uniform dimensions. Part of pipeline identity.
+    pub dimensions: Option<[u32; 3]>,
 }
 
 impl TypedMatmulLayout {
     pub fn for_product(types: MatrixTypes, addend: bool, [m, n, k]: [u32; 3]) -> Self {
         Self {
+            dimensions: None,
             vectorized: (u64::from(m) * u64::from(k)).is_multiple_of(4)
                 && (u64::from(k) * u64::from(n)).is_multiple_of(4),
             direct_inputs: matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
@@ -1093,6 +1096,13 @@ impl TypedMatmulLayout {
                 && m.is_multiple_of(16)
                 && n.is_multiple_of(16),
         }
+    }
+
+    /// Vector products with uniform dimensions on a 16×16×16 tile use the
+    /// stored dense kernel, which stages every operand; all others use the
+    /// checked generator.
+    pub(crate) fn uses_stored_kernel(self, shape: [u32; 3]) -> bool {
+        shape == [16, 16, 16] && self.vectorized && self.dimensions.is_none()
     }
 }
 
@@ -1119,8 +1129,7 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
         "no cooperative form for {group:?}"
     );
     if let Some((addend, variant)) = coop_shape(group)
-        && shape == [16, 16, 16]
-        && layout.vectorized
+        && layout.uses_stored_kernel(shape)
     {
         return gen_matmul_coop_stored(
             addend,

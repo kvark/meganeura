@@ -101,7 +101,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
                 && d.matmul_prologue.is_none()
                 && d.matmul_epilogue.is_none()
                 && (matches!(d.kernel,
-                    Kernel::CooperativeTyped { types, splits: 1 }
+                    Kernel::CooperativeTyped { types, splits: 1, .. }
                     | Kernel::CooperativeWorkgroup { types: Some(types), splits: 1, .. }
                     if types.output == DType::F32)
                     && d.shader.is_matmul()

@@ -43,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 14;
+const KERNEL_MEMO_REVISION: u32 = 16;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -455,13 +455,13 @@ pub(super) fn tile_module(
                     &tile.coop_config().expect("cooperative candidate"),
                 )
             }
-            MatmulTile::CooperativeChecked { .. } => {
+            MatmulTile::CooperativeChecked { specialize, .. } => {
                 let types = super::checked_matrix_types(dispatch).expect("checked tile types");
                 crate::codegen::generate_module_coop_typed_with_layout(
                     entry.shader_group(),
                     types,
                     [16, 16, 16],
-                    super::typed_matmul_layout(dispatch),
+                    super::typed_matmul_layout(dispatch, specialize),
                 )
             }
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
@@ -615,6 +615,7 @@ fn collect_classes(
     plan: &crate::compile::ExecutionPlan,
     alias: &crate::memplan::AliasPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
+    capabilities: &bg::Capabilities,
 ) -> (Vec<SearchClass>, usize) {
     let mut classes: Vec<SearchClass> = Vec::new();
     let mut indices = HashMap::new();
@@ -690,8 +691,11 @@ fn collect_classes(
             }
             _ => None,
         };
+        let native_shapes = key.effective_matrix_types().map_or(&[][..], |types| {
+            super::cooperative_shapes(&capabilities.cooperative_matrix, types.multiply)
+        });
         let challengers = key
-            .challengers(initial, coop_config)
+            .challengers(initial, coop_config, native_shapes)
             .into_iter()
             .filter(|candidate| Some(*candidate) != equivalent)
             .collect();
@@ -754,9 +758,20 @@ impl Session {
                 "tuning swap requires compatible sessions on one context",
             ));
         }
-        let left_classes = collect_classes(&self.plan, &self.alias, self.coop_config.as_ref()).0;
-        let right_classes =
-            collect_classes(&other.plan, &other.alias, other.coop_config.as_ref()).0;
+        let left_classes = collect_classes(
+            &self.plan,
+            &self.alias,
+            self.coop_config.as_ref(),
+            &self.gpu.capabilities(),
+        )
+        .0;
+        let right_classes = collect_classes(
+            &other.plan,
+            &other.alias,
+            other.coop_config.as_ref(),
+            &other.gpu.capabilities(),
+        )
+        .0;
         let swaps = selection_swaps(
             &self.plan.dispatches,
             &other.plan.dispatches,
@@ -828,9 +843,13 @@ impl Session {
 
     /// Eligible classes in search order, and the dispatches outside them.
     fn tune_classes(&self, options: &TuneOptions) -> (Vec<SearchClass>, usize) {
-        let (mut classes, excluded_dispatches) =
-            collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
         let capabilities = self.gpu.capabilities();
+        let (mut classes, excluded_dispatches) = collect_classes(
+            &self.plan,
+            &self.alias,
+            self.coop_config.as_ref(),
+            &capabilities,
+        );
         let left_out = retain_tunable_classes(&mut classes, &options.scope, &capabilities);
         if options.strategy == TuneStrategy::Race {
             for class in &mut classes {
@@ -2758,13 +2777,19 @@ mod tests {
             };
             key.binding_bytes = key.buffer_sizes().unwrap();
             let (initial, config) = if types.is_some() {
-                (MatmulTile::CooperativeChecked { splits: 1 }, None)
+                (
+                    MatmulTile::CooperativeChecked {
+                        splits: 1,
+                        specialize: false,
+                    },
+                    None,
+                )
             } else if automatic {
                 (MatmulTile::CooperativeF16 { tile_size: 16 }, Some(&reduced))
             } else {
                 (MatmulTile::CooperativeF32 { tile_size: 16 }, Some(&native))
             };
-            let challengers = key.challengers(initial, config);
+            let challengers = key.challengers(initial, config, &[]);
             let mut classes = vec![SearchClass {
                 input_b_copies: 1,
                 key,
@@ -2798,7 +2823,7 @@ mod tests {
         let mut plan = crate::compile::compile(&graph);
         let original = plan.clone();
         let alias = crate::memplan::AliasPlan::identity(&plan.buffers);
-        let (classes, _) = collect_classes(&plan, &alias, None);
+        let (classes, _) = collect_classes(&plan, &alias, None, &bg::Capabilities::default());
         let class = &classes[0];
         assert!(class.key.split_k);
         let shape = WorkgroupMatmulShape {
@@ -2822,14 +2847,18 @@ mod tests {
             }
         ));
         assert_eq!(plan.dispatches[class.reductions[0]].params[0], 2);
-        let reloaded = collect_classes(&plan, &alias, None).0;
+        let reloaded = collect_classes(&plan, &alias, None, &bg::Capabilities::default()).0;
         assert_eq!(reloaded[0].key, class.key);
         assert!(reloaded[0].challengers.contains(&class.initial));
         class.install(&mut plan.dispatches, class.initial);
         assert_eq!(plan, original);
         class.install(&mut plan.dispatches, tile);
         plan.dispatches[class.reductions[0]].params[0] = 4;
-        assert!(collect_classes(&plan, &alias, None).0.is_empty());
+        assert!(
+            collect_classes(&plan, &alias, None, &bg::Capabilities::default())
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2851,7 +2880,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (classes, _) = collect_classes(&session.plan, &session.alias, None);
+        let (classes, _) = collect_classes(
+            &session.plan,
+            &session.alias,
+            None,
+            &bg::Capabilities::default(),
+        );
         let class = &classes[0];
         let options = TuneOptions {
             max_time: Duration::from_secs(30),
@@ -3487,7 +3521,7 @@ mod tests {
         let mut left = crate::compile::compile_with(&graph, &Default::default());
         super::super::select_variants(&mut left, None, false, false);
         let alias = crate::memplan::AliasPlan::identity(&left.buffers);
-        let classes = collect_classes(&left, &alias, None).0;
+        let classes = collect_classes(&left, &alias, None, &bg::Capabilities::default()).0;
         let mut right = left.clone();
         for class in &classes {
             for &index in &class.members {
@@ -3501,7 +3535,7 @@ mod tests {
                 .apply(&mut right.dispatches[index], &class.key);
             }
         }
-        let right_classes = collect_classes(&right, &alias, None).0;
+        let right_classes = collect_classes(&right, &alias, None, &bg::Capabilities::default()).0;
         let swaps = selection_swaps(
             &left.dispatches,
             &right.dispatches,
@@ -3554,7 +3588,8 @@ mod tests {
                 use_f16_input: true,
                 ..config
             };
-            let classes = collect_classes(&left, &alias, Some(&config)).0;
+            let classes =
+                collect_classes(&left, &alias, Some(&config), &bg::Capabilities::default()).0;
             let mut right = left.clone();
             MatmulTile::CooperativeF32 { tile_size }
                 .apply(&mut right.dispatches[0], &classes[0].key);
@@ -3564,7 +3599,7 @@ mod tests {
                     &left.dispatches,
                     &right.dispatches,
                     &classes,
-                    &collect_classes(right, &alias, Some(config)).0,
+                    &collect_classes(right, &alias, Some(config), &bg::Capabilities::default()).0,
                 )
             };
             let swaps = swaps_to(&right, &config).unwrap();
@@ -3662,7 +3697,9 @@ mod tests {
             }
             values
         };
-        let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
+        let class = collect_classes(&b.plan, &b.alias, None, &bg::Capabilities::default())
+            .0
+            .remove(0);
         let alternative = if convolution {
             MatmulTile::SpecializedConv {
                 tile_size: 32,
@@ -3769,7 +3806,8 @@ mod tests {
             );
         };
         let alias = crate::memplan::AliasPlan::identity(&plan.buffers);
-        let (classes, excluded) = collect_classes(&plan, &alias, Some(&config));
+        let (classes, excluded) =
+            collect_classes(&plan, &alias, Some(&config), &bg::Capabilities::default());
         assert_eq!((classes.len(), excluded), (1, 1));
         let class = &classes[0];
         assert!(class.key.split_k);
@@ -3788,7 +3826,7 @@ mod tests {
         assert_eq!(plan.dispatches[0].workgroups[2], 4);
         assert_eq!(plan.dispatches[1].params[0], 4);
         // The allocation still holds sixteen partitions.
-        let classes = collect_classes(&plan, &alias, Some(&config)).0;
+        let classes = collect_classes(&plan, &alias, Some(&config), &bg::Capabilities::default()).0;
         assert!(
             classes[0]
                 .challengers
@@ -3796,7 +3834,11 @@ mod tests {
         );
         // A split whose sum disagrees is not tunable.
         plan.dispatches[1].params[0] = 16;
-        assert!(collect_classes(&plan, &alias, Some(&config)).0.is_empty());
+        assert!(
+            collect_classes(&plan, &alias, Some(&config), &bg::Capabilities::default())
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4084,7 +4126,8 @@ mod tests {
             },
         );
         let mut alias = crate::memplan::AliasPlan::identity(&plan.buffers);
-        let (classes, excluded) = collect_classes(&plan, &alias, None);
+        let (classes, excluded) =
+            collect_classes(&plan, &alias, None, &bg::Capabilities::default());
         assert_eq!(excluded, 0);
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].members.len(), 2);
@@ -4095,16 +4138,28 @@ mod tests {
         alias.map[weight] = alias.map[input];
         alias.offsets[weight] = plan.buffers[input];
         alias.sizes[alias.map[input]] = plan.buffers[input] + plan.buffers[weight];
-        let (classes, excluded) = collect_classes(&plan, &alias, None);
+        let (classes, excluded) =
+            collect_classes(&plan, &alias, None, &bg::Capabilities::default());
         assert_eq!((classes.len(), excluded), (1, 0));
         assert_eq!(classes[0].members.len(), 2);
         alias.offsets[weight] -= 4;
-        assert_eq!(collect_classes(&plan, &alias, None).1, 1);
+        assert_eq!(
+            collect_classes(&plan, &alias, None, &bg::Capabilities::default()).1,
+            1
+        );
         alias = crate::memplan::AliasPlan::identity(&plan.buffers);
         alias.device_local[plan.dispatches[1].output_buffer.0 as usize] = true;
-        assert_eq!(collect_classes(&plan, &alias, None).0.len(), 2);
+        assert_eq!(
+            collect_classes(&plan, &alias, None, &bg::Capabilities::default())
+                .0
+                .len(),
+            2
+        );
         plan.dispatches[0].input_buffers[1] = plan.dispatches[0].output_buffer;
-        assert_eq!(collect_classes(&plan, &alias, None).1, 1);
+        assert_eq!(
+            collect_classes(&plan, &alias, None, &bg::Capabilities::default()).1,
+            1
+        );
     }
 
     #[test]
@@ -4351,7 +4406,11 @@ mod tests {
                 };
                 let dispatch = Dispatch {
                     shader: ShaderEntry::MatMulBT,
-                    kernel: Kernel::CooperativeTyped { types, splits: 4 },
+                    kernel: Kernel::CooperativeTyped {
+                        types,
+                        splits: 4,
+                        specialize: false,
+                    },
                     input_buffers: vec![BufferRef(0), BufferRef(1)],
                     output_buffer: BufferRef(2),
                     params: vec![3, 5, 1031, 0],
@@ -4364,8 +4423,18 @@ mod tests {
                 // The compiled partial buffer holds four partitions.
                 *class.binding_bytes.last_mut().unwrap() *= 4;
                 assert_eq!(
-                    class.challengers(MatmulTile::CooperativeChecked { splits: 4 }, None),
-                    vec![MatmulTile::CooperativeChecked { splits: 2 }]
+                    class.challengers(
+                        MatmulTile::CooperativeChecked {
+                            splits: 4,
+                            specialize: false
+                        },
+                        None,
+                        &[]
+                    ),
+                    vec![MatmulTile::CooperativeChecked {
+                        splits: 2,
+                        specialize: false
+                    }]
                 );
                 assert!(!MatmulTile::Tile32.fits(&class));
                 let mut locked = dispatch.clone();
@@ -4423,7 +4492,7 @@ mod tests {
     fn classes_without_challengers_do_not_take_class_slots() {
         let plan = mixed_typed_and_ordinary_plan();
         let alias = crate::memplan::plan_no_alias(&plan, &plan.groups, None);
-        let (mut classes, _) = collect_classes(&plan, &alias, None);
+        let (mut classes, _) = collect_classes(&plan, &alias, None, &bg::Capabilities::default());
         assert_eq!(classes.len(), 2);
         assert!(classes[0].key.matrix_types.is_some());
         assert!(
@@ -4453,7 +4522,7 @@ mod tests {
         let mut plan = crate::compile::compile(&graph);
         crate::compile::schedule_dispatches(&mut plan, false, false);
         let alias = crate::memplan::plan_no_alias(&plan, &plan.groups, None);
-        let (classes, _) = collect_classes(&plan, &alias, None);
+        let (classes, _) = collect_classes(&plan, &alias, None, &bg::Capabilities::default());
         assert_eq!(classes.len(), 1);
         // 33 * 1031 halfwords is not a whole number of words.
         assert_eq!(
@@ -4463,7 +4532,10 @@ mod tests {
         // The four compiled partitions bound the partial buffer.
         assert_eq!(
             classes[0].challengers,
-            [MatmulTile::CooperativeChecked { splits: 2 }]
+            [MatmulTile::CooperativeChecked {
+                splits: 2,
+                specialize: false
+            }]
         );
         assert_eq!(classes[0].reductions.len(), 1);
     }

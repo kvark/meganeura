@@ -230,6 +230,8 @@ pub enum MatmulTile {
     /// following SumRows adds, which only a split product has.
     CooperativeChecked {
         splits: u32,
+        #[serde(default)]
+        specialize: bool,
     },
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
@@ -366,9 +368,9 @@ impl MatmulTile {
                 {
                     Some(Self::CooperativeTiled { shape, splits })
                 }
-                Kernel::CooperativeTyped { splits, .. } => {
-                    Some(Self::CooperativeChecked { splits })
-                }
+                Kernel::CooperativeTyped {
+                    splits, specialize, ..
+                } => Some(Self::CooperativeChecked { splits, specialize }),
                 _ => None,
             }
         }
@@ -402,7 +404,7 @@ impl MatmulTile {
         match self {
             Self::CooperativeTiled { splits, .. }
             | Self::CooperativeWorkgroup { splits, .. }
-            | Self::CooperativeChecked { splits } => Some(splits),
+            | Self::CooperativeChecked { splits, .. } => Some(splits),
             _ => None,
         }
     }
@@ -438,7 +440,7 @@ impl MatmulTile {
             };
             return;
         }
-        if let Self::CooperativeChecked { splits } = self {
+        if let Self::CooperativeChecked { splits, specialize } = self {
             let types = match dispatch.kernel {
                 crate::compile::Kernel::CooperativeTyped { types, .. }
                 | crate::compile::Kernel::CooperativeWorkgroup {
@@ -446,7 +448,11 @@ impl MatmulTile {
                 } => types,
                 _ => unreachable!("checked tiles apply to typed products"),
             };
-            dispatch.kernel = crate::compile::Kernel::CooperativeTyped { types, splits };
+            dispatch.kernel = crate::compile::Kernel::CooperativeTyped {
+                types,
+                splits,
+                specialize,
+            };
             return;
         }
         if let Self::Gemv(shape) = self {
@@ -527,7 +533,7 @@ impl MatmulTile {
                 ];
             }
             // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
-            Self::CooperativeChecked { splits } => {
+            Self::CooperativeChecked { splits, .. } => {
                 return [class.m.div_ceil(32), class.n.div_ceil(32), splits];
             }
             Self::CooperativeF32 { .. } | Self::CooperativeF16 { .. } => {
@@ -586,7 +592,7 @@ impl MatmulTile {
         if let Some(types) = class.matrix_types {
             // Workgroup candidates were handled above; subgroup candidates
             // preserve storage too, with F32 partials when split.
-            let Self::CooperativeChecked { splits } = self else {
+            let Self::CooperativeChecked { splits, .. } = self else {
                 return None;
             };
             if splits == 0
@@ -760,7 +766,7 @@ impl TuneClass {
         // Tiled and typed products dispatch one Z layer per K partition.
         let (partitions, matrix_types) = match dispatch.kernel {
             crate::compile::Kernel::CooperativeTiled { splits, .. } => (splits, None),
-            crate::compile::Kernel::CooperativeTyped { types, splits } => (splits, Some(types)),
+            crate::compile::Kernel::CooperativeTyped { types, splits, .. } => (splits, Some(types)),
             crate::compile::Kernel::CooperativeWorkgroup { types, splits, .. } => (splits, types),
             _ => (1, None),
         };
@@ -1000,6 +1006,7 @@ impl TuneClass {
         &self,
         initial: MatmulTile,
         config: Option<&CoopConfig>,
+        native_shapes: &[[u32; 3]],
     ) -> Vec<MatmulTile> {
         if let MatmulTile::Gemv(shape) = initial {
             use crate::codegen::{GemvReduction, GemvShape};
@@ -1066,9 +1073,34 @@ impl TuneClass {
         if let Some(types) = self.effective_matrix_types() {
             let mut candidates = Vec::new();
             if self.matrix_types.is_some() {
-                candidates.extend(
-                    [1, 2, 4, 8, 16].map(|splits| MatmulTile::CooperativeChecked { splits }),
+                // Constant dimensions specialize the checked generator's direct
+                // native B loads. Partition counts stay uniforms, so one extra
+                // pipeline serves every count.
+                let generic = crate::codegen::TypedMatmulLayout::for_product(
+                    types,
+                    self.has_addend(),
+                    [self.m, self.n, self.k],
                 );
+                let specialize = generic.direct_inputs
+                    && types.b == types.multiply
+                    && !matches!(
+                        self.shader,
+                        ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
+                    )
+                    && crate::codegen::checked_cooperative_shape(native_shapes)
+                        .is_some_and(|shape| !generic.uses_stored_kernel(shape));
+                for splits in [1, 2, 4, 8, 16] {
+                    candidates.push(MatmulTile::CooperativeChecked {
+                        splits,
+                        specialize: false,
+                    });
+                    if specialize {
+                        candidates.push(MatmulTile::CooperativeChecked {
+                            splits,
+                            specialize: true,
+                        });
+                    }
+                }
             } else if let Some(config) = config.filter(|c| c.use_f16_input) {
                 candidates.push(MatmulTile::CooperativeF16 {
                     tile_size: config.tile_size,
@@ -1077,7 +1109,7 @@ impl TuneClass {
             // Keep the incumbent's partition count first, then explore other
             // counts only when the complete SumRows/buffer contract permits.
             let splits = match initial {
-                MatmulTile::CooperativeChecked { splits }
+                MatmulTile::CooperativeChecked { splits, .. }
                 | MatmulTile::CooperativeWorkgroup { splits, .. } => splits,
                 _ => 1,
             };
@@ -1758,6 +1790,80 @@ mod tests {
     }
 
     #[test]
+    fn dimension_specialization_keeps_the_generic_alternative() {
+        use crate::{DType, codegen::MatrixTypes, compile::Kernel};
+        let generic = MatmulTile::CooperativeChecked {
+            splits: 1,
+            specialize: false,
+        };
+        let specialized = MatmulTile::CooperativeChecked {
+            splits: 1,
+            specialize: true,
+        };
+        let mut class = class(64, 1024, 256);
+        class.matrix_types = Some(MatrixTypes::reduced(DType::F16));
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        for shapes in [&[][..], &[[16, 16, 16]][..]] {
+            assert!(
+                !class
+                    .challengers(generic, None, shapes)
+                    .contains(&specialized)
+            );
+        }
+        assert!(
+            class
+                .challengers(generic, None, &[[8, 16, 16]])
+                .contains(&specialized)
+        );
+        assert!(
+            class
+                .challengers(specialized, None, &[[8, 16, 16]])
+                .contains(&generic)
+        );
+        let mut dispatch = Dispatch {
+            params: vec![class.m, class.k, class.n, 0],
+            kernel: Kernel::CooperativeTyped {
+                types: class.matrix_types.unwrap(),
+                splits: 1,
+                specialize: false,
+            },
+            workgroups: generic.workgroups(&class),
+            ..dispatch()
+        };
+        let original = dispatch.clone();
+        specialized.apply(&mut dispatch, &class);
+        assert_eq!(MatmulTile::selected(&dispatch, None), Some(specialized));
+        assert_eq!(
+            TuneClass::from_dispatch(&dispatch, None),
+            TuneClass::from_dispatch(&original, None)
+        );
+        let saved = ron::to_string(&dispatch).unwrap();
+        assert_eq!(ron::from_str::<Dispatch>(&saved).unwrap(), dispatch);
+        generic.apply(&mut dispatch, &class);
+        assert_eq!(dispatch, original);
+        let old_dispatch = ron::to_string(&original)
+            .unwrap()
+            .replace(",specialize:false", "");
+        assert_eq!(ron::from_str::<Dispatch>(&old_dispatch).unwrap(), original);
+        let old = ron::to_string(&generic)
+            .unwrap()
+            .replace(",specialize:false", "");
+        assert_eq!(ron::from_str::<MatmulTile>(&old).unwrap(), generic);
+        for shader in [ShaderEntry::MatMulBT, ShaderEntry::MatMul] {
+            class.shader = shader.clone();
+            if shader == ShaderEntry::MatMul {
+                class.matrix_types = Some(MatrixTypes::F32_AS_F16);
+            }
+            class.binding_bytes = class.buffer_sizes().unwrap();
+            assert!(
+                !class
+                    .challengers(generic, None, &[[8, 16, 16]])
+                    .contains(&specialized)
+            );
+        }
+    }
+
+    #[test]
     fn rectangular_choices_preserve_types_geometry_and_binding_capacity() {
         use crate::{
             DType,
@@ -1779,8 +1885,11 @@ mod tests {
             let mut class = class(256, 512, 256);
             class.matrix_types = Some(types);
             class.binding_bytes = class.buffer_sizes().unwrap();
-            let initial = MatmulTile::CooperativeChecked { splits: 1 };
-            let candidates = class.challengers(initial, None);
+            let initial = MatmulTile::CooperativeChecked {
+                splits: 1,
+                specialize: false,
+            };
+            let candidates = class.challengers(initial, None, &[]);
             for shape in WorkgroupMatmulShape::all() {
                 let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 1 };
                 if shape.stage_operands && types == MatrixTypes::F32_AS_F16 {
@@ -1790,7 +1899,11 @@ mod tests {
                 assert!(candidates.contains(&tile));
                 let original = Dispatch {
                     params: vec![256, 256, 512, 0],
-                    kernel: Kernel::CooperativeTyped { types, splits: 1 },
+                    kernel: Kernel::CooperativeTyped {
+                        types,
+                        splits: 1,
+                        specialize: false,
+                    },
                     workgroups: [8, 16, 1],
                     ..dispatch()
                 };
@@ -1827,7 +1940,7 @@ mod tests {
         };
         assert!(
             automatic
-                .challengers(MatmulTile::Tile64, Some(&native))
+                .challengers(MatmulTile::Tile64, Some(&native), &[])
                 .iter()
                 .all(|tile| !matches!(
                     tile,
@@ -1844,7 +1957,7 @@ mod tests {
         assert!(!MatmulTile::Tile64.fits(&automatic));
         assert!(
             automatic
-                .challengers(legacy, Some(&reduced))
+                .challengers(legacy, Some(&reduced), &[])
                 .iter()
                 .all(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
         );
@@ -1904,7 +2017,7 @@ mod tests {
             );
 
             let initial = MatmulTile::selected(dispatch, None).unwrap();
-            let mut seen = class.challengers(initial, None);
+            let mut seen = class.challengers(initial, None, &[]);
             seen.push(initial);
             for threads in GemvShape::WIDTHS {
                 for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
@@ -1961,7 +2074,7 @@ mod tests {
             .map(|b| plan.buffers[b.0 as usize])
             .collect();
         let has_subgroup = |class: &TuneClass, initial| {
-            class.challengers(initial, None).iter().any(|tile| {
+            class.challengers(initial, None, &[]).iter().any(|tile| {
                 matches!(
                     tile,
                     MatmulTile::Gemv(GemvShape {
@@ -2028,7 +2141,7 @@ mod tests {
         let mut class = TuneClass::from_dispatch(&d, None).unwrap();
         assert_eq!((class.m, class.n, class.k), (33, 65, 17));
         class.binding_bytes = class.buffer_sizes().unwrap();
-        for candidate in class.challengers(MatmulTile::Tile64, None) {
+        for candidate in class.challengers(MatmulTile::Tile64, None, &[]) {
             candidate.apply(&mut d, &class);
             assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
             assert_eq!(d.use_small_tiles(), d.workgroups == [3, 2, 1]);
@@ -2184,7 +2297,7 @@ mod tests {
                     90
                 }
             );
-            let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
+            let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)), &[]);
             // Plain tiles and specialized K stages; 32/64-wide tiles also
             // challenge column interleaving. Exclude the incumbent.
             assert_eq!(candidates.len(), 12);
@@ -2622,12 +2735,12 @@ mod tests {
         for class in [class(32, 32, 8), class(2048, 32, 17)] {
             assert!(
                 class
-                    .challengers(MatmulTile::Tile64, Some(&config))
+                    .challengers(MatmulTile::Tile64, Some(&config), &[])
                     .contains(&native)
             );
             assert!(
                 !class
-                    .challengers(MatmulTile::Tile64, None)
+                    .challengers(MatmulTile::Tile64, None, &[])
                     .contains(&native)
             );
             let f16 = CoopConfig {
@@ -2636,7 +2749,7 @@ mod tests {
             };
             assert!(
                 !class
-                    .challengers(MatmulTile::Tile64, Some(&f16))
+                    .challengers(MatmulTile::Tile64, Some(&f16), &[])
                     .contains(&native)
             );
         }

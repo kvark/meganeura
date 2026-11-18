@@ -1300,6 +1300,9 @@ pub enum Kernel {
     CooperativeTyped {
         types: crate::codegen::MatrixTypes,
         splits: u32,
+        /// Compile dimensions into the shader; tuning retains a generic alternative.
+        #[serde(default)]
+        specialize: bool,
     },
     /// Aligned workgroup tiles with F16 or BF16 operands and F32 accumulation.
     CooperativeWorkgroup {

@@ -544,7 +544,7 @@ mod tests {
                 .collect();
             let selected = MatmulTile::CooperativeTiled { shape, splits };
             assert!(selected.fits(&class));
-            let challengers = class.challengers(selected, Some(&config));
+            let challengers = class.challengers(selected, Some(&config), &[]);
             if splits == 1 {
                 assert_eq!(plan.buffers, base.buffers);
                 assert!(

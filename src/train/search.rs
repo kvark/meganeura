@@ -1227,6 +1227,7 @@ fn fill_matrix_candidates_scoped(
             }
             d.shader = compile::ShaderEntry::Conv2dGemmCoopGen(p[5], p[6], p[7]);
             d.kernel = compile::Kernel::CooperativeTyped {
+                specialize: false,
                 types: crate::codegen::MatrixTypes {
                     multiply,
                     ..crate::codegen::MatrixTypes::F32_AS_F16
@@ -1286,6 +1287,7 @@ fn fill_conv_gradient_candidates(
         }
         dispatch.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
         dispatch.kernel = compile::Kernel::CooperativeTyped {
+            specialize: false,
             types: crate::codegen::MatrixTypes {
                 multiply,
                 ..crate::codegen::MatrixTypes::F32_AS_F16
@@ -1381,6 +1383,7 @@ fn fill_dense_product(
     // that binding explicitly; keep plan.weight_buffers for host uploads.
     d.weight_format = compile::WeightFormat::F32;
     d.kernel = compile::Kernel::CooperativeTyped {
+        specialize: false,
         types: crate::codegen::MatrixTypes {
             b,
             multiply,
@@ -2097,6 +2100,7 @@ mod tests {
                 let d = &mut plan.dispatches[0];
                 d.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
                 d.kernel = compile::Kernel::CooperativeTyped {
+                    specialize: false,
                     types: crate::codegen::MatrixTypes {
                         multiply: dtype,
                         ..crate::codegen::MatrixTypes::F32_AS_F16
@@ -3094,7 +3098,7 @@ mod tests {
             "typed storage replaces opaque-format dispatch metadata"
         );
         assert!(matches!(candidate.dispatches[0].kernel,
-            compile::Kernel::CooperativeTyped {types, splits:1}
+            compile::Kernel::CooperativeTyped {types, splits:1, specialize: false }
                 if types.a == DType::F32 && types.b == DType::F16
                     && types.multiply == DType::F16 && types.output == DType::F32));
         let mut bf16 = original.clone();
@@ -3115,7 +3119,7 @@ mod tests {
         plan.dispatches[index].kernel = compile::Kernel::Cooperative;
         assert_eq!(fill_matrix_candidates(&mut plan, DType::BF16, false), 1);
         assert!(matches!(plan.dispatches[index].kernel,
-            compile::Kernel::CooperativeTyped { types, splits: 1 }
+            compile::Kernel::CooperativeTyped { types, splits: 1, specialize: false }
                 if types.multiply == DType::BF16 && types.a == DType::F32
                     && types.b == DType::F32 && types.output == DType::F32));
     }

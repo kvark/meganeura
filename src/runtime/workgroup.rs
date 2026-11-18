@@ -7,7 +7,11 @@ pub(super) fn reset(plan: &mut ExecutionPlan) {
         if let Kernel::CooperativeWorkgroup { types, splits, .. } = dispatch.kernel {
             let (m, n, _) = dispatch.mnk().expect("workgroup product dimensions");
             if let Some(types) = types {
-                dispatch.kernel = Kernel::CooperativeTyped { types, splits };
+                dispatch.kernel = Kernel::CooperativeTyped {
+                    types,
+                    splits,
+                    specialize: false,
+                };
                 dispatch.workgroups = [m.div_ceil(32), n.div_ceil(32), splits];
             } else {
                 dispatch.kernel = Kernel::Default;
@@ -30,7 +34,7 @@ pub(super) fn select(
     };
     for dispatch in &mut plan.dispatches {
         let (types, splits) = match dispatch.kernel {
-            Kernel::CooperativeTyped { types, splits } => (Some(types), splits),
+            Kernel::CooperativeTyped { types, splits, .. } => (Some(types), splits),
             _ => (None, 1),
         };
         let f32 = matches!(
@@ -238,7 +242,8 @@ mod tests {
                     matrix.kernel,
                     Kernel::CooperativeTyped {
                         types: MatrixTypes::BF16,
-                        splits: 1
+                        splits: 1,
+                        specialize: false
                     }
                 );
                 assert_eq!(matrix.workgroups, [4, 8, 1]);
