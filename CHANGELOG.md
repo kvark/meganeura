@@ -23,6 +23,9 @@
   `ScalarMatmulShape` gains `vector_fragments`, and the kernel memo revision
   moves to 18.
 
+- The derivative-precision search also offers F16 weight gradients with BF16
+  input gradients, after the uniform BF16 and F16 choices.
+
 - Measured construction accepts `BuildSearchOptions::qualification_runs` to
   check repeated executions of each candidate outside timing. Persistent
   writes and representative inputs are restored before every qualification
