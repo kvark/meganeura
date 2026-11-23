@@ -5355,35 +5355,38 @@ impl Session {
 
     /// Query GPU pipeline statistics for all compiled compute pipelines.
     ///
-    /// Returns driver-reported statistics (register counts, spill counts,
-    /// SIMD width, etc.) for each pipeline executable. The exact statistics
-    /// depend on the GPU vendor and backend:
-    /// - NVIDIA/Vulkan: register count, spill loads/stores, subgroup size
+    /// Returns the compiler-reported statistics (subgroup size, shared memory,
+    /// register counts, spills, etc.) of each pipeline that has a report.
+    /// Reports need a context created with capture enabled, and individual
+    /// metrics are `None` where the driver doesn't report them:
+    /// - NVIDIA/Vulkan: registers per invocation, subgroup size, shared memory
+    /// - AMD/Vulkan: allocated and spilled SGPRs/VGPRs
     /// - Metal: max threads per threadgroup, SIMD width, shared memory
-    /// - Other/unsupported: empty Vec
     pub fn get_pipeline_statistics(
         &self,
-    ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
-        let mut result = Vec::new();
-        for (name, pipeline) in self.pipelines.all_pipelines() {
-            let stats = self.gpu.get_pipeline_statistics(pipeline);
-            if !stats.is_empty() {
-                result.push((name.to_string(), stats));
-            }
-        }
-        result
+    ) -> Vec<(String, blade_graphics::ComputePipelineStatistics)> {
+        self.pipelines
+            .all_pipelines()
+            .into_iter()
+            .filter_map(|(name, pipeline)| {
+                let stats = self.gpu.get_pipeline_statistics(pipeline)?;
+                Some((name.to_string(), stats))
+            })
+            .collect()
     }
 
     pub(crate) fn get_profile_pipeline_statistics(
         &self,
-    ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
-        let mut result = Vec::new();
-        for (name, pipeline) in self.pipelines.all_profile_pipelines() {
-            let stats = self.gpu.get_pipeline_statistics(pipeline);
-            if !stats.is_empty() {
-                result.push((name, stats));
-            }
-        }
+    ) -> Vec<(String, blade_graphics::ComputePipelineStatistics)> {
+        let mut result: Vec<_> = self
+            .pipelines
+            .all_profile_pipelines()
+            .into_iter()
+            .filter_map(|(name, pipeline)| {
+                let stats = self.gpu.get_pipeline_statistics(pipeline)?;
+                Some((name, stats))
+            })
+            .collect();
         result.sort_by(|a, b| a.0.cmp(&b.0));
         result
     }
