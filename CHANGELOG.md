@@ -4,6 +4,13 @@
   8x8x8 F32, F16/F32 and BF16/F32 tiles on Metal. Auto search can qualify these
   reduced multiplication paths on Apple GPUs with F32 storage and outputs.
 
+- `Graph::gelu_erf` builds `Op::GeluErf`, a composite that lowers to one
+  pointwise kernel and differentiates from its input alone. Reductions, norm
+  gradients and the max-pool gradient size their launches to occupy the
+  device, LayerNorm sums with subgroups where the device has them, and a
+  dense sum with an atomic scatter (a tied embedding's gradient) scatters onto
+  the dense result in place.
+
 - Measured construction automatically considers device-qualified BF16 and rectangular F16
   multiplication for eligible dense products and forward convolutions under
   `CoopPolicy::Auto`, with F32 storage and outputs. Checked rectangular subgroup tiles and dense workgroup tuning remain

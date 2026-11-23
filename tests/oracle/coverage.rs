@@ -113,6 +113,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("CausalAttentionRoPE", Covered("Kind::Rope")),
     ("BlockCausalAttention", Covered(".block_causal_attention(")),
     ("Gelu", Covered(".gelu(")),
+    ("GeluErf", Covered(".gelu_erf(")),
     ("LayerNorm", Covered(".layer_norm(")),
     ("FullAttention", Covered("Kind::Full")),
     ("CrossAttention", Covered("Kind::Cross")),

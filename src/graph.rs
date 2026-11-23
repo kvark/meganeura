@@ -501,6 +501,9 @@ pub enum Op {
     // GELU activation, tanh form: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     Gelu,
 
+    // Exact GELU: (x / 2) * (1 + erf(x / sqrt(2)))
+    GeluErf,
+
     // Standard Layer Normalization: (x - mean) / sqrt(var + eps) * weight + bias
     // inputs: [x, weight, bias]
     LayerNorm {
@@ -3522,11 +3525,8 @@ impl Graph {
 
     /// Exact GELU, `x · (1 + erf(x/√2)) / 2` (PyTorch's default).
     pub fn gelu_erf(&mut self, x: NodeId) -> NodeId {
-        let scaled = self.scale(x, std::f32::consts::FRAC_1_SQRT_2);
-        let erf = self.erf(scaled);
-        let shifted = self.add_scalar(erf, 1.0);
-        let half = self.scale(x, 0.5);
-        self.mul(half, shifted)
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::GeluErf, vec![x], ty)
     }
 
     #[track_caller]

@@ -999,14 +999,17 @@ pub fn group_norm_chunks(batch: u32, channels: u32, spatial: u32, num_groups: u3
 /// Rows each workgroup folds into one partial row of a norm weight gradient.
 ///
 /// Folding rows shrinks the `[blocks, cols]` partial buffer that SumRows
-/// reads back, at the cost of workgroups. Blocks only grow once there would
-/// still be at least 1024 workgroups, enough to occupy any current GPU, so
-/// short inputs keep one row per workgroup. The kernels split their 256
-/// lanes evenly across a block's rows, so a block is a power of two up to 32.
+/// reads back, at the cost of workgroups. Blocks grow until about 192
+/// workgroups remain (a few per SM): Whisper's 1500 × 384 LayerNorm took
+/// 19.3 µs plus two SumRows passes on one row a workgroup, 9.1 µs plus one
+/// on eight (RTX 5070, profiled); 3000 rows did best on 16, 128 on one or
+/// two. The kernels split their 256 lanes evenly across a block's rows, so
+/// a block is a power of two up to 32.
 fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
-    const MIN_WORKGROUPS: u32 = 1024;
-    let block = (rows / MIN_WORKGROUPS).clamp(1, 32);
-    1 << block.ilog2()
+    const TARGET_WORKGROUPS: u32 = 192;
+    rows.div_ceil(TARGET_WORKGROUPS)
+        .next_power_of_two()
+        .clamp(1, 32)
 }
 
 /// Order dependent dispatches, form barrier groups, then fuse within groups.
@@ -1712,6 +1715,7 @@ impl ExecutionPlan {
             fuse_winograd_add(&mut self);
             fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
+            fuse_scatter_into_sum(&mut self);
             bf16::fuse_boundaries(&mut self);
         }
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
@@ -2969,6 +2973,101 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     }
 }
 
+/// `X + ScatterAdd(indices, src)` where the scatter zero-fills a whole
+/// buffer only to be summed with X, as a tied embedding's gradient is: let
+/// X's writer write the sum's buffer and scatter the rows onto it. The zero
+/// fill and the full-size Add, three passes over the table, disappear.
+fn fuse_scatter_into_sum(plan: &mut ExecutionPlan) {
+    use std::collections::{HashMap, HashSet};
+    let protected: HashSet<BufferRef> = plan.externally_visible_buffers();
+    let add = pointwise(2, [Pw::Add(0, 1)]);
+    loop {
+        let mut writers = HashMap::<BufferRef, Vec<usize>>::new();
+        let mut reads = HashMap::<BufferRef, usize>::new();
+        for (index, dispatch) in plan.dispatches.iter().enumerate() {
+            writers
+                .entry(dispatch.output_buffer)
+                .or_default()
+                .push(index);
+            for &buffer in dispatch.extra_outputs.iter() {
+                writers.entry(buffer).or_default().push(index);
+            }
+            for &buffer in &dispatch.input_buffers {
+                *reads.entry(buffer).or_default() += 1;
+            }
+        }
+        let mut candidate = None;
+        'adds: for (ai, a) in plan.dispatches.iter().enumerate() {
+            if a.pointwise() != Some(&add)
+                || a.input_buffers.len() != 2
+                || a.fusion_barrier
+                || a.pointwise_storage != crate::schedule::PointwiseStorage::default()
+                || !a.extra_outputs.is_empty()
+            {
+                continue;
+            }
+            let out = a.output_buffer;
+            // Nothing before the Add may touch its output.
+            if plan.dispatches[..ai].iter().any(|d| {
+                d.output_buffer == out
+                    || d.input_buffers.contains(&out)
+                    || d.extra_outputs.contains(&out)
+            }) {
+                continue;
+            }
+            for side in 0..2 {
+                let (scattered, dense) = (a.input_buffers[side], a.input_buffers[1 - side]);
+                if scattered == dense
+                    || protected.contains(&scattered)
+                    || protected.contains(&dense)
+                {
+                    continue;
+                }
+                let (Some(sw), Some(dw)) = (writers.get(&scattered), writers.get(&dense)) else {
+                    continue;
+                };
+                let &[zi, si] = sw.as_slice() else { continue };
+                let &[xi] = dw.as_slice() else { continue };
+                let (zero, scatter) = (&plan.dispatches[zi], &plan.dispatches[si]);
+                if !zero.is_zero_fill()
+                    || scatter.shader != ShaderEntry::ScatterAddAtomic
+                    || scatter.input_buffers.last() != Some(&scattered)
+                    || !(zi < si && si < ai && xi < ai)
+                    || reads.get(&scattered).copied() != Some(2)
+                    || reads.get(&dense).copied() != Some(1)
+                    || scatter.params.first() != a.params.first()
+                    || zero.params.first() != a.params.first()
+                    || plan.dispatches[xi].fusion_barrier
+                {
+                    continue;
+                }
+                candidate = Some((ai, zi, si, xi, scattered));
+                break 'adds;
+            }
+        }
+        let Some((ai, zi, si, xi, scattered)) = candidate else {
+            break;
+        };
+        let add = plan.dispatches[ai].clone();
+        let out = add.output_buffer;
+        plan.dispatches[xi].output_buffer = out;
+        let mut scatter = plan.dispatches[si].clone();
+        for buffer in scatter.input_buffers.iter_mut() {
+            if *buffer == scattered {
+                *buffer = out;
+            }
+        }
+        scatter.output_buffer = out;
+        scatter.requires_full_precision |= add.requires_full_precision;
+        scatter.is_derivative |= add.is_derivative;
+        scatter.origin.extend_from_slice(&add.origin);
+        plan.dispatches[ai] = scatter;
+        let (low, high) = (zi.min(si), zi.max(si));
+        plan.dispatches.remove(high);
+        plan.dispatches.remove(low);
+    }
+}
+
 /// Fuse a residual addition into the Winograd output transform. Keep the
 /// fused operation at the add's position: its other input may be produced
 /// after the transform in the original schedule.
@@ -3165,6 +3264,21 @@ fn gelu_ops(x: u16, next: u16) -> [Pw; 9] {
     ]
 }
 
+/// Exact GELU as its decomposition computes it: `(x/2) · (1 + erf(x/√2))`.
+fn gelu_erf_ops(x: u16, next: u16) -> [Pw; 8] {
+    let n = next;
+    [
+        Pw::const_f32(std::f32::consts::FRAC_1_SQRT_2), // n
+        Pw::Mul(x, n),                                  // n+1 = x/√2
+        Pw::Erf(n + 1),                                 // n+2
+        Pw::const_f32(1.0),                             // n+3
+        Pw::Add(n + 2, n + 3),                          // n+4 = 1 + erf
+        Pw::const_f32(0.5),                             // n+5
+        Pw::Mul(x, n + 5),                              // n+6 = x/2
+        Pw::Mul(n + 6, n + 4),                          // n+7 = gelu(x)
+    ]
+}
+
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Conservative launch domain shared by automatic promotion and tuning.
@@ -3257,8 +3371,8 @@ mod row_reduction {
     #[test]
     fn splits_only_tall_narrow_row_reductions() {
         // 12544 x 64 is the ResNet stem bias reduction: 2 column groups.
-        assert_eq!(super::Compiler::row_reduction_splits(12544, 64), 49);
-        assert_eq!(super::Compiler::row_reduction_splits(3136, 64), 13);
+        assert_eq!(super::Compiler::row_reduction_splits(12544, 64), 128);
+        assert_eq!(super::Compiler::row_reduction_splits(3136, 64), 49);
         // Few rows, and matrices wide enough to fill the launch, stay one reduction.
         assert_eq!(super::Compiler::row_reduction_splits(32, 64), 1);
         assert_eq!(super::Compiler::row_reduction_splits(10_000, 4096), 1);
@@ -3779,7 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_inner_packs_narrow_rows_only() {
+    fn sum_inner_packs_rows_by_width() {
         let mut narrow = Graph::new();
         let input = narrow.input("input", &[100, 9]);
         let output = narrow.sum_inner(input);
@@ -3789,8 +3903,19 @@ mod tests {
         assert_eq!(narrow_dispatch.workgroups, [1, 1, 1]);
         assert_eq!(narrow_dispatch.reduction().unwrap().rows_per_workgroup, 256);
 
+        // Past 32, about 16 elements a lane: 33 takes four lanes, so 64
+        // rows share a workgroup; 4096 takes all 256.
+        let mut short = Graph::new();
+        let input = short.input("input", &[100, 33]);
+        let output = short.sum_inner(input);
+        short.set_outputs(vec![output]);
+        let short_plan = compile(&short);
+        let short_dispatch = &short_plan.dispatches[0];
+        assert_eq!(short_dispatch.workgroups, [2, 1, 1]);
+        assert_eq!(short_dispatch.reduction().unwrap().rows_per_workgroup, 64);
+
         let mut wide = Graph::new();
-        let input = wide.input("input", &[100, 33]);
+        let input = wide.input("input", &[100, 4096]);
         let output = wide.sum_inner(input);
         wide.set_outputs(vec![output]);
         let wide_plan = compile(&wide);
@@ -3961,6 +4086,92 @@ mod tests {
                 .input_buffers
                 .contains(&large_plan.dispatches[1].output_buffer)
         );
+    }
+
+    #[test]
+    fn dense_sum_with_a_scatter_takes_the_rows_in_place() {
+        const SEQ: usize = 256;
+        const VOCAB: usize = 4097;
+        let mut graph = Graph::new();
+        let indices = graph.input_u32("indices", &[SEQ]);
+        let src = graph.input("src", &[SEQ, 8]);
+        let a = graph.input("a", &[16, VOCAB]);
+        let b = graph.input("b", &[16, 8]);
+        let dense = graph.matmul_at(a, b);
+        let rows = graph.scatter_add(indices, src, VOCAB);
+        let sum = graph.add(dense, rows);
+        graph.set_outputs(vec![sum]);
+        let plan = compile(&graph);
+        assert!(!plan.dispatches.iter().any(|d| d.is_zero_fill()));
+        assert!(
+            !plan
+                .dispatches
+                .iter()
+                .any(|d| d.pointwise() == Some(&pointwise(2, [Pw::Add(0, 1)])))
+        );
+        let scatter = plan.dispatches.last().unwrap();
+        assert_eq!(scatter.shader, ShaderEntry::ScatterAddAtomic);
+        assert_eq!(plan.dispatches[0].output_buffer, scatter.output_buffer);
+        assert_eq!(scatter.input_buffers.last(), Some(&scatter.output_buffer));
+        assert_eq!(plan.dispatches.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "GPU: a dense sum with an atomic scatter, fused in place"]
+    fn scatter_into_dense_sum_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        const SEQ: usize = 256;
+        const VOCAB: usize = 4097;
+        let mut g = Graph::new();
+        let indices = g.input_u32("indices", &[SEQ]);
+        let src = g.input("src", &[SEQ, 8]);
+        let a = g.input("a", &[16, VOCAB]);
+        let b = g.input("b", &[16, 8]);
+        let dense = g.matmul_at(a, b);
+        let rows = g.scatter_add(indices, src, VOCAB);
+        let sum = g.add(dense, rows);
+        g.set_outputs(vec![sum]);
+        // Repeated indices exercise the atomic accumulation.
+        let idx: Vec<u32> = (0..SEQ as u32).map(|i| (i * 37) % 300).collect();
+        let srcs: Vec<f32> = (0..SEQ * 8).map(|i| ((i % 13) as f32 - 6.) / 8.).collect();
+        let av: Vec<f32> = (0..16 * VOCAB)
+            .map(|i| ((i % 11) as f32 - 5.) / 16.)
+            .collect();
+        let bv: Vec<f32> = (0..16 * 8).map(|i| ((i % 7) as f32 - 3.) / 4.).collect();
+        let mut feeds = Feeds::new();
+        feeds.set_u32("indices", &idx);
+        feeds.set("src", &srcs);
+        feeds.set("a", &av);
+        feeds.set("b", &bv);
+        let values = reference::evaluate(&g, &feeds).unwrap();
+        let want = &values[sum as usize];
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 2, "the pass applies");
+        let mut session = crate::runtime::Session::with_context_opts(
+            plan,
+            gpu.clone(),
+            crate::runtime::SessionOptions {
+                poison: true,
+                ..Default::default()
+            },
+        );
+        session.set_input_u32("indices", &idx);
+        session.set_input("src", &srcs);
+        session.set_input("a", &av);
+        session.set_input("b", &bv);
+        for _ in 0..2 {
+            session.step();
+            session.wait();
+            let mut got = vec![0.; want.data.len()];
+            session.read_output_by_index(0, &mut got);
+            let worst = got
+                .iter()
+                .zip(&want.data)
+                .map(|(&g, &w)| (f64::from(g) - w).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 1e-4, "largest error {worst}");
+        }
     }
 
     #[test]

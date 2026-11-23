@@ -149,6 +149,15 @@ impl Graph {
                 let s = self.sigmoid(inner);
                 self.mul(x, s)
             }
+            Op::GeluErf => {
+                // (x / 2) · (1 + erf(x / √2))
+                let x = arg(0);
+                let scaled = self.scale(x, std::f32::consts::FRAC_1_SQRT_2);
+                let erf = self.erf(scaled);
+                let shifted = self.add_scalar(erf, 1.0);
+                let half = self.scale(x, 0.5);
+                self.mul(half, shifted)
+            }
             Op::Softplus { beta } => {
                 // relu(x) + ln(1 + exp(-|βx|)) / β
                 let x = arg(0);
@@ -1226,7 +1235,7 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
     };
     let arity = |n: usize| ins.len() == n;
     match *op {
-        Op::Silu | Op::Gelu | Op::Softplus { .. } | Op::Softmax | Op::LogSoftmax => {
+        Op::Silu | Op::Gelu | Op::GeluErf | Op::Softplus { .. } | Op::Softmax | Op::LogSoftmax => {
             arity(1) && ins[0] == out && elems(out) > 0
         }
         Op::SwiGLU | Op::GeGLU => arity(2) && ins[0] == out && ins[1] == out,
@@ -1590,6 +1599,13 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 // gelu: x · sigmoid(...)
                 if is(g, b, |op| matches!(op, Op::Sigmoid)) {
                     out.push((Op::Gelu, vec![a]));
+                }
+                // exact gelu: (x / 2) · (1 + erf(x / √2))
+                if is(g, a, |op| matches!(op, Op::Scale { .. }))
+                    && is(g, b, |op| matches!(op, Op::Offset { .. }))
+                    && let Some(x) = input(g, a, 0)
+                {
+                    out.push((Op::GeluErf, vec![x]));
                 }
                 // glu: act(gate) · up
                 if let Some(gate) = input(g, a, 0) {

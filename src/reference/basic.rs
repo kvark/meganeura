@@ -56,6 +56,17 @@ pub(super) fn gelu(x: f64) -> f64 {
     x * sigmoid(2.0 * GELU_C * (x + 0.044715 * x * x * x))
 }
 
+/// Exact GELU, `x · Φ(x)`.
+pub(super) fn gelu_erf(x: f64) -> f64 {
+    0.5 * x * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2))
+}
+
+/// `Φ(x) + x · φ(x)`.
+fn gelu_erf_derivative(x: f64) -> f64 {
+    let density = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    0.5 * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2)) + x * density
+}
+
 /// The error function to near f64 precision: its Maclaurin series where
 /// that converges quickly, and the continued fraction of erfc beyond.
 pub(super) fn erf(x: f64) -> f64 {
@@ -98,6 +109,7 @@ pub(super) fn derivative(op: &Op, x: f64) -> Option<f64> {
         Op::Tanh => 1.0 - x.tanh().powi(2),
         Op::Silu => silu_derivative(x),
         Op::Gelu => gelu_derivative(x),
+        Op::GeluErf => gelu_erf_derivative(x),
         Op::Exp => x.exp(),
         Op::Log => 1.0 / x,
         Op::Recip => -1.0 / (x * x),
@@ -737,6 +749,7 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         Op::Silu => map(arg(0)?, silu),
         Op::SiluGrad => zip(node, arg(0)?, arg(1)?, |g, x| g * silu_derivative(x))?,
         Op::Gelu => map(arg(0)?, gelu),
+        Op::GeluErf => map(arg(0)?, gelu_erf),
         Op::SwiGLU => zip(node, arg(0)?, arg(1)?, |gate, up| silu(gate) * up)?,
         Op::GeGLU => zip(node, arg(0)?, arg(1)?, |gate, up| gelu(gate) * up)?,
         Op::SwiGLUGradGate => zip3(node, arg(0)?, arg(1)?, arg(2)?, |g, gate, up| {

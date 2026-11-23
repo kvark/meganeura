@@ -697,7 +697,7 @@ fn conv2d_grad_weight() {
 /// A max-pooling configuration: (batch, channels, (h, w), (kh, kw), stride, padding).
 type Pool = (u32, u32, (u32, u32), (u32, u32), u32, u32);
 
-const POOLS: [Pool; 7] = [
+const POOLS: [Pool; 9] = [
     // 2×2 stride 2, even and odd extents (the odd last row is dropped).
     (2, 3, (8, 8), (2, 2), 2, 0),
     (1, 4, (9, 7), (2, 2), 2, 0),
@@ -711,6 +711,9 @@ const POOLS: [Pool; 7] = [
     (1, 2, (11, 10), (2, 2), 3, 0),
     // Many planes: several workgroups of 256 threads.
     (4, 16, (10, 10), (3, 3), 2, 1),
+    // Several 16x16 tiles per plane, with partial tiles at the edges.
+    (2, 3, (37, 45), (3, 3), 2, 1),
+    (1, 2, (35, 33), (3, 3), 1, 1),
 ];
 
 fn pool_sizes(p: Pool) -> (usize, usize) {
