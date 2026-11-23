@@ -7,7 +7,7 @@
 //!   - total instruction count
 //!
 //! With `--gpu`, also compiles each pipeline on the actual GPU and queries
-//! driver-reported statistics (register counts, spill loads/stores, etc.).
+//! compiler-reported statistics (subgroup size, shared memory, registers, spills).
 //!
 //! Usage:
 //!   cargo run --release --example analyze_shaders
@@ -136,16 +136,28 @@ fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, ent
         compute: shader.at(entry.entry_point()),
         full_subgroup_size: None,
     });
-    let stats = gpu.get_pipeline_statistics(&pipeline);
-    if stats.is_empty() {
-        println!("  {:40} (no GPU statistics available)", name);
-    } else {
-        for exec in &stats {
-            print!("  {:40}", name);
-            for stat in &exec.statistics {
-                print!("  {}={}", stat.name, stat.value);
+    match gpu.get_pipeline_statistics(&pipeline) {
+        None => println!("  {:40} (no GPU statistics available)", name),
+        Some(stats) => {
+            for exec in &stats.executables {
+                print!("  {:40}", name);
+                for (label, value) in [
+                    ("subgroup", exec.subgroup_size.map(u64::from)),
+                    ("shared_bytes", exec.static_workgroup_memory_bytes),
+                    ("code_bytes", exec.code_size_bytes),
+                    ("scratch_bytes", exec.scratch_bytes_per_subgroup),
+                    ("gprs", exec.gprs_per_invocation.map(u64::from)),
+                    ("sgprs", exec.allocated_sgprs.map(u64::from)),
+                    ("vgprs", exec.allocated_vgprs.map(u64::from)),
+                    ("spilled_sgprs", exec.spilled_sgprs.map(u64::from)),
+                    ("spilled_vgprs", exec.spilled_vgprs.map(u64::from)),
+                ] {
+                    if let Some(value) = value {
+                        print!("  {label}={value}");
+                    }
+                }
+                println!();
             }
-            println!();
         }
     }
     gpu.destroy_compute_pipeline(&mut pipeline);
@@ -196,7 +208,8 @@ fn main() {
             blade_graphics::Context::init(blade_graphics::ContextDesc {
                 validation: false,
                 timing: false,
-                capture: false,
+                // Blade reports pipeline statistics only with capture enabled.
+                capture: true,
                 overlay: false,
                 device_id: dev_id,
                 ..Default::default()

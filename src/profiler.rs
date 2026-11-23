@@ -416,23 +416,49 @@ pub struct DispatchProfile {
     pub share_of_dispatch_median_sum_pct: f64,
 }
 
+/// Compiler-reported statistics of one pipeline, from Blade's
+/// `ComputePipelineStatistics`. Metrics the driver doesn't report are `None`.
 #[derive(Clone, Debug, Serialize)]
 pub struct PipelineProfile {
     pub pipeline: String,
+    /// Pipeline-specific limit on invocations per workgroup, not its size.
+    pub max_workgroup_invocations: Option<u32>,
     pub executables: Vec<PipelineExecutableProfile>,
 }
 
+/// One compiled executable's statistics, mirroring Blade's
+/// `PipelineExecutableStatistics`.
 #[derive(Clone, Debug, Serialize)]
 pub struct PipelineExecutableProfile {
-    pub name: String,
-    pub statistics: Vec<PipelineStatisticProfile>,
+    pub name: Option<String>,
+    pub subgroup_size: Option<u32>,
+    pub static_workgroup_memory_bytes: Option<u64>,
+    pub code_size_bytes: Option<u64>,
+    pub scratch_bytes_per_subgroup: Option<u64>,
+    /// Registers per invocation (NVIDIA).
+    pub gprs_per_invocation: Option<u32>,
+    /// Allocated and spilled register slots per subgroup (AMD).
+    pub allocated_sgprs: Option<u32>,
+    pub allocated_vgprs: Option<u32>,
+    pub spilled_sgprs: Option<u32>,
+    pub spilled_vgprs: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct PipelineStatisticProfile {
-    pub name: String,
-    pub description: String,
-    pub value: f64,
+impl From<blade_graphics::PipelineExecutableStatistics> for PipelineExecutableProfile {
+    fn from(statistics: blade_graphics::PipelineExecutableStatistics) -> Self {
+        Self {
+            name: statistics.name,
+            subgroup_size: statistics.subgroup_size,
+            static_workgroup_memory_bytes: statistics.static_workgroup_memory_bytes,
+            code_size_bytes: statistics.code_size_bytes,
+            scratch_bytes_per_subgroup: statistics.scratch_bytes_per_subgroup,
+            gprs_per_invocation: statistics.gprs_per_invocation,
+            allocated_sgprs: statistics.allocated_sgprs,
+            allocated_vgprs: statistics.allocated_vgprs,
+            spilled_sgprs: statistics.spilled_sgprs,
+            spilled_vgprs: statistics.spilled_vgprs,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -740,22 +766,13 @@ fn capture_windows(
             .get_profile_pipeline_statistics()
             .into_iter()
             .filter(|entry| selected_pipelines.contains(entry.0.as_str()))
-            .map(|(pipeline, executables)| PipelineProfile {
+            .map(|(pipeline, statistics)| PipelineProfile {
                 pipeline,
-                executables: executables
+                max_workgroup_invocations: statistics.max_workgroup_invocations,
+                executables: statistics
+                    .executables
                     .into_iter()
-                    .map(|executable| PipelineExecutableProfile {
-                        name: executable.name,
-                        statistics: executable
-                            .statistics
-                            .into_iter()
-                            .map(|statistic| PipelineStatisticProfile {
-                                name: statistic.name,
-                                description: statistic.description,
-                                value: statistic.value,
-                            })
-                            .collect(),
-                    })
+                    .map(PipelineExecutableProfile::from)
                     .collect(),
             })
             .collect()
