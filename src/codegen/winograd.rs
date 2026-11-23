@@ -41,6 +41,16 @@ pub(crate) fn transform(group: ShaderGroup, storage: DType) -> ShaderModule {
     ShaderModule::new(&source)
 }
 
+/// Whether [`matmul`] runs subgroup-tiled for these tiles. That kernel takes
+/// rows from workgroup X, so its grid is `[M, N, 16]` in tiles; the typed
+/// kernel's is `[N, M, 16]`.
+pub(crate) fn subgroup_tiled(native: [u32; 3], tile: [u32; 2], subgroup: u32) -> bool {
+    native == [16, 16, 16]
+        && subgroup == super::workgroup::SUBGROUP_WIDTH
+        && tile[0].is_multiple_of(16)
+        && tile[1].is_multiple_of(16)
+}
+
 pub(crate) fn matmul(
     storage: DType,
     native: [u32; 3],
@@ -50,6 +60,11 @@ pub(crate) fn matmul(
     let [m, n, k] = native;
     let [rows, columns] = tile;
     assert!(matches!(storage, DType::F16 | DType::BF16));
+    // Subgroup-tiled on the same grid, where the device's subgroups and
+    // 16x16 tiles allow it.
+    if subgroup_tiled(native, tile, subgroup) {
+        return super::workgroup::generate_subgroup_winograd(storage, tile);
+    }
     assert!(super::checked_cooperative_shape(&[native]).is_some());
     assert!(rows.is_multiple_of(m) && columns.is_multiple_of(n));
     // The reported subgroup width is a sizing hint. Cover wider runtime

@@ -12,6 +12,36 @@ pub(super) fn fill(
     native: [u32; 3],
     subgroup: u32,
 ) -> usize {
+    fill_scoped(plan, storage, native, subgroup, false)
+}
+
+/// [`fill`] over the derivative products instead: the automatically
+/// protected Winograd input gradients and their transforms, which measured
+/// arithmetic may qualify. Explicit pins stay F32.
+pub(super) fn fill_derivatives(
+    plan: &mut ExecutionPlan,
+    storage: DType,
+    native: [u32; 3],
+    subgroup: u32,
+) -> usize {
+    fill_scoped(plan, storage, native, subgroup, true)
+}
+
+fn fill_scoped(
+    plan: &mut ExecutionPlan,
+    storage: DType,
+    native: [u32; 3],
+    subgroup: u32,
+    derivatives: bool,
+) -> usize {
+    // Forward work outside derivatives, or derivative work without a pin.
+    let eligible = |d: &crate::compile::Dispatch| {
+        if derivatives {
+            d.is_derivative && !d.requires_full_precision
+        } else {
+            !d.full_precision()
+        }
+    };
     if subgroup == 0
         || subgroup > 128
         || !plan
@@ -42,7 +72,7 @@ pub(super) fn fill(
     for i in 0..plan.dispatches.len() {
         let d = &plan.dispatches[i];
         if d.shader != ShaderEntry::WinogradBatchedMatMul
-            || d.full_precision()
+            || !eligible(d)
             || d.schedule_locked
             || !matches!(d.kernel, Kernel::Default | Kernel::ScalarMatmul(_))
             || d.input_buffers.len() != 2
@@ -56,16 +86,28 @@ pub(super) fn fill(
         } else {
             [32.min(256 / subgroup / 2 * native[0]), 32]
         };
+        // The subgroup-tiled kernel takes a partial last column tile in whole
+        // vectors; the typed one needs whole tiles.
+        let tiled = crate::codegen::winograd::subgroup_tiled(native, tile, subgroup);
+        let columns_fit = if tiled {
+            n.is_multiple_of(4)
+        } else {
+            n.is_multiple_of(tile[1])
+        };
         if m == 0
             || n == 0
             || k == 0
             || !m.is_multiple_of(tile[0])
-            || !n.is_multiple_of(tile[1])
+            || !columns_fit
             || !k.is_multiple_of(native[2])
         {
             continue;
         }
-        let grid = [n / tile[1], m / tile[0], 16];
+        let grid = if tiled {
+            [m / tile[0], n.div_ceil(tile[1]), 16]
+        } else {
+            [n / tile[1], m / tile[0], 16]
+        };
         if !crate::compile::workgroups_within_portable_limits(grid) {
             continue;
         }
@@ -84,7 +126,7 @@ pub(super) fn fill(
             if index >= i
                 || p.shader != shader
                 || p.kernel != Kernel::Default
-                || p.full_precision()
+                || !(eligible(p) || (derivatives && !p.full_precision()))
                 || p.schedule_locked
                 || !p.extra_outputs.is_empty()
             {
@@ -185,12 +227,71 @@ mod tests {
                     let Kernel::WinogradMatmul { tile, .. } = p.dispatches[2].kernel else {
                         panic!()
                     };
-                    assert_eq!(p.dispatches[2].workgroups, [n / tile[1], m / tile[0], 16]);
+                    let grid = if crate::codegen::winograd::subgroup_tiled([rows, 16, 16], tile, 32)
+                    {
+                        [m / tile[0], n / tile[1], 16]
+                    } else {
+                        [n / tile[1], m / tile[0], 16]
+                    };
+                    assert_eq!(p.dispatches[2].workgroups, grid);
                 } else {
                     assert_eq!(p.buffers, sizes);
                 }
             }
         }
+    }
+
+    #[test]
+    fn derivative_products_narrow_only_in_their_own_scope_and_never_when_pinned() {
+        let derivative = |pin: bool| {
+            let mut p = plan(64, 64, 64);
+            for d in &mut p.dispatches {
+                d.is_derivative = true;
+            }
+            p.dispatches[2].requires_full_precision = pin;
+            p
+        };
+        assert_eq!(
+            fill(&mut derivative(false), DType::BF16, [16, 16, 16], 32),
+            0
+        );
+        let mut p = derivative(false);
+        assert_eq!(fill_derivatives(&mut p, DType::BF16, [16, 16, 16], 32), 1);
+        assert_eq!(
+            p.dispatches[2].kernel,
+            Kernel::WinogradMatmul {
+                storage: DType::BF16,
+                tile: [32, 32]
+            }
+        );
+        assert_eq!(
+            fill_derivatives(&mut derivative(true), DType::BF16, [16, 16, 16], 32),
+            0
+        );
+        // Forward products stay out of the derivative scope.
+        assert_eq!(
+            fill_derivatives(&mut plan(64, 64, 64), DType::BF16, [16, 16, 16], 32),
+            0
+        );
+    }
+
+    #[test]
+    fn subgroup_tiles_admit_a_partial_column_tile_in_whole_vectors() {
+        // 16x16 tiles on 32-wide subgroups run subgroup-tiled, rows first.
+        for (n, expected) in [
+            (784, Some([2, 25, 16])),
+            (196, Some([2, 7, 16])),
+            (198, None),
+        ] {
+            let mut p = plan(64, n, 64);
+            let count = fill(&mut p, DType::F16, [16, 16, 16], 32);
+            assert_eq!(count == 1, expected.is_some(), "n = {n}");
+            if let Some(grid) = expected {
+                assert_eq!(p.dispatches[2].workgroups, grid);
+            }
+        }
+        // The typed kernel still needs whole tiles.
+        assert_eq!(fill(&mut plan(64, 784, 64), DType::F16, [8, 16, 16], 32), 0);
     }
 
     #[test]

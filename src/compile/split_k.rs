@@ -110,10 +110,28 @@ impl ExecutionPlan {
                 k_stage: 16,
                 interleave_columns: false,
                 unroll_k: false,
+                vector_fragments: false,
+            };
+            // Vector shared fragments, and 128-row tiles where M has them: one
+            // pass over a vocabulary projection's weights. SmolLM2's input
+            // gradient (128 × 576 over K = 49152) took 0.621 ms on 64×64,
+            // 0.500 with vector fragments, 0.482 on 128×64 (RTX 5070).
+            let rows = if tile_size == 64 && class.m >= 128 {
+                128
+            } else {
+                tile_size
+            };
+            let wide = crate::codegen::ScalarMatmulShape {
+                tile_size: rows,
+                tile_n: if rows == 128 { 64 } else { 0 },
+                vector_fragments: tile_size == 64,
+                ..shape
             };
             let splits = class.k.div_ceil(1024);
             let buffers = self.buffers.len();
-            if self.split_matmul(index, shape, splits, budget).is_ok() {
+            if self.split_matmul(index, wide, splits, budget).is_ok()
+                || self.split_matmul(index, shape, splits, budget).is_ok()
+            {
                 budget -= self.buffers[buffers];
             }
         }
@@ -159,6 +177,7 @@ impl ExecutionPlan {
                 k_stage: 16,
                 interleave_columns: false,
                 unroll_k: false,
+                vector_fragments: false,
             };
             let buffers = self.buffers.len();
             if self.split_matmul(index, shape, splits, budget).is_ok() {
@@ -863,6 +882,7 @@ mod tests {
                     k_stage,
                     interleave_columns: true,
                     unroll_k,
+                    vector_fragments: false,
                 };
                 let before = serde_json::to_value(&plan).unwrap();
                 assert!(plan.split_matmul(0, shape, splits, 0).is_err());

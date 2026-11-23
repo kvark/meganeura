@@ -931,7 +931,8 @@ enum Variant {
         crate::codegen::MatrixTypes,
         crate::codegen::TypedMatmulLayout,
     ),
-    CoopConv(ShaderEntry, crate::codegen::MatrixTypes, Conv2dParams),
+    /// Entry, types, parameters, and whether a forward convolution splits K over workgroup Z.
+    CoopConv(ShaderEntry, crate::codegen::MatrixTypes, Conv2dParams, bool),
     CoopWorkgroup(
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
@@ -1050,7 +1051,7 @@ impl Variant {
             | Variant::WinogradMatmul(ref e, _, _)
             | Variant::Attention(ref e, _, _, _)
             | Variant::CoopTyped(ref e, _, _)
-            | Variant::CoopConv(ref e, _, _)
+            | Variant::CoopConv(ref e, _, _, _)
             | Variant::CoopWorkgroup(ref e, _, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
@@ -1075,8 +1076,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::CoopConv(ref e, types, ref params) => {
-                format!("{e:?}:checked-{types:?}-fixed-{params:?}")
+            Variant::CoopConv(ref e, types, ref params, split) => {
+                let split = if split { ":split-k" } else { "" };
+                format!("{e:?}:checked-{types:?}-fixed-{params:?}{split}")
             }
             Variant::StoredGate(ref entry, storage) => format!("{entry:?}:store-{storage:?}"),
             Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
@@ -1954,11 +1956,13 @@ impl Pipelines {
             interleave_columns: knobs.matmul_interleave_columns,
             integer_dot: gpu.capabilities().shader_integer_dot_product,
             unroll_k: false,
+            vector_fragments: false,
         };
         if let Some(shape) = dispatch.scalar_matmul() {
             matmul_knobs.k_stage = shape.k_stage;
             matmul_knobs.interleave_columns = shape.interleave_columns;
             matmul_knobs.unroll_k = shape.unroll_k;
+            matmul_knobs.vector_fragments = shape.vector_fragments;
         }
         let group = dispatch.shader.shader_group();
         let typed_shape = |multiply| {
@@ -1984,7 +1988,31 @@ impl Pipelines {
                 tile,
                 gpu.capabilities().subgroup_size,
             ),
-            Variant::CoopConv(ref entry, types, ref params) => {
+            Variant::CoopConv(
+                ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSplit,
+                types,
+                ref params,
+                _,
+            ) => crate::codegen::generate_subgroup_weight_grad(
+                types,
+                typed_shape(types.multiply)?,
+                gpu.capabilities().subgroup_size,
+                params,
+            )
+            .ok_or("pointwise weight gradients need 16x16 subgroup matrices")?,
+            Variant::CoopConv(
+                ShaderEntry::Conv2dGradInputGemmCoopGen(_, _, stride),
+                types,
+                ref params,
+                _,
+            ) if stride > 1 => crate::codegen::generate_subgroup_phased_grad_input(
+                types,
+                typed_shape(types.multiply)?,
+                gpu.capabilities().subgroup_size,
+                params,
+            )
+            .ok_or("phased input gradients need 16x16 subgroup matrices and whole phases")?,
+            Variant::CoopConv(ref entry, types, ref params, split) => {
                 let group = match *entry {
                     ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
                         ShaderGroup::Conv2dChecked {
@@ -2004,6 +2032,7 @@ impl Pipelines {
                     typed_shape(types.multiply)?,
                     params,
                     gpu.capabilities().subgroup_size,
+                    split,
                 )
             }
             Variant::CoopTyped(_, types, staging) => {
@@ -2016,10 +2045,9 @@ impl Pipelines {
                 )
             }
             Variant::CoopWorkgroup(_, shape, types, row_bounds) => {
-                if !dispatch
-                    .mnk()
-                    .is_some_and(|(m, n, k)| shape.supports(&gpu.capabilities(), types, m, n, k))
-                {
+                if !dispatch.mnk().is_some_and(|(m, n, k)| {
+                    shape.supports_layout(&gpu.capabilities(), types, Some(group), m, n, k)
+                }) {
                     return Err("unsupported workgroup cooperative product".to_owned());
                 }
                 crate::codegen::generate_workgroup_matmul(group, shape, types, row_bounds)
@@ -2374,9 +2402,17 @@ impl Pipelines {
         {
             if matches!(
                 entry,
-                ShaderEntry::Conv2dGemmCoopGen(..) | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                ShaderEntry::Conv2dGemmCoopGen(..)
+                    | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                    | ShaderEntry::Conv2dGradWeightGemm
+                    | ShaderEntry::Conv2dGradWeightGemmSplit
             ) {
-                return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
+                let split = matches!(
+                    entry,
+                    ShaderEntry::Conv2dGemmCoopGen(..)
+                        | ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1)
+                ) && matches!(dispatch.kernel, crate::compile::Kernel::CooperativeTyped { splits, .. } if splits > 1);
+                return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch), split);
             }
             let layout = typed_matmul_layout(dispatch, specialize);
             // The stored kernel does not read direct_inputs. Normalize it
@@ -5579,6 +5615,8 @@ mod variant_tests {
             k_stage: 32,
             threads: 64,
             stage_operands: false,
+            subgroup_rows: 0,
+            prefetch: false,
         };
         let make = |m| Dispatch {
             shader: ShaderEntry::MatMul,
@@ -5824,6 +5862,7 @@ mod variant_tests {
                         k_stage,
                         interleave_columns,
                         unroll_k: true,
+                        vector_fragments: false,
                     };
                     let dispatch = Dispatch {
                         kernel: crate::compile::Kernel::ScalarMatmul(shape),
@@ -6015,9 +6054,23 @@ mod variant_tests {
                     .max(0.0)
             })
             .collect();
-        for (tile_size, tile_n, k_stage, unroll_k) in
-            [(64, 32, 8, true), (32, 64, 16, false), (16, 64, 32, true)]
-        {
+        // (rows, columns, K stage, unroll, interleave, vec4 fragments)
+        for (tile_size, tile_n, k_stage, unroll_k, interleave_columns, vector_fragments) in [
+            (64, 32, 8, true, true, false),
+            (32, 64, 16, false, true, false),
+            (16, 64, 32, true, true, false),
+            (64, 64, 32, false, true, false),
+            (32, 32, 8, true, true, false),
+            (64, 128, 16, false, true, false),
+            (128, 128, 32, false, true, false),
+            (128, 64, 8, false, true, false),
+            (128, 128, 8, false, true, false),
+            (64, 64, 32, false, false, true),
+            (64, 64, 8, true, false, true),
+            (128, 64, 16, false, false, true),
+            (64, 128, 32, false, false, true),
+            (128, 128, 8, false, false, true),
+        ] {
             let mut graph = crate::Graph::new();
             let x = graph.input("x", &[m, k]);
             let w = graph.parameter("w", &[k, n]);
@@ -6027,8 +6080,9 @@ mod variant_tests {
                     tile_size,
                     tile_n,
                     k_stage,
-                    interleave_columns: true,
+                    interleave_columns,
                     unroll_k,
+                    vector_fragments,
                 },
                 splits: 1,
             });

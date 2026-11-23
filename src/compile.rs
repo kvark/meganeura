@@ -3530,6 +3530,7 @@ mod tests {
                 k_stage: 32,
                 interleave_columns: false,
                 unroll_k: true,
+                vector_fragments: false,
             },
             splits: 1,
         });
@@ -3551,6 +3552,7 @@ mod tests {
                 k_stage: 8,
                 interleave_columns: false,
                 unroll_k: true,
+                vector_fragments: false,
             },
             splits: 8,
         });
@@ -3580,6 +3582,7 @@ mod tests {
                 k_stage: 8,
                 interleave_columns: false,
                 unroll_k: true,
+                vector_fragments: false,
             },
             splits: 8,
         });

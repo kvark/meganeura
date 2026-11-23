@@ -2849,6 +2849,7 @@ impl<'a> Compiler<'a> {
                             k_stage: if narrow { 32 } else { 16 },
                             interleave_columns: false,
                             unroll_k: false,
+                            vector_fragments: false,
                         })
                     } else {
                         Kernel::Default

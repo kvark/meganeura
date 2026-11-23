@@ -1471,6 +1471,7 @@ const fn matrix_impl(
             k_stage,
             interleave_columns: false,
             unroll_k,
+            vector_fragments: false,
         },
         splits,
     })

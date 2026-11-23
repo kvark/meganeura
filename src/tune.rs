@@ -569,9 +569,9 @@ impl MatmulTile {
                 || class.conv2d.is_some()
                 || !class.shader.is_matmul()
                 || class.weight_format != crate::compile::WeightFormat::F32
-                || !shape.fits(class.m, class.n, class.k)
+                || !shape.fits_layout(Some(class.shader.shader_group()), class.m, class.n, class.k)
                 || splits == 0
-                || splits > class.k / shape.k_stage
+                || splits > shape.k_blocks(class.k)
                 || (splits > 1) != class.split_k
                 || (splits > 1 && (class.has_addend() || types.output != crate::DType::F32))
             {
@@ -1169,22 +1169,37 @@ impl TuneClass {
                         .map(|shape| MatmulTile::CooperativeTiled { shape, splits: 1 }),
                 );
             }
-            // 128x64 tiles come last, so a time-limited search still covers
-            // the square ones.
-            for tile_n in [0, 64] {
-                for interleave_columns in [false, true] {
-                    for k_stage in [32, 16, 8] {
-                        let sizes: &[u32] = if tile_n == 0 { &[64, 32] } else { &[128] };
-                        for &tile_size in sizes {
-                            candidates.push(MatmulTile::Scalar(
-                                crate::codegen::ScalarMatmulShape {
-                                    tile_size,
-                                    tile_n,
-                                    k_stage,
-                                    interleave_columns,
-                                    unroll_k: false,
-                                },
-                            ));
+            // 128x64 tiles come after the square ones, so a time-limited
+            // search still covers those; the 128-column tiles (8x8 and 4x8
+            // registers per thread) come next, and vec4 shared fragments
+            // repeat the 4- and 8-wide register tiles last.
+            for vector_fragments in [false, true] {
+                for tile_n in [0, 64, 128] {
+                    for interleave_columns in [false, true] {
+                        for k_stage in [32, 16, 8] {
+                            let sizes: &[u32] = match tile_n {
+                                0 => &[64, 32],
+                                64 => &[128],
+                                _ => &[128, 64],
+                            };
+                            for &tile_size in sizes {
+                                let cols = if tile_n == 0 { tile_size } else { tile_n };
+                                if vector_fragments
+                                    && (interleave_columns || tile_size < 64 || cols < 64)
+                                {
+                                    continue;
+                                }
+                                candidates.push(MatmulTile::Scalar(
+                                    crate::codegen::ScalarMatmulShape {
+                                        tile_size,
+                                        tile_n,
+                                        k_stage,
+                                        interleave_columns,
+                                        unroll_k: false,
+                                        vector_fragments,
+                                    },
+                                ));
+                            }
                         }
                     }
                 }

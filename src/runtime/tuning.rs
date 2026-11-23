@@ -43,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 16;
+const KERNEL_MEMO_REVISION: u32 = 17;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -367,6 +367,7 @@ pub(super) fn tile_module(
                 k_stage: shape.k_stage,
                 interleave_columns: shape.interleave_columns,
                 unroll_k: shape.unroll_k,
+                vector_fragments: shape.vector_fragments,
                 ..knobs
             },
         };
@@ -535,7 +536,14 @@ fn retain_tunable_classes(
             }
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 class.key.effective_matrix_types().is_some_and(|types| {
-                    shape.supports(capabilities, types, class.key.m, class.key.n, class.key.k)
+                    shape.supports_layout(
+                        capabilities,
+                        types,
+                        Some(class.key.shader.shader_group()),
+                        class.key.m,
+                        class.key.n,
+                        class.key.k,
+                    )
                 })
             }
             _ => true,
@@ -664,6 +672,7 @@ fn collect_classes(
                         k_stage: plan.knobs.matmul_k_stage,
                         interleave_columns: plan.knobs.matmul_interleave_columns,
                         unroll_k: false,
+                        vector_fragments: false,
                     }))
                 }
                 _ => None,
@@ -2832,6 +2841,8 @@ mod tests {
             k_stage: 64,
             threads: 128,
             stage_operands: false,
+            subgroup_rows: 0,
+            prefetch: false,
         };
         let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 2 };
         assert!(tile.fits(&class.key));
@@ -3531,6 +3542,7 @@ mod tests {
                     k_stage: 8,
                     interleave_columns: true,
                     unroll_k: false,
+                    vector_fragments: false,
                 })
                 .apply(&mut right.dispatches[index], &class.key);
             }
@@ -3713,6 +3725,7 @@ mod tests {
                 k_stage: 8,
                 interleave_columns: true,
                 unroll_k: false,
+                vector_fragments: false,
             })
         };
         b.pipelines
@@ -4185,6 +4198,7 @@ mod tests {
                     k_stage,
                     interleave_columns,
                     unroll_k: false,
+                    vector_fragments: false,
                 })
             };
             let tiles = [

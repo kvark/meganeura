@@ -14,6 +14,8 @@ fn main() {
                 k_stage: if bf16 { 64 } else { 32 },
                 threads: 256,
                 stage_operands,
+                subgroup_rows: 0,
+                prefetch: false,
             }
         } else {
             WorkgroupMatmulShape {
@@ -22,6 +24,8 @@ fn main() {
                 k_stage: 32,
                 threads: 64,
                 stage_operands,
+                subgroup_rows: 0,
+                prefetch: false,
             }
         };
         let shapes: &[(usize, usize, usize)] = if large {
