@@ -183,6 +183,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_GREEDY_PACK_SWIGLU=0` | Skip packing consecutive SwiGLU ops into one parameter buffer during graph optimization (legacy variable name). |
 | `MEGANEURA_DEVICE_PARAMETERS` | Experimental placement of unaliased parameter buffers on the device: `1` → device-transient, `device-buddy` → device. Default is host-visible. |
 | `MEGANEURA_REUSE_UPLOAD` | Reuse one staging buffer across `set_parameter` uploads instead of restaging per parameter. |
+| `MEGANEURA_CHECKPOINT` | Rematerialize internal activations of repeated outlined regions during training backward passes to reduce peak activation VRAM. |
 | `MEGANEURA_TUNE` | Opt-in bounded matmul, convolution and GEMV search at build (`SessionConfig { tune: true }`), using private scratch. Scalar tiles and GEMV shapes also support reduced-storage weights. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
 | `MEGANEURA_FLASH_THREADS=<n>` | Flash forward workgroup width: 128 or 256. |

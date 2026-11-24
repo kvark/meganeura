@@ -248,6 +248,102 @@ fn concat_of_matrices() {
     );
 }
 
+#[test]
+fn depend_and_checkpointed_training_match_reference() {
+    // Direct Op::Depend coverage: behaves identically to its value operand in
+    // both forward and backward passes while ordering after the control token.
+    grad_case(
+        "depend ordering barrier",
+        |g| {
+            let x = g.parameter("x", &[4, 8]);
+            let token = g.scale(x, 2.0);
+            let gated = g.depend(x, token);
+            g.silu(gated)
+        },
+        |_| {},
+    );
+
+    // End-to-end GPU training parity with activation checkpointing enabled on
+    // a 12-layer residual MLP stack (enough post-fusion compute nodes to cross
+    // outline::MIN_COVERAGE after forward optimization and toposort): gradients
+    // match the uncheckpointed GPU run while reducing peak device-local VRAM.
+    const LAYERS: usize = 12;
+    let mut g = Graph::new();
+    let mut h = g.input("x", &[16, 32]);
+    let x_data: Vec<f32> = (0..16 * 32)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+        .collect();
+    let mut param_values: Vec<(String, Vec<f32>)> = Vec::new();
+    for l in 0..LAYERS {
+        let w1_name = format!("l{l}.w1");
+        let w2_name = format!("l{l}.w2");
+        let w1 = g.parameter(&w1_name, &[32, 64]);
+        let w2 = g.parameter(&w2_name, &[64, 32]);
+        let w1_data: Vec<f32> = (0..32 * 64)
+            .map(|i| (((i + l * 7) % 11) as f32 - 5.0) * 0.02)
+            .collect();
+        let w2_data: Vec<f32> = (0..64 * 32)
+            .map(|i| (((i + l * 13) % 9) as f32 - 4.0) * 0.02)
+            .collect();
+        param_values.push((w1_name, w1_data));
+        param_values.push((w2_name, w2_data));
+        let up = g.matmul(h, w1);
+        let act = g.silu(up);
+        let down = g.matmul(act, w2);
+        h = g.add(h, down);
+    }
+    let loss = g.mean_all(h);
+    g.set_outputs(vec![loss]);
+
+    let make_session = |checkpoint: bool| {
+        let mut cfg = meganeura::SessionConfig {
+            gpu: Some(gpu::shared_context()),
+            ..Default::default()
+        };
+        cfg.options.checkpoint_activations = checkpoint;
+        let (mut session, _) = meganeura::build(&g, cfg);
+        session.set_input("x", &x_data);
+        for (name, data) in &param_values {
+            session.set_parameter(name, data);
+        }
+        session
+    };
+
+    let mut ordinary = make_session(false);
+    let mut checkpointed = make_session(true);
+    assert!(
+        checkpointed.memory_summary().device_local_bytes
+            < ordinary.memory_summary().device_local_bytes,
+        "checkpointed training should use less device-local VRAM ({} vs {})",
+        checkpointed.memory_summary().device_local_bytes,
+        ordinary.memory_summary().device_local_bytes,
+    );
+
+    ordinary.step();
+    ordinary.wait();
+    checkpointed.step();
+    checkpointed.wait();
+
+    assert!(
+        (ordinary.read_loss() - checkpointed.read_loss()).abs() <= 1e-5,
+        "loss diverged: {} vs {}",
+        ordinary.read_loss(),
+        checkpointed.read_loss(),
+    );
+    for (name, data) in &param_values {
+        let mut og = vec![0.0; data.len()];
+        let mut cg = vec![0.0; data.len()];
+        ordinary.read_param_grad(name, &mut og);
+        checkpointed.read_param_grad(name, &mut cg);
+        for (k, (&a, &b)) in og.iter().zip(&cg).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4,
+                "checkpointed gradient {name}[{k}] diverged from ordinary: {a} vs {b}"
+            );
+        }
+    }
+}
+
 /// Running sums before (or after) each element of a row, over a width
 /// spanning several workgroups' worth of elements.
 #[test]

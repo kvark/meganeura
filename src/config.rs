@@ -181,6 +181,9 @@ registry! {
     REUSE_UPLOAD: "MEGANEURA_REUSE_UPLOAD", Bool, Diagnostic,
         "Reuse one staging buffer across set_parameter uploads instead of \
          restaging per parameter.";
+    CHECKPOINT: "MEGANEURA_CHECKPOINT", Bool, Diagnostic,
+        "Rematerialize internal activations of repeated outlined regions during \
+         training backward passes to reduce peak activation VRAM.";
 
     // --- Tuning defaults (explicit code-level options win) ---
     TUNE: "MEGANEURA_TUNE", Bool, Tuning,
@@ -325,6 +328,7 @@ impl CompileOptions {
             knobs: TuningKnobs::from_env(),
             flash_forward_coop: FLASH_FWD_COOP.bool_or(true),
             flash_backward_coop: FLASH_BWD_COOP.bool_or(false),
+            checkpoint_activations: CHECKPOINT.bool_or(false),
             ..Self::default()
         }
     }

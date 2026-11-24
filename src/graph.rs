@@ -392,6 +392,13 @@ pub enum Op {
     /// other frameworks). Compiled as a buffer alias, so zero forward
     /// cost; in autodiff, no gradient is accumulated for the input.
     StopGradient,
+    /// Zero-cost control dependency: evaluates to `inputs[0]`, but any
+    /// dispatch reading it is ordered after `inputs[1]` has been written.
+    /// Compiled as a buffer alias of `inputs[0]` with `inputs[1]` attached
+    /// as a scheduling control dependency; backward passes gradients to
+    /// `inputs[0]` only. Used by activation checkpointing to keep
+    /// rematerialized forward blocks anchored to backward execution.
+    Depend,
 
     // Log-softmax (for numerical stability)
     LogSoftmax,
@@ -1278,6 +1285,18 @@ impl Graph {
         self.new_nodes_require_full_precision = false;
     }
 
+    /// Toggle whether subsequently appended nodes are marked as derivative
+    /// work, returning the previous setting. Used when activation checkpointing
+    /// clones forward nodes inside the backward pass.
+    pub(crate) fn set_derivative_region(&mut self, active: bool) -> bool {
+        let prev = self.new_nodes_are_derivatives;
+        self.new_nodes_are_derivatives = active;
+        if !active {
+            self.new_nodes_require_full_precision = false;
+        }
+        prev
+    }
+
     pub(crate) fn pin_new_derivatives(&mut self, pinned: bool) {
         assert!(self.new_nodes_are_derivatives);
         if pinned {
@@ -1845,6 +1864,13 @@ impl Graph {
     pub fn stop_gradient(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::StopGradient, vec![x], ty)
+    }
+
+    /// Zero-cost control dependency: returns the value of `value`, ordered
+    /// after `after` has executed. Gradients flow through `value` only.
+    pub fn depend(&mut self, value: NodeId, after: NodeId) -> NodeId {
+        let ty = self.node(value).ty.clone();
+        self.add_raw_node(Op::Depend, vec![value, after], ty)
     }
 
     /// Element-wise division: `a / b` = `a * recip(b)`.

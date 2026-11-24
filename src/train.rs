@@ -426,7 +426,10 @@ fn compile_for_target(
         mode,
         optimize,
         skip_full_optimize,
-        options.bf16_matrix_gradients,
+        autodiff::AutodiffOptions {
+            bf16_gradients: options.bf16_matrix_gradients,
+            checkpoint_regions: options.checkpoint_activations,
+        },
     );
     let _span = tracing::info_span!("compile").entered();
     let plan =
@@ -466,7 +469,7 @@ fn prepare_graph(
     mode: Mode,
     optimize: optimize::OptimizeConfig,
     skip_full_optimize: bool,
-    bf16_matrix_gradients: bool,
+    autodiff_options: autodiff::AutodiffOptions,
 ) -> (Graph, optimize::OptimizeReport) {
     // Composites written as their decompositions build as the composites,
     // so their fused kernels and gradients apply.
@@ -500,11 +503,7 @@ fn prepare_graph(
             // sorted, differentiated, and fully optimized graphs together.
             let full = {
                 let _span = tracing::info_span!("autodiff").entered();
-                if bf16_matrix_gradients {
-                    autodiff::differentiate_with_bf16_gradients(&sorted)
-                } else {
-                    autodiff::differentiate(&sorted)
-                }
+                autodiff::differentiate_with_options(&sorted, autodiff_options)
             };
             drop(sorted);
             log::info!(
@@ -615,7 +614,10 @@ pub fn compile_plan(
         mode,
         optimize,
         false,
-        options.bf16_matrix_gradients,
+        autodiff::AutodiffOptions {
+            bf16_gradients: options.bf16_matrix_gradients,
+            checkpoint_regions: options.checkpoint_activations,
+        },
     );
     compile::compile_owned_with_caps(graph, options, Default::default(), 32 * 1024)
 }

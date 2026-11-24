@@ -724,7 +724,7 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         Op::BiasMul => row_broadcast(node, arg(0)?, arg(1)?, |a, b| a * b)?,
         // A dead node has no defined value; nothing may consume it.
         Op::Nop => vec![f64::NAN; node.ty.num_elements()],
-        Op::Identity | Op::Materialize | Op::StopGradient => arg(0)?.data.clone(),
+        Op::Identity | Op::Materialize | Op::StopGradient | Op::Depend => arg(0)?.data.clone(),
         Op::ScatterAdd { vocab_size } => {
             let (indices, src) = (arg(0)?, arg(1)?);
             let (rows, dim) = rows_cols(src);

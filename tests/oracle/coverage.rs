@@ -89,6 +89,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("Identity", Covered(".reshape(")),
     ("Materialize", Covered(".materialize(")),
     ("StopGradient", Covered(".stop_gradient(")),
+    ("Depend", Covered(".depend(")),
     ("LogSoftmax", Covered(".log_softmax(")),
     ("ScatterAdd", Covered(".scatter_add(")),
     ("Silu", Covered(".silu(")),

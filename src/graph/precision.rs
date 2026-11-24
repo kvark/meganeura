@@ -94,12 +94,20 @@ fn narrow(graph: &mut Graph, casts: &mut HashMap<NodeId, NodeId>, id: NodeId) ->
     if let Some(&half) = casts.get(&id) {
         return half;
     }
-    let half = if matches!(graph.node(id).op, Op::Identity | Op::StopGradient) {
+    let half = if matches!(
+        graph.node(id).op,
+        Op::Identity | Op::StopGradient | Op::Depend
+    ) {
         let node = graph.node(id).clone();
         let source = narrow(graph, casts, node.inputs[0]);
         let mut ty = node.ty;
         ty.dtype = DType::BF16;
-        graph.add_raw_node(node.op, vec![source], ty)
+        let inputs = if matches!(node.op, Op::Depend) {
+            vec![source, node.inputs[1]]
+        } else {
+            vec![source]
+        };
+        graph.add_raw_node(node.op, inputs, ty)
     } else {
         graph.to_bf16(id)
     };

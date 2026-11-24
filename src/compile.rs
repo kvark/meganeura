@@ -213,6 +213,11 @@ pub struct CompileOptions {
     /// full-precision regions and pinned scalar layouts remain protected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_attention_grad: Option<crate::kernels::attention_grad::Path>,
+    /// Rematerialize internal activations of repeated outlined regions during
+    /// training backward passes instead of keeping every layer's intermediates
+    /// live across the whole step.
+    #[serde(default)]
+    pub checkpoint_activations: bool,
 }
 
 impl Default for CompileOptions {
@@ -229,6 +234,7 @@ impl Default for CompileOptions {
             conv_weight_splits: None,
             quantized_activations: true,
             prefer_attention_grad: None,
+            checkpoint_activations: false,
         }
     }
 }
@@ -1051,6 +1057,7 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
         let level = dispatch
             .input_buffers
             .iter()
+            .chain(&dispatch.control_deps)
             .filter_map(|b| producer.get(&b.0))
             .map(|&pred| levels[pred] + 1)
             .max()
@@ -1074,7 +1081,12 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut dirty = HashSet::<u32>::new();
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+        if dispatch
+            .input_buffers
+            .iter()
+            .chain(&dispatch.control_deps)
+            .any(|b| dirty.contains(&b.0))
+        {
             groups.push(start..i);
             start = i;
             dirty.clear();
@@ -1096,7 +1108,7 @@ fn warn_on_hazards(dispatches: &[Dispatch], groups: &[std::ops::Range<usize>]) {
         let mut written = HashSet::<u32>::new();
         for i in group.clone() {
             let d = &dispatches[i];
-            for ib in &d.input_buffers {
+            for ib in d.input_buffers.iter().chain(&d.control_deps) {
                 if written.contains(&ib.0) {
                     log::warn!(
                         "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
@@ -1178,6 +1190,7 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && a.input_buffers.len() == 2
         && b.input_buffers.len() == 2
         && a.input_buffers[0] == b.input_buffers[0]
+        && a.control_deps == b.control_deps
 }
 
 fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
@@ -1283,6 +1296,11 @@ pub struct Dispatch {
     /// `Wt[(ci, ky, kx), co]` produced by an explicit preceding `Transpose`.
     #[serde(default)]
     pub conv_transposed_weights: bool,
+    /// Scheduling-only control dependencies (from [`Op::Depend`]): buffers
+    /// whose writers must finish in an earlier barrier group, without binding
+    /// them to the shader or extending their memory lifetime in `memplan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_deps: Vec<BufferRef>,
 }
 
 /// Mutually exclusive implementations. Bindings and launch geometry live on
@@ -3388,6 +3406,9 @@ struct Compiler<'a> {
     /// GroupNorm backward statistics per input, grouping and epsilon,
     /// shared by the input and weight/bias gradients.
     group_norm_grad_stats: HashMap<(NodeId, [u32; 4], u32), BufferRef>,
+    /// Control dependencies carried across zero-cost alias nodes (`Depend`,
+    /// `Identity`, `StopGradient`) until stamped onto the first real dispatch.
+    node_control_deps: HashMap<NodeId, Vec<BufferRef>>,
 }
 
 // The emitter lives in `compile/emit.rs`: graph traversal that turns nodes

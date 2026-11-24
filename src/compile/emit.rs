@@ -48,7 +48,10 @@ impl<'a> Compiler<'a> {
         for node in graph.nodes() {
             if node.ty.dtype == DType::BF16 {
                 assert!(
-                    matches!(node.op, Op::ToBF16 | Op::Identity | Op::StopGradient),
+                    matches!(
+                        node.op,
+                        Op::ToBF16 | Op::Identity | Op::StopGradient | Op::Depend
+                    ),
                     "BF16 currently supports internal conversion storage only"
                 );
                 assert!(
@@ -67,6 +70,7 @@ impl<'a> Compiler<'a> {
                         Op::FromBF16
                             | Op::Identity
                             | Op::StopGradient
+                            | Op::Depend
                             | Op::MatMul
                             | Op::MatMulAT
                             | Op::MatMulBT
@@ -137,6 +141,7 @@ impl<'a> Compiler<'a> {
             pending_grad_v_buffers: HashMap::new(),
             attention_row_dots: HashMap::new(),
             group_norm_grad_stats: HashMap::new(),
+            node_control_deps: HashMap::new(),
         }
     }
 
@@ -680,10 +685,12 @@ impl<'a> Compiler<'a> {
                 self.node_buffers.insert(node.id, cache);
                 continue;
             }
-            // Identity and StopGradient are zero-cost: alias the input
-            // buffer. (Identity may also reshape; StopGradient is forward-
-            // identity with backward zero, handled in autodiff.)
-            if matches!(node.op, Op::Identity | Op::StopGradient) && !node.inputs.is_empty() {
+            // Identity, StopGradient, and Depend are zero-cost: alias the
+            // input buffer. (Depend also carries a scheduling-only control
+            // dependency on `inputs[1]`, resolved in the second pass.)
+            if matches!(node.op, Op::Identity | Op::StopGradient | Op::Depend)
+                && !node.inputs.is_empty()
+            {
                 if let Some(&input_buf) = self.node_buffers.get(&node.inputs[0]) {
                     self.node_buffers.insert(node.id, input_buf);
                     continue;
@@ -739,11 +746,38 @@ impl<'a> Compiler<'a> {
         // Processing in ID order would dispatch consumers before producers.
         let topo = topological_order(self.graph);
         for &node_id in &topo {
+            let node = &self.graph.nodes()[node_id as usize];
+            let mut inherited_deps = Vec::new();
+            for &inp in &node.inputs {
+                if let Some(deps) = self.node_control_deps.get(&inp) {
+                    for &dep in deps {
+                        if !inherited_deps.contains(&dep) {
+                            inherited_deps.push(dep);
+                        }
+                    }
+                }
+            }
+            if matches!(node.op, Op::Depend) && node.inputs.len() >= 2 {
+                let tok = self.get_buffer(node.inputs[1]);
+                if !inherited_deps.contains(&tok) {
+                    inherited_deps.push(tok);
+                }
+            }
             let first_new = self.plan.dispatches.len();
-            self.compile_node(&self.graph.nodes()[node_id as usize]);
+            self.compile_node(node);
             // Stamp provenance on every dispatch this node emitted.
             for d in &mut self.plan.dispatches[first_new..] {
                 d.origin.push(node_id);
+            }
+            if !inherited_deps.is_empty() {
+                if self.plan.dispatches.len() == first_new {
+                    self.node_control_deps.insert(node_id, inherited_deps);
+                } else {
+                    for d in &mut self.plan.dispatches[first_new..] {
+                        d.control_deps = inherited_deps.clone();
+                        d.fusion_barrier = true;
+                    }
+                }
             }
         }
 
@@ -1100,6 +1134,7 @@ impl<'a> Compiler<'a> {
             | Op::Nop
             | Op::Identity
             | Op::StopGradient
+            | Op::Depend
             | Op::CrossEntropyLogitsGrad => {}
 
             Op::Materialize => {

@@ -323,6 +323,7 @@ pub fn eval_node(
         | Op::Identity
         | Op::Materialize
         | Op::StopGradient
+        | Op::Depend
         | Op::ScatterAdd { .. }
         | Op::Silu
         | Op::SiluGrad
@@ -519,6 +520,7 @@ fn propagates_scale(op: &Op) -> bool {
                 | Op::Identity
                 | Op::Materialize
                 | Op::StopGradient
+                | Op::Depend
                 | Op::BroadcastInner { .. }
                 | Op::MaxInner
                 | Op::BiasMul

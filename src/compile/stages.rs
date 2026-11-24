@@ -46,6 +46,7 @@ pub(crate) fn schedule(
         if let Some(&producer) = producers.get(&buffer) {
             early[producer] = true;
             pending.extend(plan.dispatches[producer].input_buffers.iter().copied());
+            pending.extend(plan.dispatches[producer].control_deps.iter().copied());
         }
     }
     let early_inputs = inputs.intersection(&ready).copied().collect();

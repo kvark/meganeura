@@ -218,12 +218,16 @@ pub fn build_measured_with_inputs(
         shared_memory_bytes,
         forward_coop: cfg.options.flash_forward_coop,
     };
+    let autodiff_options = crate::autodiff::AutodiffOptions {
+        bf16_gradients: cfg.options.bf16_matrix_gradients,
+        checkpoint_regions: cfg.options.checkpoint_activations,
+    };
     let (ordinary, _) = prepare_graph(
         forward_graph,
         cfg.mode,
         cfg.optimize,
         cfg.skip_full_optimize,
-        cfg.options.bf16_matrix_gradients,
+        autodiff_options,
     );
     let mut graphs = vec![optimize::search::Candidate {
         graph: ordinary,
@@ -286,7 +290,7 @@ pub fn build_measured_with_inputs(
                                 cfg.mode,
                                 unfused,
                                 cfg.skip_full_optimize,
-                                cfg.options.bf16_matrix_gradients,
+                                autodiff_options,
                             )
                             .0,
                             expression: form.expression,

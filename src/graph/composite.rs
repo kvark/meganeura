@@ -90,6 +90,7 @@ impl Op {
             | Op::Identity
             | Op::Materialize
             | Op::StopGradient
+            | Op::Depend
             | Op::Concat { .. }
             | Op::SplitA { .. }
             | Op::SplitB { .. }
