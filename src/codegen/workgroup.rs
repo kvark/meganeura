@@ -46,13 +46,45 @@ const SUBGROUP_TILES: [(u32, u32, u32, u32, u32); 8] = [
     (2, 1, 1, 1, 64),
 ];
 
-/// Width of the subgroups the subgroup-tiled kernels assume.
+/// Default subgroup width when no device capability overrides it.
 pub(crate) const SUBGROUP_WIDTH: u32 = 32;
 
+/// Subgroup widths supported by the subgroup-tiled cooperative kernels
+/// (Intel Xe2 16/32, NVIDIA/Metal 32, AMD/Adreno 64).
+pub(crate) fn supported_subgroup_width(subgroup: u32) -> bool {
+    matches!(subgroup, 16 | 32 | 64)
+}
+
+/// Native cooperative matrix shape and subgroup width for `multiply` on `caps`.
+pub(crate) fn native_subgroup_shape(
+    caps: &blade_graphics::Capabilities,
+    multiply: DType,
+) -> Option<([u32; 3], u32)> {
+    if !supported_subgroup_width(caps.subgroup_size) {
+        return None;
+    }
+    let shapes = match multiply {
+        DType::F16 => &caps.cooperative_matrix.f16_f32_shapes,
+        DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
+        _ => return None,
+    };
+    let native = super::checked_cooperative_shape(shapes)?;
+    Some((native, caps.subgroup_size))
+}
+
 impl WorkgroupMatmulShape {
-    /// Bounded search space, including both orientations of rectangular tiles.
-    /// Device granularity, memory, buffer extents and precision filter it later.
+    /// Bounded search space for the default 16×16×16 / 32-lane target.
     pub fn all() -> impl Iterator<Item = Self> {
+        Self::all_for([16, 16, 16], SUBGROUP_WIDTH)
+    }
+
+    /// Bounded search space, including both orientations of rectangular tiles
+    /// and subgroup-tiled shapes sized to `(native, subgroup)`.
+    /// Device granularity, memory, buffer extents and precision filter it later.
+    pub fn all_for(native: [u32; 3], subgroup: u32) -> impl Iterator<Item = Self> {
+        let [nm, nn, _] = native;
+        let subgroup_ok = super::checked_cooperative_shape(&[native]).is_some()
+            && supported_subgroup_width(subgroup);
         [
             (64, 64, 64),
             (32, 64, 64),
@@ -85,12 +117,13 @@ impl WorkgroupMatmulShape {
         .chain(
             SUBGROUP_TILES
                 .into_iter()
-                .flat_map(|(wr, wc, tr, tc, k_stage)| {
-                    [false, true].map(|prefetch| Self {
-                        rows: wr * tr * 16,
-                        columns: wc * tc * 16,
+                .filter(move |&(wr, wc, ..)| subgroup_ok && wr * wc * subgroup <= 256)
+                .flat_map(move |(wr, wc, tr, tc, k_stage)| {
+                    [false, true].map(move |prefetch| Self {
+                        rows: wr * tr * nm,
+                        columns: wc * tc * nn,
                         k_stage,
-                        threads: wr * wc * SUBGROUP_WIDTH,
+                        threads: wr * wc * subgroup,
                         stage_operands: false,
                         subgroup_rows: wr,
                         prefetch,
@@ -100,31 +133,63 @@ impl WorkgroupMatmulShape {
     }
 
     /// `(subgroup rows, subgroup columns, tile rows, tile columns)` of a
-    /// subgroup-tiled shape, in subgroups and 16x16 accumulators.
+    /// subgroup-tiled shape on a 16×16×16 / 32-lane device.
     pub fn subgroup_grid(self) -> Option<(u32, u32, u32, u32)> {
+        self.subgroup_grid_for([16, 16, 16], SUBGROUP_WIDTH)
+    }
+
+    /// `(subgroup rows, subgroup columns, tile rows, tile columns)` of a
+    /// subgroup-tiled shape, in subgroups and `native` accumulators.
+    pub(crate) fn subgroup_grid_for(
+        self,
+        native: [u32; 3],
+        subgroup: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let [nm, nn, _] = native;
         let wr = self.subgroup_rows;
-        if wr == 0 || self.threads == 0 || !self.threads.is_multiple_of(SUBGROUP_WIDTH * wr) {
+        if wr == 0
+            || !supported_subgroup_width(subgroup)
+            || nm == 0
+            || nn == 0
+            || self.threads == 0
+            || !self.threads.is_multiple_of(subgroup * wr)
+        {
             return None;
         }
-        let wc = self.threads / SUBGROUP_WIDTH / wr;
-        (self.rows.is_multiple_of(16 * wr) && self.columns.is_multiple_of(16 * wc))
-            .then(|| (wr, wc, self.rows / 16 / wr, self.columns / 16 / wc))
+        let wc = self.threads / subgroup / wr;
+        if wc == 0 || !self.rows.is_multiple_of(nm * wr) || !self.columns.is_multiple_of(nn * wc) {
+            return None;
+        }
+        let tr = self.rows / nm / wr;
+        let tc = self.columns / nn / wc;
+        (tr > 0 && tc > 0).then_some((wr, wc, tr, tc))
     }
 
     /// Shared bytes of a subgroup-tiled shape: padded operand tiles in the
-    /// multiplication type, and a 16x16 f32 tile per subgroup when stores
-    /// pass through shared memory.
-    fn subgroup_shared_bytes(self, types: MatrixTypes, row_bounds: bool) -> Option<u32> {
-        let (wr, wc, ..) = self.subgroup_grid()?;
+    /// multiplication type (doubled for double-buffered `prefetch`), and one
+    /// `nm × nn` f32 tile per subgroup when stores pass through shared memory.
+    fn subgroup_shared_bytes_for(
+        self,
+        types: MatrixTypes,
+        native: [u32; 3],
+        subgroup: u32,
+        row_bounds: bool,
+    ) -> Option<u32> {
+        let (wr, wc, ..) = self.subgroup_grid_for(native, subgroup)?;
         let element = MatrixTypes::bytes(types.multiply) as u32;
+        let stages = if self.prefetch { 2u32 } else { 1u32 };
         let operands = self
             .rows
             .checked_add(self.columns)?
             .checked_mul(self.k_stage.checked_add(8)?)?
             .checked_add(16 * self.k_stage)?
-            .checked_mul(element)?;
+            .checked_mul(element)?
+            .checked_mul(stages)?;
         let scratch = if row_bounds || types.output != DType::F32 {
-            wr * wc * 256 * 4
+            wr.checked_mul(wc)?
+                .checked_mul(native[0])?
+                .checked_mul(native[1])?
+                .checked_mul(4)?
         } else {
             0
         };
@@ -159,13 +224,11 @@ impl WorkgroupMatmulShape {
             return false;
         }
         if self.subgroup_rows != 0 {
-            let shapes = match types.multiply {
-                DType::F16 => &caps.cooperative_matrix.f16_f32_shapes,
-                DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
-                _ => return false,
+            let Some((native, subgroup)) = native_subgroup_shape(caps, types.multiply) else {
+                return false;
             };
             // Storage is F32 or the multiplication type itself.
-            return self.fits_layout(group, m, n, k)
+            return self.fits_layout_for(group, native, subgroup, m, n, k)
                 && !self.stage_operands
                 && types.is_valid()
                 && [types.a, types.b]
@@ -173,12 +236,11 @@ impl WorkgroupMatmulShape {
                     .all(|&storage| storage == DType::F32 || storage == types.multiply)
                 && (!types.uses(DType::F16) || caps.shader_float16)
                 && (!types.uses(DType::BF16) || caps.shader_bfloat16)
-                && caps.subgroup_size == SUBGROUP_WIDTH
-                && shapes.contains(&[16, 16, 16])
                 && matches!(self.k_stage, 16 | 32 | 64)
+                && self.k_stage.is_multiple_of(native[2])
                 && self.threads <= 256
                 && self
-                    .subgroup_shared_bytes(types, self.ragged_rows(m))
+                    .subgroup_shared_bytes_for(types, native, subgroup, self.ragged_rows(m))
                     .is_some_and(|bytes| bytes <= caps.max_compute_shared_memory_size);
         }
         let matrix = &caps.cooperative_matrix.workgroup;
@@ -209,8 +271,31 @@ impl WorkgroupMatmulShape {
         self.fits_layout(None, m, n, k)
     }
 
-    /// [`fits`](Self::fits) for the layout of `group`, when known.
+    /// [`fits`](Self::fits) for the layout of `group`, when known, across any
+    /// supported native cooperative matrix shape and subgroup width.
     pub fn fits_layout(self, group: Option<ShaderGroup>, m: u32, n: u32, k: u32) -> bool {
+        if self.subgroup_rows == 0 {
+            return self.fits_layout_for(group, [16, 16, 16], SUBGROUP_WIDTH, m, n, k);
+        }
+        [[16, 16, 16], [8, 16, 16], [8, 8, 8]]
+            .into_iter()
+            .any(|native| {
+                [16, 32, 64]
+                    .into_iter()
+                    .any(|subgroup| self.fits_layout_for(group, native, subgroup, m, n, k))
+            })
+    }
+
+    /// [`fits_layout`](Self::fits_layout) for a specific `(native, subgroup)`.
+    pub(crate) fn fits_layout_for(
+        self,
+        group: Option<ShaderGroup>,
+        native: [u32; 3],
+        subgroup: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> bool {
         let reduction = if self.subgroup_rows != 0 {
             // Guarded vector loads: K may end inside a stage. Every
             // operand's contiguous axis holds whole vectors: K for A and for
@@ -221,7 +306,7 @@ impl WorkgroupMatmulShape {
                 Some(_) => k.is_multiple_of(4),
                 None => k.is_multiple_of(4) && m.is_multiple_of(4),
             };
-            self.subgroup_grid().is_some() && contiguous
+            self.subgroup_grid_for(native, subgroup).is_some() && contiguous
         } else {
             k.is_multiple_of(self.k_stage)
         };
@@ -259,8 +344,18 @@ impl WorkgroupMatmulShape {
     }
 
     pub fn shared_bytes(self, types: MatrixTypes, row_bounds: bool) -> Option<u32> {
+        self.shared_bytes_for(types, [16, 16, 16], SUBGROUP_WIDTH, row_bounds)
+    }
+
+    pub(crate) fn shared_bytes_for(
+        self,
+        types: MatrixTypes,
+        native: [u32; 3],
+        subgroup: u32,
+        row_bounds: bool,
+    ) -> Option<u32> {
         if self.subgroup_rows != 0 {
-            return self.subgroup_shared_bytes(types, row_bounds);
+            return self.subgroup_shared_bytes_for(types, native, subgroup, row_bounds);
         }
         let mut bytes = 0u32;
         for (storage, rows, cols, bounded) in [
@@ -289,11 +384,39 @@ pub fn generate_workgroup_matmul(
     types: MatrixTypes,
     row_bounds: bool,
 ) -> ShaderModule {
+    generate_workgroup_matmul_for_device(
+        group,
+        shape,
+        types,
+        [16, 16, 16],
+        SUBGROUP_WIDTH,
+        row_bounds,
+        None,
+    )
+}
+
+/// [`generate_workgroup_matmul`] specialized to a device's `(native, subgroup)`
+/// and optional unary [`crate::compile::MatMulEpilogue`].
+pub(crate) fn generate_workgroup_matmul_for_device(
+    group: ShaderGroup,
+    shape: WorkgroupMatmulShape,
+    types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
+    row_bounds: bool,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
+) -> ShaderModule {
     types.validate();
     assert!(matches!(types.multiply, DType::F16 | DType::BF16));
     if shape.subgroup_rows != 0 {
-        return generate_subgroup_matmul(group, shape, types, row_bounds);
+        return generate_subgroup_matmul(
+            group, shape, types, native, subgroup, row_bounds, epilogue,
+        );
     }
+    assert!(
+        epilogue.is_none(),
+        "workgroup-scope matmul does not stage fused epilogues"
+    );
     let (addend, variant) = coop_shape(group).expect("workgroup matmul group");
     let WorkgroupMatmulShape {
         rows: m,
@@ -472,18 +595,40 @@ pub fn generate_workgroup_matmul(
     ShaderModule::with_hint(source, "workgroup-matmul")
 }
 
-/// Subgroup-tiled NN/AT/BT products: `threads / 32` subgroups in a
-/// `subgroup_rows` grid split the workgroup tile, each accumulating 16x16 F32
-/// matrices over operands staged through shared memory in the
+fn conv_split_images(split: bool, batch: u32) -> Images {
+    let batch = batch.max(1);
+    if split {
+        Images {
+            a: "0u".into(),
+            b: "0u".into(),
+            c: format!("(chunk * {batch}u + image) * m * n"),
+            batch: Some(batch),
+        }
+    } else {
+        Images {
+            a: "0u".into(),
+            b: "0u".into(),
+            c: "image * m * n".into(),
+            batch: None,
+        }
+    }
+}
+
+/// Subgroup-tiled NN/AT/BT products: `threads / subgroup` subgroups in a
+/// `subgroup_rows` grid split the workgroup tile, each accumulating `native`
+/// F32 matrices over operands staged through shared memory in the
 /// multiplication type. Vector loads guard every edge, so M may be ragged
 /// and K may end inside a stage. Partitions own whole K stages and write
-/// compact M*N slices; ragged rows and reduced outputs leave through a
-/// per-subgroup shared tile.
+/// compact M*N slices; ragged rows, fused epilogues and reduced outputs leave
+/// through a per-subgroup shared tile.
 fn generate_subgroup_matmul(
     group: ShaderGroup,
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     row_bounds: bool,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
 ) -> ShaderModule {
     let (addend, variant) = coop_shape(group).expect("workgroup matmul group");
     let mut header = String::from(
@@ -505,6 +650,8 @@ fn generate_subgroup_matmul(
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant,
             header,
@@ -513,6 +660,7 @@ fn generate_subgroup_matmul(
             b: "matrix_b",
             c: "matrix_c",
             addend: addend.then_some("src"),
+            epilogue,
             images: None,
             row_bounds,
             column_bounds: false,
@@ -525,12 +673,13 @@ fn generate_subgroup_matmul(
 /// A pointwise (1x1, stride 1, unpadded) NCHW convolution as one subgroup-
 /// tiled product per image: the forward `W[Co, Ci] · X[Ci, HW]` or the input
 /// gradient `Wᵀ · dY[Co, HW]`. Dimensions are constants; workgroup Z is the
-/// image. `None` unless the device runs 16x16 F16/BF16 subgroup matrices
-/// over 32-wide subgroups and the operands hold whole vectors.
+/// image.
 pub(crate) fn generate_subgroup_pointwise_conv(
     backward: bool,
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     params: &crate::kernels::conv::Params,
 ) -> ShaderModule {
     assert!(params.vectorized_forward());
@@ -550,6 +699,8 @@ pub(crate) fn generate_subgroup_pointwise_conv(
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: if backward {
                 MatMulCoopVariant::AT
@@ -562,6 +713,7 @@ pub(crate) fn generate_subgroup_pointwise_conv(
             b: if backward { "grad_out" } else { "src" },
             c: "dst",
             addend: None,
+            epilogue: None,
             images: Some(Images {
                 a: "0u".into(),
                 b: "image * k * n".into(),
@@ -583,6 +735,8 @@ pub(crate) fn generate_subgroup_pointwise_conv(
 pub(crate) fn generate_subgroup_pointwise_weight_grad(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     params: &crate::kernels::conv::Params,
 ) -> ShaderModule {
     assert!(params.vectorized_forward());
@@ -598,6 +752,8 @@ pub(crate) fn generate_subgroup_pointwise_weight_grad(
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: MatMulCoopVariant::BT,
             header: "var<storage> grad_out: array<vec4<f32>>;\nvar<storage> src: array<vec4<f32>>;\nvar<storage, read_write> dst: array<f32>;\n".into(),
@@ -606,6 +762,7 @@ pub(crate) fn generate_subgroup_pointwise_weight_grad(
             b: "src",
             c: "dst",
             addend: None,
+            epilogue: None,
             images: Some(Images {
                 a: "image * m * k".into(),
                 b: "image * n * k".into(),
@@ -631,6 +788,8 @@ pub(crate) fn generate_subgroup_pointwise_weight_grad(
 pub(crate) fn generate_subgroup_gathered_weight_grad(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     params: &crate::kernels::conv::Params,
 ) -> ShaderModule {
     assert_eq!(
@@ -757,6 +916,8 @@ fn gather_x4(_chunk: u32, column: u32, kk0: u32, end: u32) -> vec4<f32> {{
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: MatMulCoopVariant::BT,
             header,
@@ -765,6 +926,7 @@ fn gather_x4(_chunk: u32, column: u32, kk0: u32, end: u32) -> vec4<f32> {{
             b: "src",
             c: "dst",
             addend: None,
+            epilogue: None,
             // One "image" whose K is the whole batch: workgroup Z is the chunk.
             images: Some(Images {
                 a: "0u".into(),
@@ -797,6 +959,8 @@ fn gather_x4(_chunk: u32, column: u32, kk0: u32, end: u32) -> vec4<f32> {{
 pub(crate) fn generate_subgroup_gathered_conv(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     params: &crate::kernels::conv::Params,
     split: bool,
 ) -> ShaderModule {
@@ -878,6 +1042,8 @@ fn gather_x4(image: u32, pos: u32, tap0: u32, end: u32) -> vec4<f32> {{
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: MatMulCoopVariant::BT,
             header,
@@ -886,23 +1052,10 @@ fn gather_x4(image: u32, pos: u32, tap0: u32, end: u32) -> vec4<f32> {{
             b: "src",
             c: "dst",
             addend: None,
+            epilogue: None,
             // Split K: workgroup Z is (image, chunk), and each chunk writes its
             // partial at [chunk][image] for the SumRows that follows.
-            images: Some(if split {
-                Images {
-                    a: "0u".into(),
-                    b: "0u".into(),
-                    c: format!("(chunk * {}u + image) * m * n", p.batch.max(1)),
-                    batch: Some(p.batch.max(1)),
-                }
-            } else {
-                Images {
-                    a: "0u".into(),
-                    b: "0u".into(),
-                    c: "image * m * n".into(),
-                    batch: None,
-                }
-            }),
+            images: Some(conv_split_images(split, p.batch)),
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),
             gather: [
@@ -927,6 +1080,8 @@ fn gather_x4(image: u32, pos: u32, tap0: u32, end: u32) -> vec4<f32> {{
 pub(crate) fn generate_subgroup_gathered_pointwise_grad_input(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     params: &crate::kernels::conv::Params,
     split: bool,
 ) -> ShaderModule {
@@ -971,6 +1126,8 @@ fn gather_dy4(image: u32, pos: u32, co0: u32, end: u32) -> vec4<f32> {{
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: MatMulCoopVariant::BT,
             header,
@@ -979,21 +1136,8 @@ fn gather_dy4(image: u32, pos: u32, co0: u32, end: u32) -> vec4<f32> {{
             b: "grad_out",
             c: "dst",
             addend: None,
-            images: Some(if split {
-                Images {
-                    a: "0u".into(),
-                    b: "0u".into(),
-                    c: format!("(chunk * {}u + image) * m * n", p.batch.max(1)),
-                    batch: Some(p.batch.max(1)),
-                }
-            } else {
-                Images {
-                    a: "0u".into(),
-                    b: "0u".into(),
-                    c: "image * m * n".into(),
-                    batch: None,
-                }
-            }),
+            epilogue: None,
+            images: Some(conv_split_images(split, p.batch)),
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),
             gather: [
@@ -1024,7 +1168,10 @@ fn gather_dy4(image: u32, pos: u32, co0: u32, end: u32) -> vec4<f32> {{
 pub(crate) fn generate_subgroup_phased_grad_input(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    native: [u32; 3],
+    subgroup: u32,
     params: &crate::kernels::conv::Params,
+    transposed: bool,
 ) -> ShaderModule {
     use std::fmt::Write as _;
     assert_eq!(
@@ -1035,9 +1182,10 @@ pub(crate) fn generate_subgroup_phased_grad_input(
     let s = p.stride;
     assert!(s > 1);
     let (m, co_n) = (p.in_channels, p.out_channels);
-    // Transposed weights Wt[(ci, ky, kx), co] (the fill transposes them
-    // first) with K ordered (tap, co): see `phased_transposed_weights`.
-    let transposed = crate::codegen::phased_transposed_weights(p);
+    assert!(
+        !transposed || co_n.is_multiple_of(4),
+        "transposed phased weights require vector-aligned output channels"
+    );
     let (kh_n, kw_n, oh_n, ow_n) = (p.kernel_h, p.kernel_w, p.out_h, p.out_w);
     // Per phase: first taps, tap counts, dY offsets of the first taps, and
     // the phase's rows and columns of the input.
@@ -1286,6 +1434,8 @@ let k = {co_n}u * taps;",
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: MatMulCoopVariant::BT,
             header,
@@ -1294,6 +1444,7 @@ let k = {co_n}u * taps;",
             b: "grad_out",
             c: "dst",
             addend: None,
+            epilogue: None,
             images: Some(Images {
                 a: "0u".into(),
                 b: "0u".into(),
@@ -1318,27 +1469,65 @@ let k = {co_n}u * taps;",
     )
 }
 
-/// The batched Winograd product `C[z] = A[z] · B[z]` over the 16 transform
-/// planes (workgroup Z), from the reduced transform buffers, on the
-/// `[rows, columns]` output grid the reduced Winograd lowering sizes: one
-/// subgroup per 16x16 tile, staged through shared memory where the typed
-/// kernel it replaces loaded each fragment from device memory. N may end
-/// inside a column tile when it is a multiple of 4. Bindings and
-/// parameters are the typed kernel's (`matrix_a`, `matrix_b`, `matrix_c`).
-pub(crate) fn generate_subgroup_winograd(storage: DType, tile: [u32; 2]) -> ShaderModule {
-    assert!(matches!(storage, DType::F16 | DType::BF16));
+/// Subgroup-tiled shape for a Winograd `[rows, columns]` output tile on
+/// `(native, subgroup)`, choosing one subgroup per `nm × nn` tile where it
+/// fits the 256-thread limit, or tiling multiple accumulators per subgroup.
+pub(crate) fn winograd_subgroup_shape(
+    tile: [u32; 2],
+    native: [u32; 3],
+    subgroup: u32,
+) -> Option<WorkgroupMatmulShape> {
+    let [nm, nn, _] = native;
     let [rows, columns] = tile;
-    let (wr, wc) = (rows / 16, columns / 16);
+    if !supported_subgroup_width(subgroup)
+        || !rows.is_multiple_of(nm)
+        || !columns.is_multiple_of(nn)
+    {
+        return None;
+    }
+    let max_subgroups = 256 / subgroup;
+    let max_wr = rows / nm;
+    let max_wc = columns / nn;
+    // Prefer as many subgroups as fit (at most one per native tile).
+    let (mut wr, mut wc) = (max_wr, max_wc);
+    while wr * wc > max_subgroups {
+        if wr >= wc && wr > 1 && wr.is_multiple_of(2) {
+            wr /= 2;
+        } else if wc > 1 && wc.is_multiple_of(2) {
+            wc /= 2;
+        } else {
+            return None;
+        }
+    }
     let shape = WorkgroupMatmulShape {
         rows,
         columns,
         k_stage: 32,
-        threads: wr * wc * SUBGROUP_WIDTH,
+        threads: wr * wc * subgroup,
         stage_operands: false,
         subgroup_rows: wr,
         prefetch: false,
     };
-    assert_eq!(shape.subgroup_grid(), Some((wr, wc, 1, 1)), "{tile:?}");
+    shape.subgroup_grid_for(native, subgroup).map(|_| shape)
+}
+
+/// The batched Winograd product `C[z] = A[z] · B[z]` over the 16 transform
+/// planes (workgroup Z), from the reduced transform buffers, on the
+/// `[rows, columns]` output grid the reduced Winograd lowering sizes: staged
+/// through shared memory where the typed kernel it replaces loaded each
+/// fragment from device memory. N may end inside a column tile when it is a
+/// multiple of 4. Bindings and parameters are the typed kernel's
+/// (`matrix_a`, `matrix_b`, `matrix_c`).
+pub(crate) fn generate_subgroup_winograd(
+    storage: DType,
+    tile: [u32; 2],
+    native: [u32; 3],
+    subgroup: u32,
+) -> ShaderModule {
+    assert!(matches!(storage, DType::F16 | DType::BF16));
+    let shape = winograd_subgroup_shape(tile, native, subgroup).unwrap_or_else(|| {
+        panic!("unsupported Winograd subgroup tile {tile:?} on {native:?}/{subgroup}")
+    });
     let types = MatrixTypes {
         a: storage,
         b: storage,
@@ -1352,6 +1541,8 @@ pub(crate) fn generate_subgroup_winograd(storage: DType, tile: [u32; 2]) -> Shad
     subgroup_kernel(
         shape,
         types,
+        native,
+        subgroup,
         &SubgroupLayout {
             variant: MatMulCoopVariant::Normal,
             header,
@@ -1360,6 +1551,7 @@ pub(crate) fn generate_subgroup_winograd(storage: DType, tile: [u32; 2]) -> Shad
             b: "matrix_b",
             c: "matrix_c",
             addend: None,
+            epilogue: None,
             images: Some(Images {
                 a: "image * m * k".into(),
                 b: "image * k * n".into(),
@@ -1377,64 +1569,53 @@ pub(crate) fn generate_subgroup_winograd(storage: DType, tile: [u32; 2]) -> Shad
 }
 
 /// Whether [`generate_subgroup_pointwise_conv`] serves a pointwise
-/// convolution, with the 32x32 tile of four subgroups; [`conv_tile`] picks
-/// the tile it runs.
+/// convolution, with the 32x32 tile of four subgroups; [`conv_tile_for`]
+/// picks the tile it runs.
 pub(crate) fn pointwise_conv_subgroup_shape(
     types: MatrixTypes,
     native: [u32; 3],
     subgroup: u32,
     params: &crate::kernels::conv::Params,
 ) -> Option<WorkgroupMatmulShape> {
-    let shape = WorkgroupMatmulShape {
-        rows: 32,
-        columns: 32,
-        k_stage: 32,
-        threads: 4 * SUBGROUP_WIDTH,
-        stage_operands: false,
-        subgroup_rows: 2,
-        prefetch: false,
-    };
-    (params.vectorized_forward() && gathered_conv_subgroup_shape(types, native, subgroup).is_some())
-        .then_some(shape)
+    params
+        .vectorized_forward()
+        .then(|| gathered_conv_subgroup_shape(types, native, subgroup))
+        .flatten()
 }
 
 /// Whether the device runs the generated convolutions whose operands gather
 /// their elements ([`generate_subgroup_gathered_weight_grad`]): any kernel,
 /// stride and padding. The 32x32 tile it returns is the smallest;
-/// [`conv_tile`] picks the tile each one runs.
+/// [`conv_tile_for`] picks the tile each one runs.
 pub(crate) fn gathered_conv_subgroup_shape(
     types: MatrixTypes,
     native: [u32; 3],
     subgroup: u32,
 ) -> Option<WorkgroupMatmulShape> {
-    (native == [16, 16, 16]
-        && subgroup == SUBGROUP_WIDTH
-        && matches!(types.multiply, DType::F16 | DType::BF16)
-        && (types.a, types.b, types.output) == (DType::F32, DType::F32, DType::F32))
-        .then_some(WorkgroupMatmulShape {
-            rows: 32,
-            columns: 32,
-            k_stage: 32,
-            threads: 4 * SUBGROUP_WIDTH,
-            stage_operands: false,
-            subgroup_rows: 2,
-            prefetch: false,
-        })
+    if super::checked_cooperative_shape(&[native]).is_none()
+        || !supported_subgroup_width(subgroup)
+        || !matches!(types.multiply, DType::F16 | DType::BF16)
+        || (types.a, types.b, types.output) != (DType::F32, DType::F32, DType::F32)
+    {
+        return None;
+    }
+    let shape = conv_shape((32, 32), subgroup);
+    shape.subgroup_grid_for(native, subgroup).map(|_| shape)
 }
 
-/// Subgroup tiles of the generated convolutions, largest first: 64x64 and
-/// 64x32 of two by two subgroups (two by two and two by one 16x16
-/// accumulators each), and the 32x32 tile of one accumulator each.
-const CONV_TILES: [(u32, u32, u32, u32); 3] = [(2, 2, 2, 2), (2, 2, 2, 1), (2, 2, 1, 1)];
+/// Subgroup tiles of the generated convolutions, largest first: 64x64,
+/// 64x32, and 32x32 over a 2×2 subgroup grid (4 subgroups, ≤ 256 threads
+/// for 16-, 32- and 64-lane subgroups alike).
+const CONV_TILES: [(u32, u32); 3] = [(64, 64), (64, 32), (32, 32)];
 
-fn conv_shape((wr, wc, tr, tc): (u32, u32, u32, u32)) -> WorkgroupMatmulShape {
+fn conv_shape((rows, columns): (u32, u32), subgroup: u32) -> WorkgroupMatmulShape {
     WorkgroupMatmulShape {
-        rows: wr * tr * 16,
-        columns: wc * tc * 16,
+        rows,
+        columns,
         k_stage: 32,
-        threads: wr * wc * SUBGROUP_WIDTH,
+        threads: 4 * subgroup,
         stage_operands: false,
-        subgroup_rows: wr,
+        subgroup_rows: 2,
         prefetch: false,
     }
 }
@@ -1452,28 +1633,39 @@ pub(crate) enum ConvProduct {
     WeightGradient,
 }
 
-/// The subgroup tile of a generated convolution. Larger tiles load each
-/// operand element for more products, so the largest tile that still
-/// launches [`MIN_F16_WORKGROUPS`](crate::kernels::conv::MIN_F16_WORKGROUPS)
-/// workgroups runs. On ResNet-50's accelerated training (RTX 5070) the 64x64
-/// tile was fastest for 36 of 49 convolutions and 64x32 for 9 more; the 7x7
-/// stage's forward convolutions keep 32x32. Weight gradients take as many K
-/// partitions as the device needs, so their grid is never short; with 64x64
-/// the partial sums double their reduction, and 64x32 is as fast in total.
+/// The subgroup tile of a generated convolution on a 32-lane device.
 pub(crate) fn conv_tile(
     product: ConvProduct,
     p: &crate::kernels::conv::Params,
 ) -> WorkgroupMatmulShape {
+    conv_tile_for(product, p, SUBGROUP_WIDTH)
+}
+
+/// The subgroup tile of a generated convolution on `subgroup`-wide subgroups.
+/// Larger tiles load each operand element for more products, so the largest
+/// tile that still launches
+/// [`MIN_F16_WORKGROUPS`](crate::kernels::conv::MIN_F16_WORKGROUPS)
+/// workgroups runs.
+pub(crate) fn conv_tile_for(
+    product: ConvProduct,
+    p: &crate::kernels::conv::Params,
+    subgroup: u32,
+) -> WorkgroupMatmulShape {
     let batch = p.batch.max(1);
     match product {
-        ConvProduct::Forward => conv_product_tile(p.out_channels, p.out_h * p.out_w, batch),
-        ConvProduct::InputGradient => conv_product_tile(p.in_channels, p.in_h * p.in_w, batch),
+        ConvProduct::Forward => {
+            conv_product_tile_for(p.out_channels, p.out_h * p.out_w, batch, subgroup)
+        }
+        ConvProduct::InputGradient => {
+            conv_product_tile_for(p.in_channels, p.in_h * p.in_w, batch, subgroup)
+        }
         ConvProduct::PhasedInputGradient => {
             let s = p.stride.max(1);
-            conv_product_tile(
+            conv_product_tile_for(
                 p.in_channels,
                 p.in_h.div_ceil(s) * p.in_w.div_ceil(s),
                 batch * s * s,
+                subgroup,
             )
         }
         ConvProduct::WeightGradient => conv_shape(
@@ -1482,15 +1674,25 @@ pub(crate) fn conv_tile(
             } else {
                 CONV_TILES[2]
             },
+            subgroup,
         ),
     }
 }
 
 /// [`conv_tile`] of an `m × n` product over `layers` workgroup layers.
 pub(crate) fn conv_product_tile(m: u32, n: u32, layers: u32) -> WorkgroupMatmulShape {
+    conv_product_tile_for(m, n, layers, SUBGROUP_WIDTH)
+}
+
+pub(crate) fn conv_product_tile_for(
+    m: u32,
+    n: u32,
+    layers: u32,
+    subgroup: u32,
+) -> WorkgroupMatmulShape {
     CONV_TILES
         .into_iter()
-        .map(conv_shape)
+        .map(|dims| conv_shape(dims, subgroup))
         .find(|s| {
             // A tile past the product's extent only multiplies zeros.
             s.rows <= m
@@ -1500,11 +1702,11 @@ pub(crate) fn conv_product_tile(m: u32, n: u32, layers: u32) -> WorkgroupMatmulS
                     * u64::from(layers)
                     >= crate::kernels::conv::MIN_F16_WORKGROUPS
         })
-        .unwrap_or_else(|| conv_shape(CONV_TILES[2]))
+        .unwrap_or_else(|| conv_shape(CONV_TILES[2], subgroup))
 }
 
 /// How a subgroup-tiled kernel binds its operands.
-struct SubgroupLayout {
+struct SubgroupLayout<'a> {
     variant: MatMulCoopVariant,
     /// Buffer and parameter declarations.
     header: String,
@@ -1514,6 +1716,8 @@ struct SubgroupLayout {
     b: &'static str,
     c: &'static str,
     addend: Option<&'static str>,
+    /// Optional fused unary elementwise epilogue applied in the store loop.
+    epilogue: Option<&'a crate::compile::MatMulEpilogue>,
     /// Per-image products in place of K partitions over workgroup Z.
     images: Option<Images>,
     row_bounds: bool,
@@ -1550,24 +1754,39 @@ struct Images {
     batch: Option<u32>,
 }
 
-/// Loads of one staged operand vector at a K index expression.
-type StageLoad = Box<dyn Fn(&str) -> String>;
+/// Loads or stores of one staged operand vector at a K index or shared-memory offset.
+type StageEmit = Box<dyn Fn(&str) -> String>;
 
 fn subgroup_kernel(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
-    layout: &SubgroupLayout,
+    native: [u32; 3],
+    subgroup: u32,
+    layout: &SubgroupLayout<'_>,
 ) -> ShaderModule {
     use std::fmt::Write as _;
+    let [nm, nn, nk] = native;
     let variant = layout.variant;
-    let (_, wc, tr, tc) = shape.subgroup_grid().expect("subgroup-tiled shape");
+    let (wr, wc, tr, tc) = shape
+        .subgroup_grid_for(native, subgroup)
+        .expect("subgroup-tiled shape");
     let (bm, bn, ks, threads) = (shape.rows, shape.columns, shape.k_stage, shape.threads);
-    assert!(matches!(ks, 16 | 32 | 64));
+    assert!(matches!(ks, 16 | 32 | 64) && ks.is_multiple_of(nk));
     let bf16 = types.multiply == DType::BF16;
     let multiply = MatrixTypes::name(types.multiply);
     for storage in [types.a, types.b] {
         assert!(storage == DType::F32 || storage == types.multiply);
     }
+    let (epi_decl, epi_body) = match layout.epilogue {
+        Some(epi) => {
+            assert!(
+                epi.inputs.is_empty(),
+                "subgroup_kernel epilogue expects unary DAG without extra buffer bindings"
+            );
+            super::matmul_epilogue_to_wgsl(epi)
+        }
+        None => (String::new(), String::new()),
+    };
     let a_t = variant == MatMulCoopVariant::AT;
     let b_t = variant == MatMulCoopVariant::BT;
     // Eight elements of padding a line rotate the shared-memory banks.
@@ -1577,9 +1796,19 @@ fn subgroup_kernel(
     let b_size = if b_t { bn * b_pitch } else { ks * b_pitch };
     // Operand tiles move as vec4 slots of the multiplication type.
     let lanes = 4;
+    let a_stage4 = a_size / lanes;
+    let b_stage4 = b_size / lanes;
+    let stages = if shape.prefetch { 2 } else { 1 };
     let slot = format!("vec4<{multiply}>");
     let bounded = layout.row_bounds || layout.column_bounds;
-    let scratch = bounded || types.output != DType::F32 || layout.scatter.is_some();
+    let scratch = bounded
+        || types.output != DType::F32
+        || layout.scatter.is_some()
+        || layout.epilogue.is_some();
+    let tile_elems = nm * nn;
+    let a_mat = format!("coop_mat{nk}x{nm}<{multiply},A>");
+    let b_mat = format!("coop_mat{nn}x{nk}<{multiply},B>");
+    let c_mat = format!("coop_mat{nn}x{nm}<f32,C>");
     let (lda, ldb, ldc) = (
         if a_t { "m" } else { "k" },
         if b_t { "k" } else { "n" },
@@ -1602,13 +1831,25 @@ fn subgroup_kernel(
         s += include_str!("../shaders/bf16_round.wgsl");
     }
     s += &layout.header;
-    let _ = writeln!(s, "var<workgroup> sa: array<{slot}, {}>;", a_size / lanes);
-    let _ = writeln!(s, "var<workgroup> sb: array<{slot}, {}>;", b_size / lanes);
+    if !epi_decl.is_empty() {
+        s += &epi_decl;
+        s.push('\n');
+    }
+    let _ = writeln!(
+        s,
+        "var<workgroup> sa: array<{slot}, {}>;",
+        a_stage4 * stages
+    );
+    let _ = writeln!(
+        s,
+        "var<workgroup> sb: array<{slot}, {}>;",
+        b_stage4 * stages
+    );
     if scratch {
         let _ = writeln!(
             s,
             "var<workgroup> scratch: array<f32, {}>;",
-            threads / SUBGROUP_WIDTH * 256
+            wr * wc * tile_elems
         );
     }
     let range = if let Some(Images {
@@ -1652,13 +1893,13 @@ let ldb = {ldb};
 let ldc = {ldc};
 let wrow = (sg / {wc}u) * {}u;
 let wcol = (sg % {wc}u) * {}u;",
-        tr * 16,
-        tc * 16,
+        tr * nm,
+        tc * nn,
         dimensions = layout.dimensions,
     );
     for i in 0..tr {
         for j in 0..tc {
-            let _ = writeln!(s, "var acc{i}_{j} = coop_mat16x16<f32,C>();");
+            let _ = writeln!(s, "var acc{i}_{j} = {c_mat}();");
         }
     }
     // Staging: lines along each operand's strided axis, vectors along its
@@ -1729,16 +1970,19 @@ let wcol = (sg % {wc}u) * {}u;",
             }
         },
     ];
-    // With prefetch, the next stage's loads issue before this stage's
-    // products, so their latency hides behind the multiplications.
+    // With double-buffered prefetch, global loads for stage `t + ks` overlap
+    // with the cooperative products of stage `t`, then write into the idle
+    // shared-memory buffer so each K stage pays one workgroupBarrier() instead
+    // of two.
     let prefetch = shape.prefetch;
     let mut stage = String::new();
     let mut declare = String::new();
-    let mut store_all = String::new();
-    let mut load_at: Vec<StageLoad> = Vec::new();
+    let mut load_at: Vec<StageEmit> = Vec::new();
+    let mut store_at: Vec<StageEmit> = Vec::new();
     for plan in &plans {
         let count = plan.lines * plan.width / 4;
         let scalar = MatrixTypes::name(plan.storage);
+        let stage_base = if plan.name == "a" { "BASE_A" } else { "BASE_B" };
         for e in 0..count.div_ceil(threads) {
             let line = format!("{}l{e}", plan.name);
             let column = format!("{}c{e}", plan.name);
@@ -1801,85 +2045,119 @@ let wcol = (sg % {wc}u) * {}u;",
             }
             let at = format!("{line} * {}u + {column}", plan.pitch);
             let shared = format!("s{}", plan.name);
-            let store = if bf16 && plan.storage == DType::F32 {
+            let rhs = if bf16 && plan.storage == DType::F32 {
                 format!(
-                    "{shared}[({at}) / 4u] = vec4<bf16>(round_bf16({value}.x), round_bf16({value}.y), round_bf16({value}.z), round_bf16({value}.w));"
+                    "vec4<bf16>(round_bf16({value}.x), round_bf16({value}.y), round_bf16({value}.z), round_bf16({value}.w))"
                 )
             } else {
-                format!("{shared}[({at}) / 4u] = vec4<{multiply}>({value});")
+                format!("vec4<{multiply}>({value})")
             };
+            let plain_store = format!("{shared}[({at}) / 4u] = {rhs};");
             if partial {
-                let _ = writeln!(stage, "if lid + {}u < {count}u {{ {store} }}", e * threads);
                 let _ = writeln!(
-                    store_all,
-                    "if lid + {}u < {count}u {{ {store} }}",
+                    stage,
+                    "if lid + {}u < {count}u {{ {plain_store} }}",
                     e * threads
                 );
             } else {
-                let _ = writeln!(stage, "{store}");
-                let _ = writeln!(store_all, "{store}");
+                let _ = writeln!(stage, "{plain_store}");
             }
+            let off_expr = format!("({at}) / 4u");
+            let offset_threads = e * threads;
+            store_at.push(Box::new(move |bases: &str| {
+                // `bases` is "0u|0u" or "nxt_a|nxt_b".
+                let (ba, bb) = bases.split_once('|').unwrap();
+                let base = if stage_base == "BASE_A" { ba } else { bb };
+                let idx = if base == "0u" {
+                    off_expr.clone()
+                } else {
+                    format!("{base} + {off_expr}")
+                };
+                let stmt = format!("{shared}[{idx}] = {rhs};");
+                if partial {
+                    format!("if lid + {offset_threads}u < {count}u {{ {stmt} }}\n")
+                } else {
+                    format!("{stmt}\n")
+                }
+            }));
         }
     }
-    let mut product = String::new();
-    for q in 0..ks / 16 {
-        for i in 0..tr {
-            let (load, offset, stride) = if a_t {
-                (
-                    "coopLoad",
-                    format!("{}u * {a_pitch}u + wrow + {}u", q * 16, i * 16),
-                    a_pitch,
-                )
-            } else {
-                (
-                    "coopLoadT",
-                    format!("(wrow + {}u) * {a_pitch}u + {}u", i * 16, q * 16),
-                    a_pitch,
-                )
-            };
-            let _ = writeln!(
-                product,
-                "let a{i}_{q} = {load}<coop_mat16x16<{multiply},A>>(&sa[({offset}) / {lanes}u], {}u);",
-                stride / lanes
-            );
-        }
-        for j in 0..tc {
-            let (load, offset, stride) = if b_t {
-                (
-                    "coopLoad",
-                    format!("(wcol + {}u) * {b_pitch}u + {}u", j * 16, q * 16),
-                    b_pitch,
-                )
-            } else {
-                (
-                    "coopLoadT",
-                    format!("{}u * {b_pitch}u + wcol + {}u", q * 16, j * 16),
-                    b_pitch,
-                )
-            };
-            let _ = writeln!(
-                product,
-                "let b{j}_{q} = {load}<coop_mat16x16<{multiply},B>>(&sb[({offset}) / {lanes}u], {}u);",
-                stride / lanes
-            );
-        }
-        for i in 0..tr {
-            for j in 0..tc {
+    let emit_product = |base_a: &str, base_b: &str| -> String {
+        let mut product = String::new();
+        for q in 0..ks / nk {
+            for i in 0..tr {
+                let (load, offset, stride) = if a_t {
+                    (
+                        "coopLoad",
+                        format!("{}u * {a_pitch}u + wrow + {}u", q * nk, i * nm),
+                        a_pitch,
+                    )
+                } else {
+                    (
+                        "coopLoadT",
+                        format!("(wrow + {}u) * {a_pitch}u + {}u", i * nm, q * nk),
+                        a_pitch,
+                    )
+                };
+                let idx = if base_a.is_empty() {
+                    format!("({offset}) / {lanes}u")
+                } else {
+                    format!("{base_a} + ({offset}) / {lanes}u")
+                };
                 let _ = writeln!(
                     product,
-                    "acc{i}_{j} = coopMultiplyAdd(a{i}_{q}, b{j}_{q}, acc{i}_{j});"
+                    "let a{i}_{q} = {load}<{a_mat}>(&sa[{idx}], {}u);",
+                    stride / lanes
                 );
             }
+            for j in 0..tc {
+                let (load, offset, stride) = if b_t {
+                    (
+                        "coopLoad",
+                        format!("(wcol + {}u) * {b_pitch}u + {}u", j * nn, q * nk),
+                        b_pitch,
+                    )
+                } else {
+                    (
+                        "coopLoadT",
+                        format!("{}u * {b_pitch}u + wcol + {}u", q * nk, j * nn),
+                        b_pitch,
+                    )
+                };
+                let idx = if base_b.is_empty() {
+                    format!("({offset}) / {lanes}u")
+                } else {
+                    format!("{base_b} + ({offset}) / {lanes}u")
+                };
+                let _ = writeln!(
+                    product,
+                    "let b{j}_{q} = {load}<{b_mat}>(&sb[{idx}], {}u);",
+                    stride / lanes
+                );
+            }
+            for i in 0..tr {
+                for j in 0..tc {
+                    let _ = writeln!(
+                        product,
+                        "acc{i}_{j} = coopMultiplyAdd(a{i}_{q}, b{j}_{q}, acc{i}_{j});"
+                    );
+                }
+            }
         }
-    }
+        product
+    };
     if prefetch {
-        let first: String = load_at.iter().map(|f| f("first")).collect();
-        let next: String = load_at.iter().map(|f| f("tn")).collect();
+        let first_load: String = load_at.iter().map(|f| f("first")).collect();
+        let first_store: String = store_at.iter().map(|f| f("0u|0u")).collect();
+        let next_load: String = load_at.iter().map(|f| f("tn")).collect();
+        let next_store: String = store_at.iter().map(|f| f("nxt_a|nxt_b")).collect();
+        let product = emit_product("cur_a", "cur_b");
         let _ = writeln!(
             s,
-            "{declare}{first}for (var t = first; t < end; t += {ks}u) {{\n{store_all}workgroupBarrier();\nlet tn = t + {ks}u;\n{next}{product}workgroupBarrier();\n}}"
+            "{declare}if first < end {{\n{first_load}{first_store}}}\nworkgroupBarrier();\nvar buf = 0u;\nfor (var t = first; t < end; t += {ks}u) {{\nlet tn = t + {ks}u;\nlet cur_a = buf * {a_stage4}u;\nlet cur_b = buf * {b_stage4}u;\nlet nxt = 1u - buf;\nlet nxt_a = nxt * {a_stage4}u;\nlet nxt_b = nxt * {b_stage4}u;\nif tn < end {{\n{next_load}}}\n{product}if tn < end {{\n{next_store}}}\nworkgroupBarrier();\nbuf = nxt;\n}}"
         );
     } else {
+        let product = emit_product("", "");
         let _ = writeln!(
             s,
             "for (var t = first; t < end; t += {ks}u) {{\n{stage}workgroupBarrier();\n{product}workgroupBarrier();\n}}"
@@ -1887,8 +2165,8 @@ let wcol = (sg % {wc}u) * {}u;",
     }
     let tile_origin = |i: u32, j: u32| {
         (
-            format!("row + wrow + {}u", i * 16),
-            format!("col + wcol + {}u", j * 16),
+            format!("row + wrow + {}u", i * nm),
+            format!("col + wcol + {}u", j * nn),
         )
     };
     let c = layout.c;
@@ -1899,7 +2177,7 @@ let wcol = (sg % {wc}u) * {}u;",
             if let Some(src) = layout.addend {
                 let _ = writeln!(
                     direct,
-                    "acc{i}_{j} = acc{i}_{j} + coopLoadT<coop_mat16x16<f32,C>>(&{src}[({r}) * ldc + {cc}], ldc);"
+                    "acc{i}_{j} = acc{i}_{j} + coopLoadT<{c_mat}>(&{src}[({r}) * ldc + {cc}], ldc);"
                 );
             }
             let _ = writeln!(
@@ -1913,25 +2191,37 @@ let wcol = (sg % {wc}u) * {}u;",
         for i in 0..tr {
             for j in 0..tc {
                 let (r, cc) = tile_origin(i, j);
-                let stored = "scratch[sg * 256u + e]".to_owned();
-                let value = match layout.addend {
+                let stored = format!("scratch[sg * {tile_elems}u + e]");
+                let base_val = match layout.addend {
                     Some(src) => format!("{stored} + {src}[r * ldc + c]"),
                     None => stored,
                 };
                 let index = layout.scatter.as_deref().unwrap_or("c_base + r * ldc + c");
-                let value = match types.output {
-                    DType::F32 => value,
-                    DType::BF16 => format!("round_bf16({value})"),
-                    dtype => format!("{}({value})", MatrixTypes::name(dtype)),
+                let apply = if layout.epilogue.is_some() {
+                    let final_val = match types.output {
+                        DType::F32 => "val".to_owned(),
+                        DType::BF16 => "round_bf16(val)".to_owned(),
+                        dtype => format!("{}(val)", MatrixTypes::name(dtype)),
+                    };
+                    format!(
+                        "if r < m && c < n {{ let idx = r * ldc + c; let col = c; var val = {base_val};\n{epi_body}\n{c}[{index}] = {final_val}; }}"
+                    )
+                } else {
+                    let value = match types.output {
+                        DType::F32 => base_val,
+                        DType::BF16 => format!("round_bf16({base_val})"),
+                        dtype => format!("{}({base_val})", MatrixTypes::name(dtype)),
+                    };
+                    format!("if r < m && c < n {{ {c}[{index}] = {value}; }}")
                 };
                 let _ = writeln!(
                     staged,
-                    "coopStoreT(acc{i}_{j}, &scratch[sg * 256u], 16u);
+                    "coopStoreT(acc{i}_{j}, &scratch[sg * {tile_elems}u], {nn}u);
 workgroupBarrier();
-for (var e = lane; e < 256u; e += {SUBGROUP_WIDTH}u) {{
-let r = {r} + e / 16u;
-let c = {cc} + e % 16u;
-if r < m && c < n {{ {c}[{index}] = {value}; }}
+for (var e = lane; e < {tile_elems}u; e += {subgroup}u) {{
+let r = {r} + e / {nn}u;
+let c = {cc} + e % {nn}u;
+{apply}
 }}
 workgroupBarrier();"
                 );
@@ -1940,7 +2230,7 @@ workgroupBarrier();"
     }
     if !scratch {
         s += &direct;
-    } else if types.output == DType::F32 && layout.scatter.is_none() {
+    } else if types.output == DType::F32 && layout.scatter.is_none() && layout.epilogue.is_none() {
         // Only the last row and column of workgroups are ragged; the branch
         // is uniform. `&&` would lower through a local variable, which
         // naga's uniformity analysis treats as varying.
@@ -2068,8 +2358,14 @@ mod tests {
                         .expect("pointwise subgroup shape");
                 assert_eq!((shape.rows, shape.columns), (32, 32));
                 for backward in [false, true] {
-                    let mut module =
-                        generate_subgroup_pointwise_conv(backward, shape, types, &params);
+                    let mut module = generate_subgroup_pointwise_conv(
+                        backward,
+                        shape,
+                        types,
+                        [16, 16, 16],
+                        SUBGROUP_WIDTH,
+                        &params,
+                    );
                     super::super::validate_shader_for_test(
                         &mut module.module,
                         capabilities,
@@ -2086,9 +2382,173 @@ mod tests {
             );
             assert!(
                 pointwise_conv_subgroup_shape(MatrixTypes::F32_AS_F16, [16, 16, 16], 64, &params)
+                    .is_some()
+            );
+            assert!(
+                pointwise_conv_subgroup_shape(MatrixTypes::F32_AS_F16, [8, 16, 16], 16, &params)
+                    .is_some()
+            );
+            assert!(
+                pointwise_conv_subgroup_shape(MatrixTypes::F32_AS_F16, [8, 8, 8], 32, &params)
+                    .is_some()
+            );
+            assert!(
+                pointwise_conv_subgroup_shape(MatrixTypes::F32_AS_F16, [16, 16, 16], 8, &params)
                     .is_none()
             );
         }
+    }
+
+    /// Subgroup tiles validate across all supported native matrix shapes
+    /// (`16×16×16`, `8×16×16`, `8×8×8`), subgroup widths (`16`, `32`, `64`),
+    /// double-buffered `prefetch`, and fused unary epilogues.
+    #[test]
+    fn subgroup_portable_prefetch_and_epilogue_validate() {
+        let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        let relu = crate::compile::MatMulEpilogue {
+            dag: crate::schedule::PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![
+                    crate::schedule::Pw::LoadInput(0),
+                    crate::schedule::Pw::Relu(0),
+                ],
+                output: 1,
+            },
+            inputs: Vec::new(),
+        };
+        for (native, subgroup) in [
+            ([16, 16, 16], 32),
+            ([16, 16, 16], 64),
+            ([8, 16, 16], 16),
+            ([8, 16, 16], 32),
+            ([8, 8, 8], 32),
+        ] {
+            let shapes: Vec<_> = WorkgroupMatmulShape::all_for(native, subgroup)
+                .filter(|s| s.subgroup_rows != 0)
+                .collect();
+            assert!(!shapes.is_empty(), "no shapes for {native:?}/{subgroup}");
+            for (idx, group) in [
+                ShaderGroup::MatMul,
+                ShaderGroup::MatMulAT,
+                ShaderGroup::MatMulBT,
+                ShaderGroup::MatMulAdd,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for prefetch in [false, true] {
+                    let shape = shapes
+                        .iter()
+                        .copied()
+                        .find(|s| s.prefetch == prefetch)
+                        .expect("prefetch shape");
+                    let multiply = if idx % 2 == 0 {
+                        DType::F16
+                    } else {
+                        DType::BF16
+                    };
+                    let types = MatrixTypes {
+                        multiply,
+                        ..MatrixTypes::F32_AS_F16
+                    };
+                    let epi = (prefetch && idx % 2 == 0).then_some(&relu);
+                    let mut module = generate_workgroup_matmul_for_device(
+                        group,
+                        shape,
+                        types,
+                        native,
+                        subgroup,
+                        idx % 2 == 1,
+                        epi,
+                    );
+                    super::super::validate_shader_for_test(
+                        &mut module.module,
+                        capabilities,
+                        (1, 6),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{native:?}/{subgroup} {group:?} {shape:?} epi={}: {error}",
+                            epi.is_some()
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    /// GPU f64-parity test for double-buffered `prefetch` subgroup matmul
+    /// (NN, AT, BT, ragged rows, and fused ReLU epilogue).
+    #[test]
+    fn subgroup_double_buffered_prefetch_and_epilogue_match_f64() {
+        let gpu = std::sync::Arc::new(crate::init_gpu_context().expect("gpu"));
+        let caps = gpu.capabilities();
+        let Some((native, subgroup)) = native_subgroup_shape(&caps, DType::F16) else {
+            return;
+        };
+        if !crate::runtime::typed_matrix_supported(&gpu, DType::F16) {
+            return;
+        }
+        let shape = WorkgroupMatmulShape::all_for(native, subgroup)
+            .find(|s| s.subgroup_rows != 0 && s.prefetch && s.k_stage == 32)
+            .expect("double-buffered subgroup shape");
+        let [m, k, n] = [
+            shape.rows as usize + 12,
+            128usize,
+            shape.columns as usize * 2,
+        ];
+        let mut g = crate::Graph::new();
+        let a = g.input("a", &[m, k]);
+        let b = g.input("b", &[k, n]);
+        let y = g.matmul(a, b);
+        let z = g.relu(y);
+        g.set_outputs(vec![z]);
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| (((i * 37 + 11) % 97) as f32 - 48.0) * 0.02)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| (((i * 29 + 5) % 89) as f32 - 44.0) * 0.02)
+            .collect();
+        let mut ref_out = vec![0.0f64; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                let mut sum = 0.0f64;
+                for t in 0..k {
+                    sum += f64::from(a_data[r * k + t]) * f64::from(b_data[t * n + c]);
+                }
+                ref_out[r * n + c] = sum.max(0.0);
+            }
+        }
+        let plan = crate::compile::compile(&g);
+        let opts = crate::SessionOptions {
+            coop: crate::CoopPolicy::AllowF16,
+            workgroup_matmul: Some(shape),
+            ..Default::default()
+        };
+        let mut session = crate::Session::with_context_opts(plan, gpu, opts);
+        assert!(
+            session.plan().dispatches.iter().any(|d| matches!(
+                d.kernel,
+                crate::compile::Kernel::CooperativeWorkgroup { .. }
+            )),
+            "expected subgroup workgroup kernel with fused ReLU epilogue"
+        );
+        session.set_input("a", &a_data);
+        session.set_input("b", &b_data);
+        session.step();
+        session.wait();
+        let got = session.read_output(m * n);
+        let max_err = got
+            .iter()
+            .zip(&ref_out)
+            .fold(0.0f64, |acc, (&g, &r)| acc.max((f64::from(g) - r).abs()));
+        assert!(
+            max_err < 1e-2,
+            "double-buffered subgroup matmul + ReLU epilogue diverged: max_err={max_err}"
+        );
     }
 
     /// Subgroup tiles in every layout, storage, output and row-bounds case.

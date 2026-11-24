@@ -1002,11 +1002,22 @@ impl TuneClass {
     /// A bounded tournament over scalar layouts and native f32 where it fits.
     /// Capability/precision/padding are legality;
     /// occupancy and the static large-shape veto do not exclude candidates.
+    #[cfg(test)]
     pub(crate) fn challengers(
         &self,
         initial: MatmulTile,
         config: Option<&CoopConfig>,
         native_shapes: &[[u32; 3]],
+    ) -> Vec<MatmulTile> {
+        self.challengers_for_device(initial, config, native_shapes, 32)
+    }
+
+    pub(crate) fn challengers_for_device(
+        &self,
+        initial: MatmulTile,
+        config: Option<&CoopConfig>,
+        native_shapes: &[[u32; 3]],
+        subgroup_size: u32,
     ) -> Vec<MatmulTile> {
         if let MatmulTile::Gemv(shape) = initial {
             use crate::codegen::{GemvReduction, GemvShape};
@@ -1113,8 +1124,15 @@ impl TuneClass {
                 | MatmulTile::CooperativeWorkgroup { splits, .. } => splits,
                 _ => 1,
             };
+            let native =
+                crate::codegen::checked_cooperative_shape(native_shapes).unwrap_or([16, 16, 16]);
+            let subgroup = if subgroup_size == 0 {
+                32
+            } else {
+                subgroup_size
+            };
             candidates.extend(
-                crate::codegen::WorkgroupMatmulShape::all()
+                crate::codegen::WorkgroupMatmulShape::all_for(native, subgroup)
                     // Converted operands already use vector staging. Spend
                     // these extra probes on native operands' scalar loads.
                     .filter(|shape| {

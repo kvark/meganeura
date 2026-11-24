@@ -13,7 +13,10 @@ pub(crate) mod winograd;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
-pub(crate) use workgroup::{ConvProduct, conv_product_tile, conv_tile};
+pub(crate) use workgroup::{
+    ConvProduct, conv_product_tile, conv_tile, conv_tile_for, generate_workgroup_matmul_for_device,
+    native_subgroup_shape,
+};
 pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
@@ -1203,16 +1206,18 @@ pub(crate) fn generate_checked_conv(
         };
         return workgroup::generate_subgroup_pointwise_conv(
             backward,
-            conv_tile(product, params),
+            conv_tile_for(product, params, subgroup),
             types,
+            shape,
+            subgroup,
             params,
         );
     }
     // Pointwise input gradients without whole vectors gather both operands.
     if backward && workgroup::gathered_conv_subgroup_shape(types, shape, subgroup).is_some() {
-        let tile = conv_tile(ConvProduct::InputGradient, params);
+        let tile = conv_tile_for(ConvProduct::InputGradient, params, subgroup);
         return workgroup::generate_subgroup_gathered_pointwise_grad_input(
-            tile, types, params, split,
+            tile, types, shape, subgroup, params, split,
         );
     }
     if !backward
@@ -1220,8 +1225,10 @@ pub(crate) fn generate_checked_conv(
         && workgroup::gathered_conv_subgroup_shape(types, shape, subgroup).is_some()
     {
         return workgroup::generate_subgroup_gathered_conv(
-            conv_tile(ConvProduct::Forward, params),
+            conv_tile_for(ConvProduct::Forward, params, subgroup),
             types,
+            shape,
+            subgroup,
             params,
             split,
         );
@@ -1265,11 +1272,15 @@ pub(crate) fn generate_subgroup_phased_grad_input(
     shape: [u32; 3],
     subgroup: u32,
     params: &crate::kernels::conv::Params,
+    transposed: bool,
 ) -> Option<ShaderModule> {
     workgroup::gathered_conv_subgroup_shape(types, shape, subgroup)?;
-    let tile = conv_tile(ConvProduct::PhasedInputGradient, params);
-    phased_grad_input(params)
-        .then(|| workgroup::generate_subgroup_phased_grad_input(tile, types, params))
+    let tile = conv_tile_for(ConvProduct::PhasedInputGradient, params, subgroup);
+    phased_grad_input(params).then(|| {
+        workgroup::generate_subgroup_phased_grad_input(
+            tile, types, shape, subgroup, params, transposed,
+        )
+    })
 }
 
 /// Whether a phased input gradient reads its weights transposed,
@@ -1306,15 +1317,15 @@ pub(crate) fn generate_subgroup_weight_grad(
     subgroup: u32,
     params: &crate::kernels::conv::Params,
 ) -> Option<ShaderModule> {
-    let tile = conv_tile(ConvProduct::WeightGradient, params);
+    let tile = conv_tile_for(ConvProduct::WeightGradient, params, subgroup);
     if workgroup::pointwise_conv_subgroup_shape(types, shape, subgroup, params).is_some() {
         return Some(workgroup::generate_subgroup_pointwise_weight_grad(
-            tile, types, params,
+            tile, types, shape, subgroup, params,
         ));
     }
     workgroup::gathered_conv_subgroup_shape(types, shape, subgroup)?;
     Some(workgroup::generate_subgroup_gathered_weight_grad(
-        tile, types, params,
+        tile, types, shape, subgroup, params,
     ))
 }
 

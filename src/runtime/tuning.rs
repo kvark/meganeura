@@ -705,7 +705,12 @@ fn collect_classes(
             super::cooperative_shapes(&capabilities.cooperative_matrix, types.multiply)
         });
         let challengers = key
-            .challengers(initial, coop_config, native_shapes)
+            .challengers_for_device(
+                initial,
+                coop_config,
+                native_shapes,
+                capabilities.subgroup_size,
+            )
             .into_iter()
             .filter(|candidate| Some(*candidate) != equivalent)
             .collect();

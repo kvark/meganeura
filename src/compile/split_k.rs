@@ -58,6 +58,30 @@ fn sum_rows_columns(serial_rows: bool) -> u32 {
     if serial_rows { 256 } else { 32 }
 }
 
+/// Target workgroups for a split-K heuristic, scaled by `parallel_width`
+/// (concurrent workgroups from [`crate::tune::MachineProfile`]) when known.
+pub(crate) fn split_target_workgroups(
+    parallel_width: Option<u32>,
+    waves: u32,
+    default: u32,
+) -> u32 {
+    match parallel_width.filter(|&w| w != 0) {
+        Some(width) => width.saturating_mul(waves).clamp(64, 512),
+        None => default,
+    }
+}
+
+/// Validate a K-split partial allocation and its final `SumRows` dispatch
+/// against portable limits and `budget`, returning the partial byte size.
+pub(crate) fn plan_k_split(
+    columns: u32,
+    splits: u32,
+    serial_rows: bool,
+    budget: usize,
+) -> Result<usize, TuneError> {
+    partial_bytes(columns, splits, serial_rows, budget)
+}
+
 /// Bytes of `splits` partial results of `columns` elements each, provided
 /// their SumRows fits the portable dispatch limit and they fit `budget`.
 fn partial_bytes(
@@ -268,6 +292,63 @@ impl ExecutionPlan {
             return Ok(());
         }
         self.splice_k_partials(index, producer, columns, splits, max_partial_bytes)
+    }
+
+    /// Redirect dispatch `index` into a new partial buffer of `splits`
+    /// `columns`-element slices and insert its `SumRows` reduction right after.
+    pub(crate) fn splice_k_split(
+        &mut self,
+        index: usize,
+        columns: u32,
+        splits: u32,
+        serial_rows: bool,
+        max_partial_bytes: usize,
+    ) -> Result<usize, TuneError> {
+        let bytes = partial_bytes(columns, splits, serial_rows, max_partial_bytes)?;
+        let partial = BufferRef(
+            u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
+        );
+        let output = self.dispatches[index].output_buffer;
+        let reduction =
+            self.dispatches[index].partial_sum(partial, output, columns, splits, serial_rows);
+        self.dispatches[index].output_buffer = partial;
+        self.buffers.push(bytes);
+        self.dispatches.insert(index + 1, reduction);
+        Ok(bytes)
+    }
+
+    /// Reconfigure an existing `SumRows` reduction reading `partial` to sum
+    /// `partitions` slices and grow the partial buffer to at least `bytes`.
+    pub(crate) fn update_split_sum_rows(
+        &mut self,
+        partial: BufferRef,
+        partitions: u32,
+        bytes: usize,
+    ) -> bool {
+        if partitions < 2 {
+            return false;
+        }
+        let Some(reduction) = self.dispatches.iter().position(|r| {
+            r.shader == ShaderEntry::SumRows
+                && r.input_buffers == [partial]
+                && r.params.len() == 4
+                && r.params[3] == 0
+        }) else {
+            return false;
+        };
+        let r = &mut self.dispatches[reduction];
+        let serial = partitions <= 16 || r.params[1].div_ceil(32) > 65_535;
+        let groups = r.params[1].div_ceil(sum_rows_columns(serial));
+        if groups > 65_535 {
+            return false;
+        }
+        r.params[0] = partitions;
+        r.params[2] = u32::from(serial);
+        r.params[3] = 0;
+        r.workgroups = [groups, 1, 1];
+        let size = &mut self.buffers[partial.0 as usize];
+        *size = (*size).max(bytes);
+        true
     }
 
     /// Replace dispatch `index` by `producer`, redirected to a new buffer of

@@ -931,14 +931,23 @@ enum Variant {
         crate::codegen::MatrixTypes,
         crate::codegen::TypedMatmulLayout,
     ),
-    /// Entry, types, parameters, and whether a forward convolution splits K over workgroup Z.
-    CoopConv(ShaderEntry, crate::codegen::MatrixTypes, Conv2dParams, bool),
+    /// Entry, types, parameters, whether a forward/pointwise convolution splits
+    /// K over workgroup Z, and whether a phased input gradient reads transposed weights.
+    CoopConv(
+        ShaderEntry,
+        crate::codegen::MatrixTypes,
+        Conv2dParams,
+        bool,
+        bool,
+    ),
     CoopWorkgroup(
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
         crate::codegen::MatrixTypes,
         /// Guard global accesses to the final, incomplete row tile.
         bool,
+        /// Optional unary fused elementwise epilogue.
+        Option<crate::compile::MatMulEpilogue>,
     ),
     CoopTiled(
         ShaderEntry,
@@ -1051,8 +1060,8 @@ impl Variant {
             | Variant::WinogradMatmul(ref e, _, _)
             | Variant::Attention(ref e, _, _, _)
             | Variant::CoopTyped(ref e, _, _)
-            | Variant::CoopConv(ref e, _, _, _)
-            | Variant::CoopWorkgroup(ref e, _, _, _)
+            | Variant::CoopConv(ref e, _, _, _, _)
+            | Variant::CoopWorkgroup(ref e, _, _, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1076,18 +1085,20 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::CoopConv(ref e, types, ref params, split) => {
+            Variant::CoopConv(ref e, types, ref params, split, transposed) => {
                 let split = if split { ":split-k" } else { "" };
-                format!("{e:?}:checked-{types:?}-fixed-{params:?}{split}")
+                let wt = if transposed { ":wt" } else { "" };
+                format!("{e:?}:checked-{types:?}-fixed-{params:?}{split}{wt}")
             }
             Variant::StoredGate(ref entry, storage) => format!("{entry:?}:store-{storage:?}"),
             Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
             }
-            Variant::CoopWorkgroup(ref e, shape, types, row_bounds) => {
+            Variant::CoopWorkgroup(ref e, shape, types, row_bounds, ref epilogue) => {
                 let suffix = if row_bounds { "-row-bounds" } else { "" };
-                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}")
+                let epi = if epilogue.is_some() { "-epilogue" } else { "" };
+                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}{epi}")
             }
             Variant::CoopTyped(ref e, types, staging) => {
                 use crate::codegen::MatrixTypes;
@@ -2000,26 +2011,29 @@ impl Pipelines {
                 types,
                 ref params,
                 _,
+                _,
             ) => crate::codegen::generate_subgroup_weight_grad(
                 types,
                 typed_shape(types.multiply)?,
                 gpu.capabilities().subgroup_size,
                 params,
             )
-            .ok_or("subgroup-tiled weight gradients need 16x16 subgroup matrices")?,
+            .ok_or("subgroup-tiled weight gradients need supported cooperative matrices")?,
             Variant::CoopConv(
                 ShaderEntry::Conv2dGradInputGemmCoopGen(_, _, stride),
                 types,
                 ref params,
                 _,
+                transposed,
             ) if stride > 1 => crate::codegen::generate_subgroup_phased_grad_input(
                 types,
                 typed_shape(types.multiply)?,
                 gpu.capabilities().subgroup_size,
                 params,
+                transposed,
             )
-            .ok_or("phased input gradients need 16x16 subgroup matrices and whole phases")?,
-            Variant::CoopConv(ref entry, types, ref params, split) => {
+            .ok_or("phased input gradients need supported cooperative matrices and whole phases")?,
+            Variant::CoopConv(ref entry, types, ref params, split, _) => {
                 let group = match *entry {
                     ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
                         ShaderGroup::Conv2dChecked {
@@ -2051,13 +2065,35 @@ impl Pipelines {
                     gpu.capabilities().subgroup_size,
                 )
             }
-            Variant::CoopWorkgroup(_, shape, types, row_bounds) => {
+            Variant::CoopWorkgroup(_, shape, types, row_bounds, ref epilogue) => {
+                let capabilities = gpu.capabilities();
                 if !dispatch.mnk().is_some_and(|(m, n, k)| {
-                    shape.supports_layout(&gpu.capabilities(), types, Some(group), m, n, k)
+                    shape.supports_layout(&capabilities, types, Some(group), m, n, k)
                 }) {
                     return Err("unsupported workgroup cooperative product".to_owned());
                 }
-                crate::codegen::generate_workgroup_matmul(group, shape, types, row_bounds)
+                if let Some(ref epi) = *epilogue {
+                    if shape.subgroup_rows == 0 || !epi.inputs.is_empty() {
+                        return Err(
+                            "unsupported epilogue on workgroup cooperative product".to_owned()
+                        );
+                    }
+                }
+                let (native, subgroup) = if shape.subgroup_rows != 0 {
+                    crate::codegen::native_subgroup_shape(&capabilities, types.multiply)
+                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?
+                } else {
+                    ([16, 16, 16], 32)
+                };
+                crate::codegen::generate_workgroup_matmul_for_device(
+                    group,
+                    shape,
+                    types,
+                    native,
+                    subgroup,
+                    row_bounds,
+                    epilogue.as_ref(),
+                )
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
@@ -2401,6 +2437,7 @@ impl Pipelines {
                 shape,
                 types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
                 dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
+                dispatch.matmul_epilogue.clone(),
             );
         }
         if let crate::compile::Kernel::CooperativeTyped {
@@ -2419,7 +2456,13 @@ impl Pipelines {
                     ShaderEntry::Conv2dGemmCoopGen(..)
                         | ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1)
                 ) && matches!(dispatch.kernel, crate::compile::Kernel::CooperativeTyped { splits, .. } if splits > 1);
-                return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch), split);
+                return Variant::CoopConv(
+                    entry,
+                    types,
+                    Conv2dParams::from(dispatch),
+                    split,
+                    dispatch.conv_transposed_weights,
+                );
             }
             let layout = typed_matmul_layout(dispatch, specialize);
             // The stored kernel does not read direct_inputs. Normalize it

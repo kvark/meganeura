@@ -290,8 +290,16 @@ mod tests {
                 assert_eq!(p.dispatches[2].workgroups, grid);
             }
         }
-        // The typed kernel still needs whole tiles.
-        assert_eq!(fill(&mut plan(64, 784, 64), DType::F16, [8, 16, 16], 32), 0);
+        // Portable native shapes (Xe2 8×16×16, Metal 8×8×8, AMD 64-lane) also
+        // run subgroup-tiled; unsupported subgroup widths fall back to the
+        // typed kernel, which still needs whole tiles.
+        assert_eq!(fill(&mut plan(64, 784, 64), DType::F16, [8, 16, 16], 32), 1);
+        assert_eq!(fill(&mut plan(64, 784, 64), DType::F16, [8, 8, 8], 32), 1);
+        assert_eq!(
+            fill(&mut plan(64, 784, 64), DType::F16, [16, 16, 16], 64),
+            1
+        );
+        assert_eq!(fill(&mut plan(64, 784, 64), DType::F16, [8, 16, 16], 8), 0);
     }
 
     #[test]

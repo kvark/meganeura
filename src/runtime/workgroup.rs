@@ -51,7 +51,10 @@ pub(super) fn select(
                 | ShaderEntry::FusedMatMulBTAdd
         ) || dispatch.horizontal_batch > 1
             || dispatch.matmul_prologue.is_some()
-            || dispatch.matmul_epilogue.is_some()
+            || dispatch
+                .matmul_epilogue
+                .as_ref()
+                .is_some_and(|e| shape.subgroup_rows == 0 || !e.inputs.is_empty())
             || dispatch.full_precision()
             || dispatch.weight_format != WeightFormat::F32
             || (types.is_none() && dispatch.schedule_locked)

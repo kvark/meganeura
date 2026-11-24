@@ -355,6 +355,10 @@ pub fn build_measured_with_inputs(
         .iter()
         .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
     programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
+    programs.parallel_width = match options.tuning.calibration {
+        crate::tune::TuneCalibration::Profile(ref profile) => profile.parallel_width,
+        _ => None,
+    };
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     programs.enable_gradient_inputs(&supported);
     programs.enable_conv_gradient_inputs(&supported);
@@ -818,6 +822,7 @@ fn implementations(
         attention_subgroup_size: 0,
         defer_bf16: false,
         allow_matrix_storage: false,
+        parallel_width: None,
         matrix_shapes: collections::HashMap::new(),
     }
 }
@@ -837,6 +842,7 @@ struct Implementations {
     attention_subgroup_size: u32,
     defer_bf16: bool,
     allow_matrix_storage: bool,
+    parallel_width: Option<u32>,
     matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
 
@@ -1208,6 +1214,33 @@ fn fill_attention_products(
     count
 }
 
+/// Choose a K-split count for a low-occupancy gathered subgroup convolution
+/// and validate its partial allocation and final `SumRows` reduction against
+/// portable limits and the remaining byte budget.
+#[allow(clippy::too_many_arguments)]
+fn plan_gathered_k_split(
+    grid: [u32; 3],
+    stages: u32,
+    batch: u32,
+    total_cols: Option<u32>,
+    remaining_budget: usize,
+    parallel_width: Option<u32>,
+) -> Option<(u32, [u32; 3], u32, usize)> {
+    let low_threshold = compile::split_target_workgroups(parallel_width, 4, 192);
+    let target_groups = compile::split_target_workgroups(parallel_width, 8, 384);
+    let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
+    if workgroups == 0 || workgroups >= low_threshold || stages < 32 {
+        return None;
+    }
+    let chunks = target_groups.div_ceil(workgroups).clamp(2, stages / 8);
+    let total_cols = total_cols?;
+    let bytes = compile::plan_k_split(total_cols, chunks, chunks <= 16, remaining_budget).ok()?;
+    let z = batch.checked_mul(chunks)?;
+    let split_grid = [grid[0], grid[1], z];
+    compile::workgroups_within_portable_limits(split_grid)
+        .then_some((chunks, split_grid, total_cols, bytes))
+}
+
 /// Checked typed products preserve the existing F32 or F16 weight bindings,
 /// including tails. Conversion happens inside each timed dispatch. This reaches
 /// rectangular subgroup shapes and workgroup tuning without the legacy heuristic.
@@ -1218,9 +1251,27 @@ fn fill_matrix_candidates(
     vector_convolutions_only: bool,
     subgroup_tiles: bool,
 ) -> usize {
+    fill_matrix_candidates_with_width(
+        plan,
+        multiply,
+        replace_extracted,
+        vector_convolutions_only,
+        subgroup_tiles,
+        None,
+    )
+}
+
+fn fill_matrix_candidates_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    vector_convolutions_only: bool,
+    subgroup_tiles: bool,
+    parallel_width: Option<u32>,
+) -> usize {
     const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
-    let mut partial_bytes = 0usize;
+    let mut remaining_budget = MAX_SPLIT_PARTIAL_BYTES;
     let mut splits_to_add = Vec::new();
     for (index, d) in plan.dispatches.iter_mut().enumerate() {
         if d.shader.is_conv2d_gemm()
@@ -1250,45 +1301,33 @@ fn fill_matrix_candidates(
                 .checked_mul(p[5])
                 .and_then(|v| v.checked_mul(p[6]))
                 .map_or(0, |taps| taps.div_ceil(32));
-            let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
             let gathered =
                 subgroup_tiles && !crate::kernels::conv::Params::from(&*d).vectorized_forward();
             let mut chunks = 1;
             let mut split_info = None;
-            if gathered && workgroups > 0 && workgroups < 192 && stages >= 32 {
-                let candidate_chunks = 384u32.div_ceil(workgroups).clamp(2, stages / 8);
-                let serial = candidate_chunks <= 16;
+            if gathered {
                 let total_cols = batch
                     .checked_mul(p[4])
                     .and_then(|v| v.checked_mul(positions));
-                let candidate_bytes = total_cols.and_then(|cols| {
-                    if cols.div_ceil(if serial { 256 } else { 32 }) > 65_535 {
-                        return None;
-                    }
-                    (cols as usize)
-                        .checked_mul(candidate_chunks as usize)?
-                        .checked_mul(4)
-                });
-                if let (Some(total_cols), Some(bytes), Some(z)) = (
+                if let Some((candidate_chunks, split_grid, cols, bytes)) = plan_gathered_k_split(
+                    grid,
+                    stages,
+                    batch,
                     total_cols,
-                    candidate_bytes
-                        .filter(|&b| partial_bytes.saturating_add(b) <= MAX_SPLIT_PARTIAL_BYTES),
-                    batch.checked_mul(candidate_chunks),
+                    remaining_budget,
+                    parallel_width,
                 ) {
-                    let split_grid = [grid[0], grid[1], z];
-                    if compile::workgroups_within_portable_limits(split_grid) {
-                        chunks = candidate_chunks;
-                        grid = split_grid;
-                        split_info = Some((total_cols, bytes));
-                    }
+                    chunks = candidate_chunks;
+                    grid = split_grid;
+                    split_info = Some((cols, bytes));
                 }
             }
             if !compile::workgroups_within_portable_limits(grid) {
                 continue;
             }
             if let Some((total_cols, bytes)) = split_info {
-                partial_bytes += bytes;
-                splits_to_add.push((index, chunks, total_cols));
+                remaining_budget -= bytes;
+                splits_to_add.push((index, chunks, total_cols, bytes));
             }
             d.shader = compile::ShaderEntry::Conv2dGemmCoopGen(p[5], p[6], p[7]);
             d.kernel = compile::Kernel::CooperativeTyped {
@@ -1309,15 +1348,9 @@ fn fill_matrix_candidates(
         }
     }
     // Each split convolution writes partials, and a SumRows adds its chunks.
-    for &(index, chunks, columns) in splits_to_add.iter().rev() {
-        let partial = compile::BufferRef(plan.buffers.len() as u32);
-        plan.buffers.push(columns as usize * chunks as usize * 4);
-        let output = plan.dispatches[index].output_buffer;
-        let serial = chunks <= 16;
-        let reduction =
-            plan.dispatches[index].partial_sum(partial, output, columns, chunks, serial);
-        plan.dispatches[index].output_buffer = partial;
-        plan.dispatches.insert(index + 1, reduction);
+    for &(index, chunks, columns, bytes) in splits_to_add.iter().rev() {
+        plan.splice_k_split(index, columns, chunks, chunks <= 16, bytes)
+            .expect("pre-validated split-K reduction");
     }
     count
 }
@@ -1347,9 +1380,19 @@ fn fill_conv_gradient_candidates(
     replace_extracted: bool,
     gathered: bool,
 ) -> usize {
+    fill_conv_gradient_candidates_with_width(plan, multiply, replace_extracted, gathered, None)
+}
+
+fn fill_conv_gradient_candidates_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    gathered: bool,
+    parallel_width: Option<u32>,
+) -> usize {
     const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
-    let mut partial_bytes = 0usize;
+    let mut remaining_budget = MAX_SPLIT_PARTIAL_BYTES;
     let mut splits_to_add = Vec::new();
     let mut transposes_to_add = Vec::new();
     for (index, dispatch) in plan.dispatches.iter_mut().enumerate() {
@@ -1395,37 +1438,19 @@ fn fill_conv_gradient_candidates(
             let mut grid = [p[1].div_ceil(rows), columns.div_ceil(cols), p[0]];
             // A gathered one with few workgroups over a long K (a 7×7
             // stage's over 2048 channels) splits K over workgroup Z.
-            let stages = p[4].div_ceil(32);
-            let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
-            if gathered
-                && !params.vectorized_forward()
-                && workgroups > 0
-                && workgroups < 192
-                && stages >= 32
-            {
-                let candidate_chunks = 384u32.div_ceil(workgroups).clamp(2, stages / 8);
-                let serial = candidate_chunks <= 16;
+            if gathered && !params.vectorized_forward() {
                 let total_cols = batch.checked_mul(p[1]).and_then(|v| v.checked_mul(columns));
-                let candidate_bytes = total_cols.and_then(|cols| {
-                    if cols.div_ceil(if serial { 256 } else { 32 }) > 65_535 {
-                        return None;
-                    }
-                    (cols as usize)
-                        .checked_mul(candidate_chunks as usize)?
-                        .checked_mul(4)
-                });
-                if let (Some(total_cols), Some(bytes), Some(z)) = (
+                if let Some((candidate_chunks, split_grid, cols, bytes)) = plan_gathered_k_split(
+                    grid,
+                    p[4].div_ceil(32),
+                    batch,
                     total_cols,
-                    candidate_bytes
-                        .filter(|&b| partial_bytes.saturating_add(b) <= MAX_SPLIT_PARTIAL_BYTES),
-                    batch.checked_mul(candidate_chunks),
+                    remaining_budget,
+                    parallel_width,
                 ) {
-                    let split_grid = [grid[0], grid[1], z];
-                    if compile::workgroups_within_portable_limits(split_grid) {
-                        chunks = candidate_chunks;
-                        grid = split_grid;
-                        split_info = Some((total_cols, bytes));
-                    }
+                    chunks = candidate_chunks;
+                    grid = split_grid;
+                    split_info = Some((cols, bytes));
                 }
             }
             grid
@@ -1465,8 +1490,8 @@ fn fill_conv_gradient_candidates(
             transposes_to_add.push((index, p[4], k));
         }
         if let Some((total_cols, bytes)) = split_info {
-            partial_bytes += bytes;
-            splits_to_add.push((index, chunks, total_cols));
+            remaining_budget -= bytes;
+            splits_to_add.push((index, chunks, total_cols, bytes));
         }
         dispatch.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(p[5], p[6], p[7]);
         dispatch.kernel = compile::Kernel::CooperativeTyped {
@@ -1477,24 +1502,23 @@ fn fill_conv_gradient_candidates(
             },
             splits: chunks,
         };
+        dispatch.conv_transposed_weights = needs_transpose;
         dispatch.workgroups = grid;
         count += 1;
     }
     // Each split input gradient writes partials, and a SumRows adds its chunks.
-    for &(index, chunks, columns) in splits_to_add.iter().rev() {
-        let partial = compile::BufferRef(plan.buffers.len() as u32);
-        plan.buffers.push(columns as usize * chunks as usize * 4);
-        let output = plan.dispatches[index].output_buffer;
-        let serial = chunks <= 16;
-        let reduction =
-            plan.dispatches[index].partial_sum(partial, output, columns, chunks, serial);
-        plan.dispatches[index].output_buffer = partial;
-        plan.dispatches.insert(index + 1, reduction);
+    for &(index, chunks, columns, bytes) in splits_to_add.iter().rev() {
+        plan.splice_k_split(index, columns, chunks, chunks <= 16, bytes)
+            .expect("pre-validated split-K reduction");
     }
     // Phased input gradients read W[co, (ci, ky, kx)] transposed, from a
     // tiled Transpose just before them (after the reductions shifted them).
     for &(index, co, k) in transposes_to_add.iter().rev() {
-        let index = index + splits_to_add.iter().filter(|&&(i, _, _)| i < index).count();
+        let index = index
+            + splits_to_add
+                .iter()
+                .filter(|&&(i, _, _, _)| i < index)
+                .count();
         let d = &plan.dispatches[index];
         let transposed = compile::BufferRef(plan.buffers.len() as u32);
         let transpose = compile::Dispatch {
@@ -1514,7 +1538,7 @@ fn fill_conv_gradient_candidates(
     }
     count
         + if gathered {
-            fill_conv_weight_gradients(plan, multiply, replace_extracted)
+            fill_conv_weight_gradients_with_width(plan, multiply, replace_extracted, parallel_width)
         } else {
             0
         }
@@ -1525,14 +1549,24 @@ fn fill_conv_gradient_candidates(
 /// device, summed by the SumRows a split producer already feeds, or by one
 /// this adds. Pointwise convolutions load vectors; the rest gather their
 /// im2col elements. Partials and the gradient stay F32.
+#[cfg(test)]
 fn fill_conv_weight_gradients(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> usize {
+    fill_conv_weight_gradients_with_width(plan, multiply, replace_extracted, None)
+}
+
+fn fill_conv_weight_gradients_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    parallel_width: Option<u32>,
+) -> usize {
     use compile::ShaderEntry as E;
     // Partition workgroups aimed for, and the fewest K positions per chunk.
-    const TARGET_WORKGROUPS: u32 = 192;
+    let target_workgroups = compile::split_target_workgroups(parallel_width, 4, 192);
     const MIN_CHUNK: u32 = 128;
     const MAX_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
@@ -1590,7 +1624,7 @@ fn fill_conv_weight_gradients(
             // Per-image products, each split into chunks of its positions.
             let k = params.out_h.saturating_mul(params.out_w);
             batch.saturating_mul(
-                TARGET_WORKGROUPS
+                target_workgroups
                     .div_ceil(tiles.saturating_mul(batch))
                     .clamp(1, (k / MIN_CHUNK).max(1)),
             )
@@ -1601,64 +1635,40 @@ fn fill_conv_weight_gradients(
             let k = batch
                 .saturating_mul(params.out_h)
                 .saturating_mul(params.out_w);
-            let chunks = TARGET_WORKGROUPS
+            let chunks = target_workgroups
                 .div_ceil(tiles)
                 .clamp(1, (k / MIN_CHUNK).max(1));
             if split { chunks.max(2) } else { chunks }
         };
-        let Some(bytes) = m
-            .checked_mul(n)
-            .and_then(|cols| usize::try_from(cols).ok())
-            .and_then(|cols| cols.checked_mul(4))
-            .and_then(|row| row.checked_mul(partitions as usize))
-        else {
+        let Some(cols) = m.checked_mul(n) else {
             index += 1;
             continue;
         };
+        let remaining = MAX_PARTIAL_BYTES.saturating_sub(partial_bytes);
+        let bytes = if partitions > 1 {
+            let Ok(bytes) = compile::plan_k_split(cols, partitions, partitions <= 16, remaining)
+            else {
+                index += 1;
+                continue;
+            };
+            bytes
+        } else {
+            0
+        };
         let grid = [m.div_ceil(tile.rows), n.div_ceil(tile.columns), partitions];
-        if partitions > 65_535
-            || !compile::workgroups_within_portable_limits(grid)
-            || (partitions > 1 && partial_bytes.saturating_add(bytes) > MAX_PARTIAL_BYTES)
-        {
+        if partitions > 65_535 || !compile::workgroups_within_portable_limits(grid) {
             index += 1;
             continue;
         }
         if split {
-            // Re-count the SumRows that reads this producer's partials.
             let partial = d.output_buffer;
-            let Some(reduction) = plan.dispatches.iter().position(|r| {
-                r.shader == E::SumRows
-                    && r.input_buffers == [partial]
-                    && r.params.len() == 4
-                    && r.params[3] == 0
-            }) else {
-                index += 1;
-                continue;
-            };
-            if partitions < 2 {
+            if !plan.update_split_sum_rows(partial, partitions, bytes) {
                 index += 1;
                 continue;
             }
-            let r = &mut plan.dispatches[reduction];
-            r.params[0] = partitions;
-            // A few partials sum one thread a column; wider splits use parallel rows when they fit.
-            if partitions <= 16 {
-                r.params[2] = 1;
-                r.params[3] = 0;
-                r.workgroups = [r.params[1].div_ceil(256), 1, 1];
-            } else if r.params[2] != 0 && r.params[1].div_ceil(32) <= 65_535 {
-                r.params[2] = 0;
-                r.params[3] = 0;
-                r.workgroups = [r.params[1].div_ceil(32), 1, 1];
-            }
-            let size = &mut plan.buffers[partial.0 as usize];
-            *size = (*size).max(bytes);
         } else if partitions > 1
             && plan
-                .split_conv_weight_gradients(
-                    &[(index, partitions)],
-                    MAX_PARTIAL_BYTES - partial_bytes,
-                )
+                .split_conv_weight_gradients(&[(index, partitions)], remaining)
                 .is_err()
         {
             index += 1;
@@ -1702,7 +1712,16 @@ fn fill_gradient_candidates(
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> usize {
-    split_long_weight_gradients(plan, replace_extracted);
+    fill_gradient_candidates_with_width(plan, multiply, replace_extracted, None)
+}
+
+fn fill_gradient_candidates_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    parallel_width: Option<u32>,
+) -> usize {
+    split_long_weight_gradients(plan, replace_extracted, parallel_width);
     let mut count = 0;
     for d in &mut plan.dispatches {
         if d.is_derivative
@@ -1739,9 +1758,13 @@ fn fill_gradient_candidates(
 /// Input gradients over a long K do the same: SmolLM2's MLP down
 /// projection (128 × 576 over K = 3072) took 36.8 µs a layer on 32×16
 /// tiles, 12 TFLOP/s.
-fn split_long_weight_gradients(plan: &mut ExecutionPlan, replace_extracted: bool) -> usize {
+fn split_long_weight_gradients(
+    plan: &mut ExecutionPlan,
+    replace_extracted: bool,
+    parallel_width: Option<u32>,
+) -> usize {
     // Workgroups aimed for, and the fewest K positions per partition.
-    const TARGET_WORKGROUPS: u32 = 144;
+    let target_workgroups = compile::split_target_workgroups(parallel_width, 3, 144);
     const MIN_CHUNK: u32 = 256;
     let mut budget: usize = 64 << 20;
     let mut count = 0;
@@ -1769,7 +1792,7 @@ fn split_long_weight_gradients(plan: &mut ExecutionPlan, replace_extracted: bool
             continue;
         }
         let tiles = m.div_ceil(64) * n.div_ceil(64);
-        let splits = TARGET_WORKGROUPS.div_ceil(tiles).min(k / MIN_CHUNK);
+        let splits = target_workgroups.div_ceil(tiles).min(k / MIN_CHUNK);
         if splits < 2 {
             continue;
         }
@@ -2241,20 +2264,25 @@ impl measure::Frontier for Implementations {
             }
             if let Some(multiply) = matrix_inputs {
                 let (shape, subgroup) = self.matrix_shapes[&multiply];
-                if fill_matrix_candidates(
+                if fill_matrix_candidates_with_width(
                     &mut plan,
                     multiply,
                     self.replace_extracted_matrices,
                     vector_convolutions_only,
                     gathered(multiply, shape, subgroup),
+                    self.parallel_width,
                 ) == 0
                 {
                     continue;
                 }
             }
             if let Some(multiply) = gradient_inputs {
-                if fill_gradient_candidates(&mut plan, multiply, self.replace_extracted_matrices)
-                    == 0
+                if fill_gradient_candidates_with_width(
+                    &mut plan,
+                    multiply,
+                    self.replace_extracted_matrices,
+                    self.parallel_width,
+                ) == 0
                 {
                     continue;
                 }
@@ -2263,11 +2291,12 @@ impl measure::Frontier for Implementations {
                 // Pointwise input gradients on the typed kernel, and the
                 // derivative Winograd products with their transforms.
                 let (shape, subgroup) = self.matrix_shapes[&multiply];
-                if fill_conv_gradient_candidates(
+                if fill_conv_gradient_candidates_with_width(
                     &mut plan,
                     multiply,
                     self.replace_extracted_matrices,
                     gathered(multiply, shape, subgroup),
+                    self.parallel_width,
                 ) + winograd::fill_derivatives(&mut plan, multiply, shape, subgroup)
                     == 0
                 {
