@@ -764,6 +764,11 @@ impl ShaderGroup {
 }
 
 /// Generate WGSL source for a shader group.
+/// Subgroup-reduction LayerNorm for devices advertising non-zero subgroup size.
+pub(crate) fn generate_layer_norm_subgroup() -> ShaderModule {
+    ShaderModule::new(include_str!("shaders/layer_norm_subgroup.wgsl"))
+}
+
 pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
         ShaderGroup::Generated => {
@@ -3774,6 +3779,14 @@ mod tests {
                     panic!("{group:?}: generated module failed validation: {e:#?}")
                 });
         }
+
+        // Subgroup LayerNorm is selected at runtime when the device exposes subgroups.
+        let ln_sub = generate_layer_norm_subgroup();
+        naga::valid::Validator::new(flags, naga::valid::Capabilities::SUBGROUP)
+            .validate(&ln_sub.module)
+            .unwrap_or_else(|e| {
+                panic!("LayerNorm (subgroup): generated module failed validation: {e:#?}")
+            });
 
         // Cooperative execution is a modifier rather than a group, so its
         // modules are reached through the scalar group they derive from.
