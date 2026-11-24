@@ -21,7 +21,7 @@
   gather their operands, and strided input gradients run per stride phase.
   `WorkgroupMatmulShape` gains `subgroup_rows` and `prefetch`,
   `ScalarMatmulShape` gains `vector_fragments`, and the kernel memo revision
-  moves to 17.
+  moves to 18.
 
 - Measured construction accepts `BuildSearchOptions::qualification_runs` to
   check repeated executions of each candidate outside timing. Persistent

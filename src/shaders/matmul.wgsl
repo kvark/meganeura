@@ -52,16 +52,7 @@ $ENTRY_SIGNATURE {
     loop {
         if t >= end_k { break; }
 
-        for (var e = 0u; e < $A_STAGE_EPT_U; e++) {
-            let flat = tid + e * 256u;
-            let row_local = $A_ROW;
-            let col_local = $A_COL;
-            let a_row = tile_row + row_local;
-            let a_col = t + col_local;
-            let in_bounds = (a_row < params.m) && (a_col < params.k);
-            // `select` evaluates both arms: an index past the end reads element 0.
-            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);
-        }
+        $A_STAGE_BODY
         $B_STAGE_BODY
         workgroupBarrier();
 

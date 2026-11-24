@@ -1978,6 +1978,16 @@ fn matmul_vars_tiled(
         WeightFormat::Q3K if tile == MatMulTile::Large => Some("dequant_q3k_pack8"),
         _ => None,
     };
+    let a_stage_body = r"for (var e = 0u; e < $A_STAGE_EPT_U; e++) {
+            let flat = tid + e * 256u;
+            let row_local = $A_ROW;
+            let col_local = $A_COL;
+            let a_row = tile_row + row_local;
+            let a_col = t + col_local;
+            let in_bounds = (a_row < params.m) && (a_col < params.k);
+            // `select` evaluates both arms: an index past the end reads element 0.
+            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);
+        }";
     let b_stage_body = if let Some(pack8) = pack8 {
         format!(
             "\
@@ -2044,19 +2054,15 @@ fn matmul_vars_tiled(
     };
     // vec4 fragments: A stored transposed ([K][BM + 4]) and B as [K][BN + 4],
     // so a thread's TM values of A and TN values of B for one k are aligned
-    // vec4s; every scalar store becomes a component write.
+    // vec4s. One invocation stages all four components of each shared vector.
     let fragments = knobs.vector_fragments
         && pack8.is_none()
         && !interleave_columns
         && tm.is_multiple_of(4)
         && tn.is_multiple_of(4);
     let vectored;
-    let (src, b_stage_body, k_math) = if fragments {
+    let (src, a_stage_body, b_stage_body, k_math) = if fragments {
         let (bmp, bnp) = (bm + 4, bn + 4);
-        let a_at = format!("(col_local * {bmp}u + row_local)");
-        let b_at = format!("(row_local * {bnp}u + col_local)");
-        let a_store = format!("shared_a[{a_at} / 4u][{a_at} % 4u] =");
-        let b_store = format!("shared_b[{b_at} / 4u][{b_at} % 4u] =");
         vectored = src
             .replace(
                 "var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;",
@@ -2071,11 +2077,33 @@ fn matmul_vars_tiled(
                     "var<workgroup> shared_b: array<vec4<f32>, {}>;",
                     k_tile * bnp / 4
                 ),
-            )
-            .replace("shared_a[row_local * $A_STRIDE_U + col_local] =", &a_store)
-            .replace("shared_b[row_local * $B_STRIDE_U + col_local] =", &b_store);
-        let b_stage =
-            b_stage_body.replace("shared_b[row_local * $B_STRIDE_U + col_local] =", &b_store);
+            );
+        let a_stage = r"
+            for (var i = tid; i < $BM_U * $K_TILE_U / 4u; i += 256u) {
+                let k_local = i % $K_TILE_U;
+                let rows = i / $K_TILE_U;
+                let a_col = t + k_local;
+                var values: vec4<f32>;
+                for (var lane = 0u; lane < 4u; lane++) {
+                    let a_row = tile_row + rows * 4u + lane;
+                    let in_bounds = a_row < params.m && a_col < params.k;
+                    values[lane] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);
+                }
+                shared_a[k_local * ($BM_U / 4u + 1u) + rows] = values;
+            }";
+        let b_stage = r"
+            for (var i = tid; i < $BN_U * $K_TILE_U / 4u; i += 256u) {
+                let k_local = i / ($BN_U / 4u);
+                let cols = i % ($BN_U / 4u);
+                let b_row = t + k_local;
+                var values: vec4<f32>;
+                for (var lane = 0u; lane < 4u; lane++) {
+                    let b_col = tile_col + cols * 4u + lane;
+                    let in_bounds = b_row < params.k && b_col < params.n;
+                    values[lane] = select(0.0, $B_LOAD_EXPR, in_bounds);
+                }
+                shared_b[k_local * ($BN_U / 4u + 1u) + cols] = values;
+            }";
         let lanes = ["x", "y", "z", "w"];
         let mut body = String::new();
         for i4 in 0..tm / 4 {
@@ -2116,9 +2144,9 @@ fn matmul_vars_tiled(
         } else {
             body
         };
-        (vectored.as_str(), b_stage, math)
+        (vectored.as_str(), a_stage, b_stage.to_owned(), math)
     } else {
-        (src, b_stage_body, k_math)
+        (src, a_stage_body, b_stage_body, k_math)
     };
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
@@ -2133,6 +2161,7 @@ fn matmul_vars_tiled(
                 "$K_UNROLL_U",
                 &format!("{}u", if knobs.unroll_k { k_tile } else { 1 }),
             ),
+            ("$A_STAGE_BODY", a_stage_body),
             ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
             ("$B_LOAD_EXPR", &b_load_expr),

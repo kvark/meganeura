@@ -6116,7 +6116,7 @@ mod variant_tests {
                 assert!(
                     actual.is_finite()
                         && (f64::from(actual) - expected).abs() < 2e-5 + 2e-4 * expected.abs(),
-                    "{actual} != {expected}"
+                    "{shape:?}: {actual} != {expected}"
                 );
             }
         }
