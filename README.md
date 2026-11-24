@@ -53,7 +53,7 @@ synaga and other shader construction approaches.
 Vulkan on Linux, Windows, and Android, and Metal on Apple platforms. Mesa's
 Lavapipe provides a software Vulkan target for headless CI. Doesn't need any runtime.
 
-**Lean.** Around 50K LOC of Rust+WGSL code in this repository.
+**Lean.** Around 105K LOC of Rust+WGSL in `src/` (142K including tests, examples, and benchmarks).
 Automatic shader composition based on kernel archetypes: pointwise, reduction, matmul, convolution, attention.
 May produce a single 12Mb self-contained binary for deployment.
 

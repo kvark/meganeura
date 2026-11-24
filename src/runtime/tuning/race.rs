@@ -79,13 +79,14 @@ impl Drop for HostEncoders<'_> {
 }
 
 impl Session {
-    /// Time `incumbent` and every other challenger of `class` together, and
+    /// Time `incumbent` and every tile in `challengers` together, and
     /// return the qualified winner, if one passes the decision rule.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn race_class(
         &mut self,
         class: &SearchClass,
         incumbent: MatmulTile,
+        challengers: &[MatmulTile],
         options: &TuneOptions,
         start: Instant,
         staging: &mut Staging<'_>,
@@ -95,7 +96,7 @@ impl Session {
         let capabilities = self.gpu.capabilities();
         let race_start = Instant::now();
         let mut tiles = vec![incumbent];
-        for &tile in &class.challengers {
+        for &tile in challengers {
             if !tiles.contains(&tile) {
                 tiles.push(tile);
             }
