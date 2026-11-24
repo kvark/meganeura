@@ -500,6 +500,43 @@ struct Seed {
 
 type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>);
 
+/// Multiplication precision for derivative products: uniform across weight
+/// (`dW`) and input (`dX`) gradients, or split so weight gradients use F16
+/// while input gradients keep BF16's exponent range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GradientPrecision {
+    Uniform(crate::DType),
+    Split {
+        weights: crate::DType,
+        inputs: crate::DType,
+    },
+}
+
+impl GradientPrecision {
+    fn weights(self) -> crate::DType {
+        match self {
+            Self::Uniform(t) | Self::Split { weights: t, .. } => t,
+        }
+    }
+
+    fn inputs(self) -> crate::DType {
+        match self {
+            Self::Uniform(t) | Self::Split { inputs: t, .. } => t,
+        }
+    }
+
+    fn is_split(self) -> bool {
+        matches!(self, Self::Split { weights, inputs } if weights != inputs)
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Uniform(t) => format!("{t:?}"),
+            Self::Split { weights, inputs } => format!("{weights:?}/{inputs:?}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct AxisChoice {
     attention: AttentionChoice,
@@ -514,11 +551,9 @@ struct AxisChoice {
     backward_ept: Option<u32>,
     /// Subgroup lane sums and vector forward tiles for scalar flash attention.
     subgroup_tiles: bool,
-    gradient_inputs: Option<crate::DType>,
-    conv_gradient_inputs: Option<crate::DType>,
+    gradient_inputs: Option<GradientPrecision>,
+    conv_gradient_inputs: Option<GradientPrecision>,
     forward_products: bool,
-    /// Use BF16 for BT derivative products and F16 for AT products.
-    bf16_bt_gradients: bool,
 }
 
 /// A scalar flash dispatch of `plan` whose reduction can use subgroups on
@@ -852,13 +887,15 @@ impl Implementations {
     fn enable_gradient_inputs(&mut self, inputs: &[crate::DType]) {
         let ordinary = self.choices.clone();
         for multiply in [crate::DType::BF16, crate::DType::F16] {
+            let precision = GradientPrecision::Uniform(multiply);
             if !inputs.contains(&multiply)
                 || !self.matrix_shapes.contains_key(&multiply)
                 || !self.seeds.iter().any(|seed| {
-                    fill_gradient_candidates(
+                    fill_gradient_candidates_precision(
                         &mut seed.plan.clone(),
-                        multiply,
+                        precision,
                         self.replace_extracted_matrices,
+                        self.parallel_width,
                     ) != 0
                 })
             {
@@ -869,29 +906,32 @@ impl Implementations {
             self.order.priority_choices.push_back(self.choices.len());
             self.choices
                 .extend(ordinary.iter().map(|choice| AxisChoice {
-                    gradient_inputs: Some(multiply),
+                    gradient_inputs: Some(precision),
                     ..*choice
                 }));
         }
-        // F16 AT products beside BF16 BT products, after both
-        // uniform choices.
+        // F16 weight gradients (AT) beside BF16 input gradients (BT and NN),
+        // after both uniform choices.
+        let split = GradientPrecision::Split {
+            weights: crate::DType::F16,
+            inputs: crate::DType::BF16,
+        };
         if [crate::DType::BF16, crate::DType::F16]
             .iter()
             .all(|t| inputs.contains(t) && self.matrix_shapes.contains_key(t))
             && self.seeds.iter().any(|seed| {
-                fill_gradient_candidates_typed(
+                fill_gradient_candidates_precision(
                     &mut seed.plan.clone(),
-                    crate::DType::F16,
-                    crate::DType::BF16,
+                    split,
                     self.replace_extracted_matrices,
+                    self.parallel_width,
                 ) != 0
             })
         {
             self.order.priority_choices.push_back(self.choices.len());
             self.choices
                 .extend(ordinary.iter().map(|choice| AxisChoice {
-                    gradient_inputs: Some(crate::DType::F16),
-                    bf16_bt_gradients: true,
+                    gradient_inputs: Some(split),
                     ..*choice
                 }));
         }
@@ -899,38 +939,68 @@ impl Implementations {
         self.order.choice_order = (0..self.choices.len()).collect();
     }
 
+    fn apply_conv_gradient_precision(
+        &self,
+        plan: &mut ExecutionPlan,
+        precision: GradientPrecision,
+    ) -> usize {
+        let (w_ty, x_ty) = (precision.weights(), precision.inputs());
+        let (w_shape, w_sub) = self.matrix_shapes[&w_ty];
+        let (x_shape, x_sub) = self.matrix_shapes[&x_ty];
+        let mut candidate = plan.clone();
+        let (dx, dw) = fill_conv_gradient_candidates_split(
+            &mut candidate,
+            w_ty,
+            x_ty,
+            self.replace_extracted_matrices,
+            gathered(w_ty, w_shape, w_sub),
+            gathered(x_ty, x_shape, x_sub),
+            self.parallel_width,
+        );
+        let wino = winograd::fill_derivatives(&mut candidate, x_ty, x_shape, x_sub);
+        let inputs_changed = dx + wino;
+        if precision.is_split() && (dw == 0 || inputs_changed == 0) {
+            return 0;
+        }
+        let total = dw + inputs_changed;
+        if total == 0 {
+            return 0;
+        }
+        *plan = candidate;
+        total
+    }
+
     fn enable_conv_gradient_inputs(&mut self, inputs: &[crate::DType]) {
         let ordinary = self.choices.clone();
-        for multiply in [crate::DType::BF16, crate::DType::F16] {
-            let Some(&(shape, subgroup)) = self.matrix_shapes.get(&multiply) else {
-                continue;
-            };
-            if !inputs.contains(&multiply)
-                || !self.seeds.iter().any(|seed| {
-                    fill_conv_gradient_candidates(
-                        &mut seed.plan.clone(),
-                        multiply,
-                        self.replace_extracted_matrices,
-                        gathered(multiply, shape, subgroup),
-                    ) + winograd::fill_derivatives(
-                        &mut seed.plan.clone(),
-                        multiply,
-                        shape,
-                        subgroup,
-                    ) != 0
-                })
-            {
+        let has_attention = self
+            .seeds
+            .iter()
+            .any(|seed| seed.plan.dispatches.iter().any(|d| d.shader.is_attention()));
+        let mut precisions: Vec<GradientPrecision> = [crate::DType::BF16, crate::DType::F16]
+            .into_iter()
+            .filter(|t| inputs.contains(t) && self.matrix_shapes.contains_key(t))
+            .map(GradientPrecision::Uniform)
+            .collect();
+        if [crate::DType::BF16, crate::DType::F16]
+            .iter()
+            .all(|t| inputs.contains(t) && self.matrix_shapes.contains_key(t))
+        {
+            precisions.push(GradientPrecision::Split {
+                weights: crate::DType::F16,
+                inputs: crate::DType::BF16,
+            });
+        }
+        for precision in precisions {
+            if !self.seeds.iter().any(|seed| {
+                self.apply_conv_gradient_precision(&mut seed.plan.clone(), precision) != 0
+            }) {
                 continue;
             }
             // Convolution graphs can reach this trial early. Attention graphs
             // keep their arithmetic and derivative-layout priorities first and
             // queue this one after them: their convolutions are small (Whisper's
             // two stem layers), but their gradients now all have typed kernels.
-            if !self
-                .seeds
-                .iter()
-                .any(|seed| seed.plan.dispatches.iter().any(|d| d.shader.is_attention()))
-            {
+            if !has_attention && !precision.is_split() {
                 self.order.arithmetic_layouts = 1;
                 self.order.priority_choices.push_front(self.choices.len());
             } else {
@@ -938,7 +1008,7 @@ impl Implementations {
             }
             self.choices
                 .extend(ordinary.iter().map(|choice| AxisChoice {
-                    conv_gradient_inputs: Some(multiply),
+                    conv_gradient_inputs: Some(precision),
                     ..*choice
                 }));
         }
@@ -1398,27 +1468,42 @@ fn gathered(multiply: crate::DType, native: [u32; 3], subgroup: u32) -> bool {
 /// image and stride phase (workgroup Z), gathering its operands and
 /// scattering its output.
 /// Only measured construction installs reduced derivative operands.
+#[cfg(test)]
 fn fill_conv_gradient_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
     gathered: bool,
 ) -> usize {
-    fill_conv_gradient_candidates_with_width(plan, multiply, replace_extracted, gathered, None)
+    let (dx, dw) = fill_conv_gradient_candidates_split(
+        plan,
+        multiply,
+        multiply,
+        replace_extracted,
+        gathered,
+        gathered,
+        None,
+    );
+    dx + dw
 }
 
-fn fill_conv_gradient_candidates_with_width(
+#[allow(clippy::too_many_arguments)]
+fn fill_conv_gradient_candidates_split(
     plan: &mut ExecutionPlan,
-    multiply: crate::DType,
+    weight_multiply: crate::DType,
+    input_multiply: crate::DType,
     replace_extracted: bool,
-    gathered: bool,
+    gathered_weights: bool,
+    gathered_inputs: bool,
     parallel_width: Option<u32>,
-) -> usize {
+) -> (usize, usize) {
     const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
     let mut remaining_budget = MAX_SPLIT_PARTIAL_BYTES;
     let mut splits_to_add = Vec::new();
     let mut transposes_to_add = Vec::new();
+    let gathered = gathered_inputs;
+    let multiply = input_multiply;
     for (index, dispatch) in plan.dispatches.iter_mut().enumerate() {
         if !matches!(
             dispatch.shader,
@@ -1560,12 +1645,17 @@ fn fill_conv_gradient_candidates_with_width(
         plan.dispatches[index].input_buffers[1] = transposed;
         plan.dispatches.insert(index, transpose);
     }
-    count
-        + if gathered {
-            fill_conv_weight_gradients_with_width(plan, multiply, replace_extracted, parallel_width)
-        } else {
-            0
-        }
+    let dw = if gathered_weights {
+        fill_conv_weight_gradients_with_width(
+            plan,
+            weight_multiply,
+            replace_extracted,
+            parallel_width,
+        )
+    } else {
+        0
+    };
+    (count, dw)
 }
 
 /// Convolution weight gradients as typed per-image BT products over K chunks
@@ -1723,44 +1813,65 @@ fn fill_conv_weight_gradients_with_width(
     count
 }
 
-/// Only AT/BT derivative products were qualified by the dense controls. In
-/// particular, SmolLM2's long-K NN gradient fails the unchanged F16 gate.
+/// Only AT/BT derivative products qualify in F16; SmolLM2's long-K NN input
+/// gradient fails the strict-f32 gate in F16, but BF16 preserves F32's
+/// exponent range and therefore covers `MatMul` (`NN`) input gradients of
+/// forward `matmul_bt` layers as well.
 /// Their fused forms add an F32 addend after the F32 accumulation, so they
 /// round the same operands. Bindings, partials and automatic derivative
 /// protection remain F32.
 /// Reduced inputs are admitted by the caller's quality check on search-time
 /// data only. F16 can lose small derivative values as training converges;
 /// passing that check does not establish range or accuracy for future steps.
+#[cfg(test)]
 fn fill_gradient_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> usize {
-    fill_gradient_candidates_typed_with_width(plan, multiply, multiply, replace_extracted, None)
+    fill_gradient_candidates_precision(
+        plan,
+        GradientPrecision::Uniform(multiply),
+        replace_extracted,
+        None,
+    )
 }
 
-/// Mixed precision qualifies AT and BT derivative layouts independently.
-/// A mixed trial only differs from both uniform trials if both layouts change.
+/// Mixed precision qualifies weight (`AT`) and input (`BT`, plus `NN` when
+/// `inputs == BF16`) derivative layouts independently. A mixed trial only
+/// differs from both uniform trials if both sides change.
 /// Returns 0 without mutating `plan` when the mixed trial is ineligible.
+#[cfg(test)]
 fn fill_gradient_candidates_typed(
     plan: &mut ExecutionPlan,
-    at_type: crate::DType,
-    bt_type: crate::DType,
+    weights: crate::DType,
+    inputs: crate::DType,
     replace_extracted: bool,
 ) -> usize {
-    fill_gradient_candidates_typed_with_width(plan, at_type, bt_type, replace_extracted, None)
+    let precision = if weights == inputs {
+        GradientPrecision::Uniform(weights)
+    } else {
+        GradientPrecision::Split { weights, inputs }
+    };
+    fill_gradient_candidates_precision(plan, precision, replace_extracted, None)
 }
 
-fn fill_gradient_candidates_typed_with_width(
+fn fill_gradient_candidates_precision(
     plan: &mut ExecutionPlan,
-    at_type: crate::DType,
-    bt_type: crate::DType,
+    precision: GradientPrecision,
     replace_extracted: bool,
     parallel_width: Option<u32>,
 ) -> usize {
+    let (weight_type, input_type) = (precision.weights(), precision.inputs());
+    let allow_nn_inputs = input_type == crate::DType::BF16;
     let mut candidate = plan.clone();
-    split_long_weight_gradients(&mut candidate, replace_extracted, parallel_width);
-    let (mut at, mut bt) = (0, 0);
+    split_long_weight_gradients(
+        &mut candidate,
+        replace_extracted,
+        parallel_width,
+        allow_nn_inputs,
+    );
+    let (mut weights_count, mut inputs_count) = (0, 0);
     for d in &mut candidate.dispatches {
         if d.is_derivative
             && !d.requires_full_precision
@@ -1768,7 +1879,11 @@ fn fill_gradient_candidates_typed_with_width(
                 compile::ShaderEntry::MatMulAT | compile::ShaderEntry::MatMulBT => {
                     d.input_buffers.len() == 2
                 }
+                compile::ShaderEntry::MatMul if allow_nn_inputs => d.input_buffers.len() == 2,
                 compile::ShaderEntry::FusedMatMulATAdd | compile::ShaderEntry::FusedMatMulBTAdd => {
+                    d.input_buffers.len() == 3
+                }
+                compile::ShaderEntry::FusedMatMulAdd if allow_nn_inputs => {
                     d.input_buffers.len() == 3
                 }
                 _ => false,
@@ -1782,24 +1897,25 @@ fn fill_gradient_candidates_typed_with_width(
             && d.extra_outputs.is_empty()
         {
             let (multiply, count) = match d.shader {
-                compile::ShaderEntry::MatMulBT | compile::ShaderEntry::FusedMatMulBTAdd => {
-                    (bt_type, &mut bt)
-                }
-                _ => (at_type, &mut at),
+                compile::ShaderEntry::MatMulBT
+                | compile::ShaderEntry::FusedMatMulBTAdd
+                | compile::ShaderEntry::MatMul
+                | compile::ShaderEntry::FusedMatMulAdd => (input_type, &mut inputs_count),
+                _ => (weight_type, &mut weights_count),
             };
             if fill_dense_product(d, multiply, replace_extracted) {
                 *count += 1;
             }
         }
     }
-    if at_type != bt_type && (at == 0 || bt == 0) {
+    if precision.is_split() && (weights_count == 0 || inputs_count == 0) {
         return 0;
     }
-    if at + bt == 0 {
+    if weights_count + inputs_count == 0 {
         return 0;
     }
     *plan = candidate;
-    at + bt
+    weights_count + inputs_count
 }
 
 /// Weight gradients over many positions (Whisper's 384×384 products with
@@ -1814,6 +1930,7 @@ fn split_long_weight_gradients(
     plan: &mut ExecutionPlan,
     replace_extracted: bool,
     parallel_width: Option<u32>,
+    allow_nn_inputs: bool,
 ) -> usize {
     // Workgroups aimed for, and the fewest K positions per partition.
     let target_workgroups = compile::split_target_workgroups(parallel_width, 3, 144);
@@ -1825,7 +1942,9 @@ fn split_long_weight_gradients(
         let Some((m, n, k)) = d.mnk() else {
             continue;
         };
-        let long_input_gradient = d.shader == compile::ShaderEntry::MatMulBT && k >= 2048;
+        let long_input_gradient = k >= 2048
+            && (d.shader == compile::ShaderEntry::MatMulBT
+                || (allow_nn_inputs && d.shader == compile::ShaderEntry::MatMul));
         if !d.is_derivative
             || d.requires_full_precision
             || !(d.shader == compile::ShaderEntry::MatMulAT || long_input_gradient)
@@ -2039,8 +2158,7 @@ impl measure::Frontier for Implementations {
                 let arithmetic = self.choices[*index];
                 self.order.rebased_choices.remove(index);
                 let derivative_trial = (arithmetic.gradient_inputs.is_some()
-                    && (arithmetic.gradient_inputs != active.gradient_inputs
-                        || arithmetic.bf16_bt_gradients != active.bf16_bt_gradients))
+                    && arithmetic.gradient_inputs != active.gradient_inputs)
                     || (arithmetic.conv_gradient_inputs.is_some()
                         && arithmetic.conv_gradient_inputs != active.conv_gradient_inputs)
                     || (arithmetic.backward_ept.is_some()
@@ -2061,12 +2179,6 @@ impl measure::Frontier for Implementations {
                 };
                 let neighbor = AxisChoice {
                     gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
-                    // The input-gradient type travels with the derivative type it qualifies.
-                    bf16_bt_gradients: if arithmetic.gradient_inputs.is_some() {
-                        arithmetic.bf16_bt_gradients
-                    } else {
-                        active.bf16_bt_gradients
-                    },
                     conv_gradient_inputs: arithmetic
                         .conv_gradient_inputs
                         .or(active.conv_gradient_inputs),
@@ -2163,10 +2275,7 @@ impl measure::Frontier for Implementations {
                             active.matrix_storage,
                         ),
                     ) + usize::from(choice.winograd != active.winograd)
-                        + usize::from(
-                            (choice.gradient_inputs, choice.bf16_bt_gradients)
-                                != (active.gradient_inputs, active.bf16_bt_gradients),
-                        )
+                        + usize::from(choice.gradient_inputs != active.gradient_inputs)
                         + usize::from(choice.conv_gradient_inputs != active.conv_gradient_inputs),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
@@ -2205,7 +2314,6 @@ impl measure::Frontier for Implementations {
                 gradient_inputs,
                 conv_gradient_inputs,
                 forward_products,
-                bf16_bt_gradients,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && !f16_attention
@@ -2339,16 +2447,10 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
-            if let Some(multiply) = gradient_inputs {
-                let inputs = if bf16_bt_gradients {
-                    crate::DType::BF16
-                } else {
-                    multiply
-                };
-                if fill_gradient_candidates_typed_with_width(
+            if let Some(precision) = gradient_inputs {
+                if fill_gradient_candidates_precision(
                     &mut plan,
-                    multiply,
-                    inputs,
+                    precision,
                     self.replace_extracted_matrices,
                     self.parallel_width,
                 ) == 0
@@ -2356,19 +2458,10 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
-            if let Some(multiply) = conv_gradient_inputs {
-                // Pointwise input gradients on the typed kernel, and the
+            if let Some(precision) = conv_gradient_inputs {
+                // Pointwise/phased input gradients, weight gradients, and
                 // derivative Winograd products with their transforms.
-                let (shape, subgroup) = self.matrix_shapes[&multiply];
-                if fill_conv_gradient_candidates_with_width(
-                    &mut plan,
-                    multiply,
-                    self.replace_extracted_matrices,
-                    gathered(multiply, shape, subgroup),
-                    self.parallel_width,
-                ) + winograd::fill_derivatives(&mut plan, multiply, shape, subgroup)
-                    == 0
-                {
+                if self.apply_conv_gradient_precision(&mut plan, precision) == 0 {
                     continue;
                 }
             }
@@ -2409,14 +2502,11 @@ impl measure::Frontier for Implementations {
                     description.push_str(", vector_convolutions_only=true");
                 }
             }
-            if let Some(dtype) = gradient_inputs {
-                description.push_str(&format!(", gradient_inputs={dtype:?}"));
-                if bf16_bt_gradients {
-                    description.push_str(", bf16_bt_gradients=true");
-                }
+            if let Some(precision) = gradient_inputs {
+                description.push_str(&format!(", gradient_inputs={}", precision.label()));
             }
-            if let Some(dtype) = conv_gradient_inputs {
-                description.push_str(&format!(", conv_gradient_inputs={dtype:?}"));
+            if let Some(precision) = conv_gradient_inputs {
+                description.push_str(&format!(", conv_gradient_inputs={}", precision.label()));
             }
             if let Some(dtype) = winograd {
                 description.push_str(&format!(", winograd={dtype:?}"));
@@ -3262,12 +3352,12 @@ mod tests {
         let ordinary = frontier.choices[0];
         let bf16 = frontier.choices.len();
         frontier.choices.push(AxisChoice {
-            gradient_inputs: Some(crate::DType::BF16),
+            gradient_inputs: Some(GradientPrecision::Uniform(crate::DType::BF16)),
             ..ordinary
         });
         let f16 = frontier.choices.len();
         frontier.choices.push(AxisChoice {
-            gradient_inputs: Some(crate::DType::F16),
+            gradient_inputs: Some(GradientPrecision::Uniform(crate::DType::F16)),
             ..ordinary
         });
         let reduction = frontier.choices.len();
@@ -3277,7 +3367,7 @@ mod tests {
         });
         for dtype in [crate::DType::BF16, crate::DType::F16] {
             frontier.choices.push(AxisChoice {
-                gradient_inputs: Some(dtype),
+                gradient_inputs: Some(GradientPrecision::Uniform(dtype)),
                 subgroup_tiles: true,
                 ..ordinary
             });
@@ -3293,7 +3383,7 @@ mod tests {
             let queued = frontier.order.priority_choices.front().unwrap();
             assert_eq!(
                 frontier.choices[frontier.order.candidate_choice(*queued)].gradient_inputs,
-                Some(dtype)
+                Some(GradientPrecision::Uniform(dtype))
             );
         }
     }
@@ -3559,7 +3649,10 @@ mod tests {
             for &index in &products {
                 nn.dispatches[index].shader = compile::ShaderEntry::MatMul;
             }
-            assert_eq!(fill_gradient_candidates(&mut nn, dtype, true), 0);
+            // F16 skips NN derivatives; BF16 preserves F32 range and covers
+            // NN input gradients produced by forward `matmul_bt` layers.
+            let expected_nn = if dtype == BF16 { products.len() } else { 0 };
+            assert_eq!(fill_gradient_candidates(&mut nn, dtype, true), expected_nn);
             let mut locked = baseline.clone();
             for &index in &products {
                 locked.dispatches[index].schedule_locked = true;
@@ -3567,6 +3660,74 @@ mod tests {
             assert_eq!(fill_gradient_candidates(&mut locked, dtype, false), 0);
             assert_eq!(fill_gradient_candidates(&mut locked, dtype, true), 2);
         }
+    }
+
+    #[test]
+    fn mixed_gradient_precision_covers_matmul_bt_nn_inputs_and_conv_splits() {
+        use crate::DType::{BF16, F16};
+        // Forward `matmul_bt(x, w)` differentiates to AT (dW) and NN (dX).
+        let mut graph = Graph::new();
+        let x = graph.parameter("x", &[64, 128]);
+        let w = graph.parameter("w", &[64, 128]);
+        let y = graph.matmul_bt(x, w);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let mut plan = compile::compile(&crate::autodiff::differentiate(&graph));
+        let changed = fill_gradient_candidates_typed(&mut plan, F16, BF16, true);
+        assert!(changed >= 2, "expected both AT dW and NN dX to be typed");
+        let mut saw_at_f16 = false;
+        let mut saw_nn_bf16 = false;
+        for d in &plan.dispatches {
+            if let compile::Kernel::CooperativeTyped { types, .. } = d.kernel
+                && d.is_derivative
+            {
+                if d.shader == compile::ShaderEntry::MatMulAT {
+                    assert_eq!(types.multiply, F16);
+                    saw_at_f16 = true;
+                } else if d.shader == compile::ShaderEntry::MatMul {
+                    assert_eq!(types.multiply, BF16);
+                    saw_nn_bf16 = true;
+                }
+            }
+        }
+        assert!(saw_at_f16 && saw_nn_bf16);
+
+        // Convolution gradients split dW (F16) from dX (BF16).
+        let mut cg = Graph::new();
+        let cx = cg.parameter("x", &[4 * 64 * 56 * 56]);
+        let cw = cg.parameter("w", &[256 * 64]);
+        let cy = cg.conv2d(cx, cw, 4, 64, 56, 56, 256, 1, 1, 1, 0);
+        let closs = cg.mean_all(cy);
+        cg.set_outputs(vec![closs]);
+        let mut frontier = graph_frontier(crate::autodiff::differentiate(&cg));
+        let caps = matrix_caps(&[[16, 16, 16]], &[[16, 16, 16]]);
+        frontier.enable_matrix_inputs(&[BF16, F16], &caps);
+        frontier.enable_conv_gradient_inputs(&[BF16, F16]);
+        let split = GradientPrecision::Split {
+            weights: F16,
+            inputs: BF16,
+        };
+        assert!(
+            frontier
+                .choices
+                .iter()
+                .any(|c| c.conv_gradient_inputs == Some(split)),
+            "expected split F16 dW / BF16 dX conv gradient candidate"
+        );
+        let mut cplan = frontier.seeds[0].plan.clone();
+        assert!(frontier.apply_conv_gradient_precision(&mut cplan, split) >= 2);
+        let dw_f16 = cplan.dispatches.iter().any(|d| {
+            matches!(
+                d.shader,
+                compile::ShaderEntry::Conv2dGradWeightGemm
+                    | compile::ShaderEntry::Conv2dGradWeightGemmSplit
+            ) && matches!(d.kernel, compile::Kernel::CooperativeTyped { types, .. } if types.multiply == F16)
+        });
+        let dx_bf16 = cplan.dispatches.iter().any(|d| {
+            matches!(d.shader, compile::ShaderEntry::Conv2dGradInputGemmCoopGen(..))
+                && matches!(d.kernel, compile::Kernel::CooperativeTyped { types, .. } if types.multiply == BF16)
+        });
+        assert!(dw_f16 && dx_bf16);
     }
 
     #[test]
@@ -3613,9 +3774,14 @@ mod tests {
                 frontier
                     .choices
                     .iter()
-                    .any(|c| c.gradient_inputs == Some(F16))
+                    .any(|c| c.gradient_inputs == Some(GradientPrecision::Uniform(F16)))
             );
-            assert!(frontier.choices.iter().all(|c| !c.bf16_bt_gradients));
+            assert!(
+                frontier
+                    .choices
+                    .iter()
+                    .all(|c| !c.gradient_inputs.is_some_and(GradientPrecision::is_split))
+            );
         }
     }
 
@@ -3630,7 +3796,10 @@ mod tests {
         let bf16 = frontier
             .choices
             .iter()
-            .position(|c| c.gradient_inputs == Some(BF16) && c.matrix_inputs.is_none())
+            .position(|c| {
+                c.gradient_inputs == Some(GradientPrecision::Uniform(BF16))
+                    && c.matrix_inputs.is_none()
+            })
             .unwrap();
         frontier.order.tried.insert((0, bf16));
         let _ = frontier.next(Some(measure::Origin {
@@ -3643,10 +3812,12 @@ mod tests {
             .iter()
             .map(|&i| frontier.choices[frontier.order.candidate_choice(i)])
             .collect();
+        let split = GradientPrecision::Split {
+            weights: F16,
+            inputs: BF16,
+        };
         assert!(
-            rebased
-                .iter()
-                .any(|c| c.gradient_inputs == Some(F16) && c.bf16_bt_gradients),
+            rebased.iter().any(|c| c.gradient_inputs == Some(split)),
             "{rebased:?}"
         );
     }
@@ -3669,26 +3840,31 @@ mod tests {
             .filter_map(|&i| frontier.choices[i].gradient_inputs)
             .collect();
         // Uniform BF16, uniform F16, then F16 weight gradients with BF16 input gradients.
-        assert_eq!(derivative_order, [BF16, F16, F16]);
-        let mixed: Vec<bool> = frontier
-            .order
-            .priority_choices
-            .iter()
-            .filter(|&&i| frontier.choices[i].gradient_inputs.is_some())
-            .map(|&i| frontier.choices[i].bf16_bt_gradients)
-            .collect();
-        assert_eq!(mixed, [false, false, true]);
+        assert_eq!(
+            derivative_order,
+            [
+                GradientPrecision::Uniform(BF16),
+                GradientPrecision::Uniform(F16),
+                GradientPrecision::Split {
+                    weights: F16,
+                    inputs: BF16,
+                },
+            ]
+        );
         let f16 = frontier
             .choices
             .iter()
-            .position(|c| c.gradient_inputs == Some(F16) && c.matrix_inputs.is_none())
+            .position(|c| {
+                c.gradient_inputs == Some(GradientPrecision::Uniform(F16))
+                    && c.matrix_inputs.is_none()
+            })
             .unwrap();
         let bf16 = frontier
             .choices
             .iter()
             .position(|c| {
                 *c == AxisChoice {
-                    gradient_inputs: Some(BF16),
+                    gradient_inputs: Some(GradientPrecision::Uniform(BF16)),
                     ..frontier.choices[f16]
                 }
             })
@@ -3719,7 +3895,14 @@ mod tests {
             reached.insert((choice.matrix_inputs, choice.gradient_inputs));
         }
         for forward in [None, Some(F16), Some(BF16)] {
-            for derivative in [Some(F16), Some(BF16)] {
+            for derivative in [
+                Some(GradientPrecision::Uniform(F16)),
+                Some(GradientPrecision::Uniform(BF16)),
+                Some(GradientPrecision::Split {
+                    weights: F16,
+                    inputs: BF16,
+                }),
+            ] {
                 assert!(
                     reached.contains(&(forward, derivative)),
                     "missing {forward:?}/{derivative:?}"
