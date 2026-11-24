@@ -134,7 +134,8 @@ pub(super) struct Segment {
 
 /// What one dispatch of a pass covers: a whole chunk, or one pair that left
 /// its chunk.
-struct Unit {
+#[derive(Clone)]
+pub(super) struct Unit {
     chunk: usize,
     /// Byte offset of the unit within the chunk's moments and accumulators.
     base: usize,
@@ -289,6 +290,11 @@ impl Session {
     /// The table is host-visible, so when it changes (after a parameter is
     /// rebound, for instance) the GPU must be idle.
     fn optimizer_units(&mut self, accumulating: bool) -> Vec<Unit> {
+        if let Some((cached_accumulating, ref units)) = self.cached_optimizer_units
+            && cached_accumulating == accumulating
+        {
+            return units.clone();
+        }
         struct Plan {
             chunk: usize,
             base: usize,
@@ -396,7 +402,7 @@ impl Session {
         }
         let segments = self.optimizer_segments.unwrap();
         let accumulators = self.grad_accum.as_ref().filter(|_| accumulating);
-        units
+        let built: Vec<Unit> = units
             .into_iter()
             .map(|(plan, start, groups, slot)| Unit {
                 chunk: plan.chunk,
@@ -411,7 +417,9 @@ impl Session {
                 groups,
                 slot,
             })
-            .collect()
+            .collect();
+        self.cached_optimizer_units = Some((accumulating, built.clone()));
+        built
     }
 
     /// Record the passes that follow backward: gradient accumulation, then
@@ -450,13 +458,10 @@ impl Session {
                     pc.dispatch(unit.grid());
                 }
             }
-            // Submit + wait so the accumulator this pass wrote is fully
-            // durable before the optimizer's separate passes read it.
-            // Sharing one submission left a write/read hazard that
-            // corrupted the accumulator on the apply step.
-            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-            self.wait();
-            self.encoder.start();
+            // Ensure the accumulated gradients are visible to clipping and
+            // optimizer passes in the same command buffer without forcing a
+            // synchronous CPU/GPU drain.
+            self.encoder.barrier();
         }
 
         if clip {

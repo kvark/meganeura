@@ -64,6 +64,10 @@ pub struct TuneClass {
     /// the session policy. Separate from explicit types for cache fallback.
     #[serde(default)]
     pub cooperative_f16: bool,
+    /// Unary fused elementwise epilogue attached to this matmul, if any.
+    /// Part of the key so epilogue-fused and plain matmuls never share winners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epilogue: Option<crate::schedule::PointwiseDAG>,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
     /// Declared bytes for A, B, optional addend, output, in binding order.
@@ -574,6 +578,7 @@ impl MatmulTile {
                 || splits > shape.k_blocks(class.k)
                 || (splits > 1) != class.split_k
                 || (splits > 1 && (class.has_addend() || types.output != crate::DType::F32))
+                || (class.epilogue.is_some() && (shape.subgroup_rows == 0 || splits > 1))
             {
                 return None;
             }
@@ -595,6 +600,9 @@ impl MatmulTile {
             let Self::CooperativeChecked { splits, .. } = self else {
                 return None;
             };
+            if class.epilogue.is_some() {
+                return None;
+            }
             if splits == 0
                 || (splits > 1) != class.split_k
                 || (splits > 1
@@ -616,6 +624,7 @@ impl MatmulTile {
         }
         if let Self::Scalar(shape) = self {
             if class.conv2d.is_some()
+                || class.epilogue.is_some()
                 || gemv_group(&class.shader).is_some()
                 || class.weight_format.is_quantized()
                 || !shape.legal()
@@ -666,6 +675,7 @@ impl MatmulTile {
         let mut sizes = class.buffer_sizes()?;
         if let Self::CooperativeTiled { shape, splits } = self {
             if class.conv2d.is_some()
+                || class.epilogue.is_some()
                 || !class.shader.is_matmul()
                 || class.weight_format != crate::compile::WeightFormat::F32
                 || !shape.fits_dimensions(class.m, class.n, class.k)
@@ -754,7 +764,10 @@ impl TuneClass {
         ) || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
-            || dispatch.matmul_epilogue.is_some()
+            || dispatch
+                .matmul_epilogue
+                .as_ref()
+                .is_some_and(|epi| !epi.inputs.is_empty() || !dispatch.shader.is_matmul())
             || !dispatch.extra_outputs.is_empty()
             || dispatch.pointwise().is_some()
             || dispatch.reduction().is_some()
@@ -866,6 +879,7 @@ impl TuneClass {
                 crate::compile::Kernel::CooperativeWorkgroup { types: None, .. }
             ) || (dispatch.kernel == crate::compile::Kernel::Cooperative
                 && config.is_some_and(|c| c.use_f16_input)),
+            epilogue: dispatch.matmul_epilogue.as_ref().map(|epi| epi.dag.clone()),
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -1179,7 +1193,7 @@ impl TuneClass {
         .into_iter()
         .flatten()
         .collect();
-        if !self.weight_format.is_quantized() {
+        if !self.weight_format.is_quantized() && self.epilogue.is_none() {
             candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
             if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input) {
                 candidates.extend(
@@ -2830,5 +2844,67 @@ mod tests {
         assert_eq!(d.workgroups, [2, 1, 1]);
         assert!(!d.use_coop() && d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
+    }
+
+    #[test]
+    fn unary_epilogue_matmul_enters_tuning_and_filters_to_capable_tiles() {
+        use crate::compile::MatMulEpilogue;
+        use crate::schedule::{PointwiseDAG, Pw};
+
+        let relu = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Relu(0)],
+            output: 1,
+        };
+        let mut d = dispatch();
+        d.params = vec![128, 64, 128, 0];
+        d.workgroups = [2, 2, 1];
+        d.matmul_epilogue = Some(MatMulEpilogue {
+            dag: relu.clone(),
+            inputs: vec![],
+        });
+        let mut class = TuneClass::from_dispatch(&d, None).expect("unary epilogue should tune");
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        assert_eq!(class.epilogue, Some(relu.clone()));
+        let challengers = class.challengers(MatmulTile::Tile64, None, &[]);
+        assert!(challengers.contains(&MatmulTile::Tile32));
+        assert!(
+            !challengers
+                .iter()
+                .any(|t| matches!(t, MatmulTile::Scalar(_)))
+        );
+
+        // Subgroup-tiled cooperative workgroup shapes support unary epilogues,
+        // while workgroup-scope shapes (subgroup_rows == 0) are excluded.
+        let mut coop_class = class.clone();
+        coop_class.cooperative_f16 = true;
+        let f16 = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+        };
+        let coop_challengers = coop_class.challengers_for_device(
+            MatmulTile::CooperativeF16 { tile_size: 16 },
+            Some(&f16),
+            &[[16, 16, 16]],
+            32,
+        );
+        assert!(coop_challengers.iter().any(|t| matches!(
+            t,
+            MatmulTile::CooperativeWorkgroup { shape, splits: 1 } if shape.subgroup_rows > 0
+        )));
+        assert!(coop_challengers.iter().all(|t| !matches!(
+            t,
+            MatmulTile::CooperativeWorkgroup { shape, .. } if shape.subgroup_rows == 0
+        )));
+
+        // Non-unary epilogues with extra input bindings remain excluded.
+        d.matmul_epilogue = Some(MatMulEpilogue {
+            dag: relu,
+            inputs: vec![(
+                crate::compile::BufferRef(9),
+                crate::compile::EpilogueLoadKind::PerElement,
+            )],
+        });
+        assert!(TuneClass::from_dispatch(&d, None).is_none());
     }
 }

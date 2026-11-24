@@ -69,6 +69,10 @@ fn node_signature(graph: &Graph, id: usize) -> u64 {
             data.len().hash(&mut h);
             h.write(bytemuck::cast_slice(data));
         }
+        Op::Fill { value } => {
+            "F".hash(&mut h);
+            value.to_bits().hash(&mut h);
+        }
         // Debug formatting includes op params (num_heads, eps, strides…)
         // so structurally different ops hash differently.
         ref op => format!("{:?}", op).hash(&mut h),
@@ -93,6 +97,9 @@ fn ops_equivalent(a: &Op, b: &Op) -> bool {
             }
             _ => false,
         },
+        Op::Fill { value } => {
+            matches!(*b, Op::Fill { value: other } if value.to_bits() == other.to_bits())
+        }
         _ => format!("{:?}", a) == format!("{:?}", b),
     }
 }
@@ -225,7 +232,11 @@ pub fn detect_repeated_regions(graph: &Graph) -> Vec<Region> {
             .all(|node| {
                 matches!(
                     node.op,
-                    Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Nop
+                    Op::Input { .. }
+                        | Op::Parameter { .. }
+                        | Op::Constant { .. }
+                        | Op::Fill { .. }
+                        | Op::Nop
                 )
             })
         {

@@ -116,6 +116,7 @@ impl<'a> Compiler<'a> {
                 input_buffers: Vec::new(),
                 input_types: HashMap::new(),
                 constant_buffers: Vec::new(),
+                uniform_constants: Vec::new(),
                 dispatches: Vec::new(),
                 groups: Vec::new(),
                 loss_buffer: None,
@@ -414,12 +415,18 @@ impl<'a> Compiler<'a> {
     pub(super) fn is_f32_unit_constant(&self, node: NodeId) -> bool {
         let node = self.graph.node(node);
         node.ty.dtype == DType::F32
-            && matches!(
-                node.op,
-                Op::Constant { ref data }
-                    if !data.is_empty()
-                        && data.iter().all(|value| value.to_bits() == 1.0_f32.to_bits())
-            )
+            && match node.op {
+                Op::Constant { ref data } => {
+                    !data.is_empty()
+                        && data
+                            .iter()
+                            .all(|value| value.to_bits() == 1.0_f32.to_bits())
+                }
+                Op::Fill { value } => {
+                    node.ty.num_elements() > 0 && value.to_bits() == 1.0_f32.to_bits()
+                }
+                _ => false,
+            }
     }
 
     pub(super) fn emit_sum_inner(
@@ -702,7 +709,7 @@ impl<'a> Compiler<'a> {
                     self.plan.input_buffers.push((name.clone(), buf));
                     self.plan.input_types.insert(buf, node.ty.clone());
                 }
-                Op::Constant { .. } => {}
+                Op::Constant { .. } | Op::Fill { .. } => {}
                 Op::MultiHeadAttnGradV { fwd_node, .. } => {
                     self.pending_grad_v_buffers.insert(fwd_node, buf);
                 }
@@ -872,7 +879,8 @@ impl<'a> Compiler<'a> {
                     // a real gradient: optimizers iterate over the parameter's
                     // full length and would otherwise read past the scalar.
                     assert!(
-                        matches!(grad_node.op, Op::Constant { ref data } if data == &[0.0]),
+                        matches!(grad_node.op, Op::Constant { ref data } if data == &[0.0])
+                            || matches!(grad_node.op, Op::Fill { value } if value == 0.0),
                         "parameter gradient shape mismatch without a zero placeholder",
                     );
                     continue;
@@ -1082,6 +1090,7 @@ impl<'a> Compiler<'a> {
             Op::Input { .. }
             | Op::Parameter { .. }
             | Op::Constant { .. }
+            | Op::Fill { .. }
             | Op::Nop
             | Op::Identity
             | Op::StopGradient

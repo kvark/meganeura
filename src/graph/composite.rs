@@ -42,7 +42,9 @@ impl Op {
         use OpClass::{Composite, Primitive, Private};
         match *self {
             // Leaves.
-            Op::Parameter { .. } | Op::Input { .. } | Op::Constant { .. } => Primitive,
+            Op::Parameter { .. } | Op::Input { .. } | Op::Constant { .. } | Op::Fill { .. } => {
+                Primitive
+            }
             // `dot_general`, in each operand layout.
             Op::MatMul
             | Op::MatMulAT

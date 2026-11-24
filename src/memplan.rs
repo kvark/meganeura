@@ -149,6 +149,9 @@ impl AliasPlan {
         for &(b, _) in &plan.constant_buffers {
             roles[b.0 as usize] += 2;
         }
+        for &(b, _) in &plan.uniform_constants {
+            roles[b.0 as usize] += 2;
+        }
         let eligible = |&(p, g): &(BufferRef, BufferRef)| {
             p != g
                 && roles[p.0 as usize] == 1
@@ -465,6 +468,24 @@ fn uniform_constant_aliases(plan: &ExecutionPlan) -> Vec<Option<usize>> {
             canonical.insert(key, index);
         }
     }
+    for &(buffer, value) in &plan.uniform_constants {
+        let index = buffer.0 as usize;
+        if mutable[index] {
+            continue;
+        }
+        let elems = plan.buffers[index] / std::mem::size_of::<f32>();
+        if elems == 0 {
+            continue;
+        }
+        let key = (plan.buffers[index], elems, value.to_bits());
+        if let Some(&target) = canonical.get(&key) {
+            aliases[index] = Some(target);
+            count += 1;
+            bytes += plan.buffers[index];
+        } else {
+            canonical.insert(key, index);
+        }
+    }
     if count != 0 {
         log::info!(
             "uniform constant aliasing: {count} buffers share canonical allocations ({:.1} MB eliminated)",
@@ -518,6 +539,9 @@ fn device_local_eligible(plan: &ExecutionPlan) -> Vec<bool> {
     for &(buffer, _) in &plan.constant_buffers {
         ok[buffer.0 as usize] = false;
     }
+    for &(buffer, _) in &plan.uniform_constants {
+        ok[buffer.0 as usize] = false;
+    }
     ok
 }
 
@@ -542,6 +566,9 @@ fn compute_pinned(
         pin(b, &mut pinned);
     }
     for &(b, _) in &plan.constant_buffers {
+        pin(b, &mut pinned);
+    }
+    for &(b, _) in &plan.uniform_constants {
         pin(b, &mut pinned);
     }
     for &b in &plan.output_buffers {
@@ -690,6 +717,7 @@ mod tests {
             input_buffers: Vec::new(),
             input_types: Default::default(),
             constant_buffers: Vec::new(),
+            uniform_constants: Vec::new(),
             dispatches,
             groups: Vec::new(),
             loss_buffer: None,

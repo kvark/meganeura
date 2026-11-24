@@ -1489,6 +1489,10 @@ pub struct ExecutionPlan {
     pub input_types: HashMap<BufferRef, crate::graph::TensorType>,
     /// Constant buffers with their initial data (uploaded once at session creation).
     pub constant_buffers: Vec<(BufferRef, Vec<f32>)>,
+    /// Uniform F32 constants (`Op::Fill`): initialized in place on upload without
+    /// storing a dense `Vec<f32>` in the graph, plan, or RON cache.
+    #[serde(default)]
+    pub uniform_constants: Vec<(BufferRef, f32)>,
     /// The dispatch sequence. For a training graph, this includes
     /// forward, backward, and parameter update dispatches.
     pub dispatches: Vec<Dispatch>,
@@ -1634,6 +1638,12 @@ impl ExecutionPlan {
             let bits: Vec<u32> = data.iter().map(|v| v.to_bits()).collect();
             current.insert(buf, hash(("constant", bits)));
         }
+        for &(buf, value) in &self.uniform_constants {
+            current.insert(
+                buf,
+                hash(("fill", self.buffers[buf.0 as usize], value.to_bits())),
+            );
+        }
         for &(buf, ref sources, ref transform) in &self.derived_params {
             current.insert(buf, hash(("derived", sources, structural_key(transform))));
         }
@@ -1703,10 +1713,17 @@ impl ExecutionPlan {
 
     fn attach_borrowed_constant_buffers(&mut self, graph: &Graph) {
         for node in graph.nodes() {
-            if let Op::Constant { ref data } = node.op {
-                let buffer = self.node_buffer(node.id);
-                self.constant_buffers
-                    .push((buffer, constant_words(data.clone(), node.ty.dtype)));
+            match node.op {
+                Op::Constant { ref data } => {
+                    let buffer = self.node_buffer(node.id);
+                    self.constant_buffers
+                        .push((buffer, constant_words(data.clone(), node.ty.dtype)));
+                }
+                Op::Fill { value } => {
+                    let buffer = self.node_buffer(node.id);
+                    self.uniform_constants.push((buffer, value));
+                }
+                _ => {}
             }
         }
     }
@@ -1715,10 +1732,17 @@ impl ExecutionPlan {
         for node in graph.nodes_mut() {
             let node_id = node.id;
             let dtype = node.ty.dtype;
-            if let Op::Constant { ref mut data } = node.op {
-                let buffer = self.node_buffer(node_id);
-                self.constant_buffers
-                    .push((buffer, constant_words(std::mem::take(data), dtype)));
+            match node.op {
+                Op::Constant { ref mut data } => {
+                    let buffer = self.node_buffer(node_id);
+                    self.constant_buffers
+                        .push((buffer, constant_words(std::mem::take(data), dtype)));
+                }
+                Op::Fill { value } => {
+                    let buffer = self.node_buffer(node_id);
+                    self.uniform_constants.push((buffer, value));
+                }
+                _ => {}
             }
         }
     }
@@ -1741,6 +1765,7 @@ impl ExecutionPlan {
         visible.extend(self.derived_params.iter().map(|entry| entry.0));
         visible.extend(self.input_buffers.iter().map(|entry| entry.1));
         visible.extend(self.constant_buffers.iter().map(|entry| entry.0));
+        visible.extend(self.uniform_constants.iter().map(|entry| entry.0));
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
         for dispatch in &self.dispatches {
             visible.extend(dispatch.extra_outputs.iter().copied());
@@ -2059,6 +2084,11 @@ fn fold_uniform_constants(plan: &mut ExecutionPlan) {
                 .all(|value| value.to_bits() == bits)
                 .then_some((buffer, bits))
         })
+        .chain(
+            plan.uniform_constants
+                .iter()
+                .map(|&(buffer, value)| (buffer, value.to_bits())),
+        )
         .collect();
     if uniform.is_empty() {
         return;

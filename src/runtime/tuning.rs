@@ -447,6 +447,7 @@ pub(super) fn tile_module(
     dispatch: &Dispatch,
     tile: MatmulTile,
     knobs: crate::codegen::MatmulKnobs,
+    caps: &bg::Capabilities,
 ) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     if let MatmulTile::Scalar(shape) = tile {
@@ -548,21 +549,40 @@ pub(super) fn tile_module(
             }
             MatmulTile::CooperativeChecked { specialize, .. } => {
                 let types = super::checked_matrix_types(dispatch).expect("checked tile types");
-                crate::codegen::generate_module_coop_typed_with_layout(
+                let native = crate::codegen::checked_cooperative_shape(super::cooperative_shapes(
+                    &caps.cooperative_matrix,
+                    types.multiply,
+                ))
+                .unwrap_or([16, 16, 16]);
+                crate::codegen::generate_module_coop_typed_with_subgroup(
                     entry.shader_group(),
                     types,
-                    [16, 16, 16],
+                    native,
                     super::typed_matmul_layout(dispatch, specialize),
+                    caps.subgroup_size,
                 )
             }
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 let types = super::checked_matrix_types(dispatch)
                     .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
-                crate::codegen::generate_workgroup_matmul(
+                let native = crate::codegen::checked_cooperative_shape(super::cooperative_shapes(
+                    &caps.cooperative_matrix,
+                    types.multiply,
+                ))
+                .unwrap_or([16, 16, 16]);
+                let subgroup = if caps.subgroup_size == 0 {
+                    32
+                } else {
+                    caps.subgroup_size
+                };
+                crate::codegen::generate_workgroup_matmul_for_device(
                     entry.shader_group(),
                     shape,
                     types,
+                    native,
+                    subgroup,
                     dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
+                    dispatch.matmul_epilogue.as_ref(),
                 )
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
@@ -3702,6 +3722,7 @@ mod tests {
                 &dispatch,
                 MatmulTile::Gemv(shape),
                 crate::codegen::MatmulKnobs::default(),
+                &bg::Capabilities::default(),
             )
             .source
             .contains("dot_q4_q8_packed")
@@ -4534,8 +4555,12 @@ mod tests {
                         Variant::Scalar(tile.shader(&entry))
                     );
                 }
-                let mut module =
-                    tile_module(&dispatch, tile, crate::codegen::MatmulKnobs::default());
+                let mut module = tile_module(
+                    &dispatch,
+                    tile,
+                    crate::codegen::MatmulKnobs::default(),
+                    &bg::Capabilities::default(),
+                );
                 // Blade assigns resource bindings by ShaderData field name.
                 // Assign distinct test bindings before full offline validation.
                 for (index, (_, var)) in module.module.global_variables.iter_mut().enumerate() {

@@ -1085,6 +1085,29 @@ impl Variant {
         }
     }
 
+    /// Whether this pipeline relies on subgroup operations whose workgroup
+    /// geometry assumes `caps.subgroup_size` full lanes.
+    fn uses_subgroups(&self, caps: &blade_graphics::Capabilities) -> bool {
+        match *self {
+            Variant::CoopWorkgroup(..)
+            | Variant::CoopConv(..)
+            | Variant::CoopTyped(..)
+            | Variant::CoopTiled(..)
+            | Variant::Coop(..)
+            | Variant::CoopEpilogue(..)
+            | Variant::CoopPrologue(..)
+            | Variant::Horizontal(_, _, HorizMatMulKind::Coop) => true,
+            Variant::Gemv(_, _, shape)
+            | Variant::GemvIntDot(_, _, shape)
+            | Variant::GemvRmsNorm(_, _, shape)
+            | Variant::GemvRmsNormIntDot(_, _, shape) => {
+                shape.reduction == crate::codegen::GemvReduction::Subgroup
+            }
+            Variant::Scalar(ShaderEntry::LayerNorm) => caps.subgroup_size > 0,
+            _ => false,
+        }
+    }
+
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
@@ -1791,11 +1814,53 @@ fn create_gen_shader(
     .map_err(|error| error.to_string())
 }
 
+/// Parse literal `@workgroup_size(x[, y[, z]])` from generated WGSL source.
+fn parse_wgsl_workgroup_size(source: &str) -> Option<[u32; 3]> {
+    let start = source.find("@workgroup_size(")?;
+    let rest = &source[start + "@workgroup_size(".len()..];
+    let end = rest.find(')')?;
+    let mut dims = [1u32; 3];
+    let mut count = 0usize;
+    for part in rest[..end].split(',') {
+        let token = part.trim().trim_end_matches(['u', 'i']);
+        if token.is_empty() || count >= 3 {
+            return None;
+        }
+        dims[count] = token.parse().ok()?;
+        count += 1;
+    }
+    (count >= 1).then_some(dims)
+}
+
+fn required_full_subgroup_size(
+    caps: &blade_graphics::Capabilities,
+    key: &Variant,
+    source: &str,
+) -> Option<u32> {
+    if !key.uses_subgroups(caps) || caps.subgroup_size == 0 {
+        return None;
+    }
+    let wg = parse_wgsl_workgroup_size(source)?;
+    caps.full_subgroups
+        .is_some_and(|fs| fs.supports(caps.subgroup_size, wg))
+        .then_some(caps.subgroup_size)
+}
+
 fn create_profiled_pipeline(
     gpu: &Gpu,
     name: String,
     layout: &blade_graphics::ShaderDataLayout,
     compute: blade_graphics::ShaderFunction<'_>,
+) -> blade_graphics::ComputePipeline {
+    create_profiled_pipeline_with_subgroup(gpu, name, layout, compute, None)
+}
+
+fn create_profiled_pipeline_with_subgroup(
+    gpu: &Gpu,
+    name: String,
+    layout: &blade_graphics::ShaderDataLayout,
+    compute: blade_graphics::ShaderFunction<'_>,
+    full_subgroup_size: Option<u32>,
 ) -> blade_graphics::ComputePipeline {
     let _span = tracing::info_span!(
         "pipeline",
@@ -1807,7 +1872,7 @@ fn create_profiled_pipeline(
         name: &name,
         data_layouts: &[layout],
         compute,
-        full_subgroup_size: None,
+        full_subgroup_size,
     })
 }
 
@@ -2149,13 +2214,17 @@ impl Pipelines {
             Variant::Weight(_, format) => {
                 crate::codegen::generate_module_weighted(group, format, matmul_knobs)
             }
-            Variant::WeightSmall(..) => {
-                tuning::tile_module(dispatch, crate::tune::MatmulTile::Tile32, matmul_knobs)
-            }
+            Variant::WeightSmall(..) => tuning::tile_module(
+                dispatch,
+                crate::tune::MatmulTile::Tile32,
+                matmul_knobs,
+                &gpu.capabilities(),
+            ),
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
+                &gpu.capabilities(),
             ),
             Variant::SplitMatmul(_, _, shape, splits) => crate::codegen::generate_split_matmul(
                 group,
@@ -2167,7 +2236,7 @@ impl Pipelines {
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
-                tuning::tile_module(dispatch, tile, matmul_knobs)
+                tuning::tile_module(dispatch, tile, matmul_knobs, &gpu.capabilities())
             }
             Variant::Gemv(_, _, shape)
             | Variant::GemvIntDot(_, _, shape)
@@ -2176,7 +2245,12 @@ impl Pipelines {
                 if dispatch.gemv_rmsnorm.is_some() {
                     layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
                 }
-                tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
+                tuning::tile_module(
+                    dispatch,
+                    crate::tune::MatmulTile::Gemv(shape),
+                    matmul_knobs,
+                    &gpu.capabilities(),
+                )
             }
             Variant::Coop(..) => {
                 let config = cooperative();
@@ -2366,10 +2440,12 @@ impl Pipelines {
         if let Some(dir) = dump_dir {
             module.dump(dir);
         }
+        let full_subgroup_size =
+            required_full_subgroup_size(&gpu.capabilities(), key, &module.source);
         let shared_key = SharedPipelineKey {
             context: Arc::as_ptr(gpu) as usize,
             entry_point,
-            layout: format!("{:?}", layout.bindings),
+            layout: format!("{:?}:sg={:?}", layout.bindings, full_subgroup_size),
             source: module.source.clone(),
         };
         if let Some(pipeline) = SharedPipelines::get(&shared_key) {
@@ -2378,7 +2454,13 @@ impl Pipelines {
         let shader = create_gen_shader(gpu, module)?;
         let pipeline = Arc::new(SharedPipeline {
             gpu: Arc::clone(gpu),
-            raw: create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point)),
+            raw: create_profiled_pipeline_with_subgroup(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(entry_point),
+                full_subgroup_size,
+            ),
         });
         SharedPipelines::insert(shared_key, &pipeline);
         Ok(pipeline)
@@ -3505,6 +3587,9 @@ pub struct Session {
     /// rewritten when it changes, so a step recorded while an earlier one is
     /// in flight does not touch memory the GPU may be reading.
     optimizer_table: Vec<optimizer::Segment>,
+    /// Cached optimizer dispatch units for `(accumulating, units)`. Invalidated
+    /// whenever a buffer binding, LR multiplier, or accumulator changes.
+    cached_optimizer_units: Option<(bool, Vec<optimizer::Unit>)>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
     /// this diagnostic does not require another dispatch or shader variant.
@@ -4056,6 +4141,7 @@ impl Session {
             {
                 if plan.input_buffers.iter().any(|entry| entry.1 == buffer)
                     || plan.constant_buffers.iter().any(|entry| entry.0 == buffer)
+                    || plan.uniform_constants.iter().any(|entry| entry.0 == buffer)
                     || plan.loss_buffer == Some(buffer)
                     || !plan.buffers[buffer.0 as usize].is_multiple_of(4)
                     || plan
@@ -4337,7 +4423,7 @@ impl Session {
         {
             let _span = tracing::info_span!(
                 "buffer_constants",
-                buffers = plan.constant_buffers.len(),
+                buffers = plan.constant_buffers.len() + plan.uniform_constants.len(),
                 trace_min_duration_us = 1_000u64,
             )
             .entered();
@@ -4346,6 +4432,14 @@ impl Session {
                 unsafe {
                     let ptr = buffer.data() as *mut f32;
                     std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                }
+            }
+            for &(buf_ref, value) in &plan.uniform_constants {
+                let buffer = &buffers[buf_ref.0 as usize];
+                let elems = plan.buffers[buf_ref.0 as usize] / std::mem::size_of::<f32>();
+                unsafe {
+                    let ptr = buffer.data() as *mut f32;
+                    std::slice::from_raw_parts_mut(ptr, elems).fill(value);
                 }
             }
         }
@@ -4485,6 +4579,9 @@ impl Session {
         for &(b, _) in &plan.constant_buffers {
             written[b.0 as usize] = true;
         }
+        for &(b, _) in &plan.uniform_constants {
+            written[b.0 as usize] = true;
+        }
         for d in &plan.derived_params {
             written[d.0.0 as usize] = true;
         }
@@ -4530,6 +4627,7 @@ impl Session {
             optimizer_chunks,
             optimizer_segments: None,
             optimizer_table: Vec::new(),
+            cached_optimizer_units: None,
             adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
@@ -4759,6 +4857,7 @@ impl Session {
             self.invariants_cacheable = false;
         }
         self.buffers[index] = physical.handle.at(offset as u64);
+        self.cached_optimizer_units = None;
         let target = self
             .alias
             .rebind(index, self.plan.buffers[index], offset, device_local);
@@ -6787,12 +6886,14 @@ impl Session {
         } else {
             self.lr_multipliers.push((name_prefix.to_string(), mul));
         }
+        self.cached_optimizer_units = None;
     }
 
     /// Clear all per-parameter LR multipliers (returns all params to
     /// the base learning rate).
     pub fn clear_lr_multipliers(&mut self) {
         self.lr_multipliers.clear();
+        self.cached_optimizer_units = None;
     }
 
     /// Internal: longest-prefix-match lookup. Static helper so it can
@@ -7000,6 +7101,7 @@ impl Session {
             let mut device_bufs = Vec::new();
             let accumulators = optimizer::ChunkBuffers::new(self, "grad_accum", &mut device_bufs);
             self.grad_accum = Some(accumulators);
+            self.cached_optimizer_units = None;
             self.zero_optimizer_buffers(&device_bufs, "zero_grad_accum");
         }
         self.grad_accum_scale = Some(1.0 / micro_batches as f32);
