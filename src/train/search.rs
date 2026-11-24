@@ -517,8 +517,8 @@ struct AxisChoice {
     gradient_inputs: Option<crate::DType>,
     conv_gradient_inputs: Option<crate::DType>,
     forward_products: bool,
-    /// With `gradient_inputs`, input gradients (BT products) in BF16 instead.
-    bf16_input_gradients: bool,
+    /// Use BF16 for BT derivative products and F16 for AT products.
+    bf16_bt_gradients: bool,
 }
 
 /// A scalar flash dispatch of `plan` whose reduction can use subgroups on
@@ -873,7 +873,7 @@ impl Implementations {
                     ..*choice
                 }));
         }
-        // F16 weight gradients beside BF16 input gradients, after both
+        // F16 AT products beside BF16 BT products, after both
         // uniform choices.
         if [crate::DType::BF16, crate::DType::F16]
             .iter()
@@ -891,7 +891,7 @@ impl Implementations {
             self.choices
                 .extend(ordinary.iter().map(|choice| AxisChoice {
                     gradient_inputs: Some(crate::DType::F16),
-                    bf16_input_gradients: true,
+                    bf16_bt_gradients: true,
                     ..*choice
                 }));
         }
@@ -1739,29 +1739,26 @@ fn fill_gradient_candidates(
     fill_gradient_candidates_typed_with_width(plan, multiply, multiply, replace_extracted, None)
 }
 
-/// [`fill_gradient_candidates`] with one multiplication type for weight
-/// gradients (`Xᵀ·dY`, the AT products) and another for input gradients
-/// (`dY·Wᵀ`, the BT products). Input gradients carry dY at full range into
-/// every earlier layer: Whisper's fail the strict-f32 bound in F16 and pass in
-/// BF16, while its weight gradients pass in F16.
+/// Mixed precision qualifies AT and BT derivative layouts independently.
+/// A mixed trial only differs from both uniform trials if both layouts change.
 fn fill_gradient_candidates_typed(
     plan: &mut ExecutionPlan,
-    weights: crate::DType,
-    inputs: crate::DType,
+    at_type: crate::DType,
+    bt_type: crate::DType,
     replace_extracted: bool,
 ) -> usize {
-    fill_gradient_candidates_typed_with_width(plan, weights, inputs, replace_extracted, None)
+    fill_gradient_candidates_typed_with_width(plan, at_type, bt_type, replace_extracted, None)
 }
 
 fn fill_gradient_candidates_typed_with_width(
     plan: &mut ExecutionPlan,
-    weights: crate::DType,
-    inputs: crate::DType,
+    at_type: crate::DType,
+    bt_type: crate::DType,
     replace_extracted: bool,
     parallel_width: Option<u32>,
 ) -> usize {
     split_long_weight_gradients(plan, replace_extracted, parallel_width);
-    let mut count = 0;
+    let (mut at, mut bt) = (0, 0);
     for d in &mut plan.dispatches {
         if d.is_derivative
             && !d.requires_full_precision
@@ -1781,23 +1778,22 @@ fn fill_gradient_candidates_typed_with_width(
                     | compile::Kernel::SplitMatmul { .. }
             )
             && d.extra_outputs.is_empty()
-            && fill_dense_product(
-                d,
-                if matches!(
-                    d.shader,
-                    compile::ShaderEntry::MatMulBT | compile::ShaderEntry::FusedMatMulBTAdd
-                ) {
-                    inputs
-                } else {
-                    weights
-                },
-                replace_extracted,
-            )
         {
-            count += 1;
+            let (multiply, count) = match d.shader {
+                compile::ShaderEntry::MatMulBT | compile::ShaderEntry::FusedMatMulBTAdd => {
+                    (bt_type, &mut bt)
+                }
+                _ => (at_type, &mut at),
+            };
+            if fill_dense_product(d, multiply, replace_extracted) {
+                *count += 1;
+            }
         }
     }
-    count
+    if at_type != bt_type && (at == 0 || bt == 0) {
+        return 0;
+    }
+    at + bt
 }
 
 /// Weight gradients over many positions (Whisper's 384×384 products with
@@ -2038,7 +2034,7 @@ impl measure::Frontier for Implementations {
                 self.order.rebased_choices.remove(index);
                 let derivative_trial = (arithmetic.gradient_inputs.is_some()
                     && (arithmetic.gradient_inputs != active.gradient_inputs
-                        || arithmetic.bf16_input_gradients != active.bf16_input_gradients))
+                        || arithmetic.bf16_bt_gradients != active.bf16_bt_gradients))
                     || (arithmetic.conv_gradient_inputs.is_some()
                         && arithmetic.conv_gradient_inputs != active.conv_gradient_inputs)
                     || (arithmetic.backward_ept.is_some()
@@ -2060,10 +2056,10 @@ impl measure::Frontier for Implementations {
                 let neighbor = AxisChoice {
                     gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
                     // The input-gradient type travels with the derivative type it qualifies.
-                    bf16_input_gradients: if arithmetic.gradient_inputs.is_some() {
-                        arithmetic.bf16_input_gradients
+                    bf16_bt_gradients: if arithmetic.gradient_inputs.is_some() {
+                        arithmetic.bf16_bt_gradients
                     } else {
-                        active.bf16_input_gradients
+                        active.bf16_bt_gradients
                     },
                     conv_gradient_inputs: arithmetic
                         .conv_gradient_inputs
@@ -2200,7 +2196,7 @@ impl measure::Frontier for Implementations {
                 gradient_inputs,
                 conv_gradient_inputs,
                 forward_products,
-                bf16_input_gradients,
+                bf16_bt_gradients,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && !f16_attention
@@ -2335,7 +2331,7 @@ impl measure::Frontier for Implementations {
                 }
             }
             if let Some(multiply) = gradient_inputs {
-                let inputs = if bf16_input_gradients {
+                let inputs = if bf16_bt_gradients {
                     crate::DType::BF16
                 } else {
                     multiply
@@ -2406,8 +2402,8 @@ impl measure::Frontier for Implementations {
             }
             if let Some(dtype) = gradient_inputs {
                 description.push_str(&format!(", gradient_inputs={dtype:?}"));
-                if bf16_input_gradients {
-                    description.push_str(", bf16_input_gradients=true");
+                if bf16_bt_gradients {
+                    description.push_str(", bf16_bt_gradients=true");
                 }
             }
             if let Some(dtype) = conv_gradient_inputs {
@@ -3565,6 +3561,34 @@ mod tests {
     }
 
     #[test]
+    fn one_derivative_layout_only_queues_uniform_precision() {
+        use crate::DType::{BF16, F16};
+        for pinned in [
+            compile::ShaderEntry::MatMulAT,
+            compile::ShaderEntry::MatMulBT,
+        ] {
+            let mut frontier = gradient_frontier();
+            for seed in &mut frontier.seeds {
+                for d in &mut seed.plan.dispatches {
+                    if d.is_derivative && d.shader == pinned {
+                        d.requires_full_precision = true;
+                    }
+                }
+            }
+            let caps = matrix_caps(&[[8, 16, 16]], &[[8, 16, 16]]);
+            frontier.enable_matrix_inputs(&[BF16, F16], &caps);
+            frontier.enable_gradient_inputs(&[BF16, F16]);
+            assert!(
+                frontier
+                    .choices
+                    .iter()
+                    .any(|c| c.gradient_inputs == Some(F16))
+            );
+            assert!(frontier.choices.iter().all(|c| !c.bf16_bt_gradients));
+        }
+    }
+
+    #[test]
     fn mixed_gradient_choice_survives_rebasing_onto_a_bf16_incumbent() {
         use crate::DType::{BF16, F16};
         use measure::Frontier as _;
@@ -3591,7 +3615,7 @@ mod tests {
         assert!(
             rebased
                 .iter()
-                .any(|c| c.gradient_inputs == Some(F16) && c.bf16_input_gradients),
+                .any(|c| c.gradient_inputs == Some(F16) && c.bf16_bt_gradients),
             "{rebased:?}"
         );
     }
@@ -3620,7 +3644,7 @@ mod tests {
             .priority_choices
             .iter()
             .filter(|&&i| frontier.choices[i].gradient_inputs.is_some())
-            .map(|&i| frontier.choices[i].bf16_input_gradients)
+            .map(|&i| frontier.choices[i].bf16_bt_gradients)
             .collect();
         assert_eq!(mixed, [false, false, true]);
         let f16 = frontier

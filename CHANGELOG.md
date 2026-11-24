@@ -23,8 +23,8 @@
   `ScalarMatmulShape` gains `vector_fragments`, and the kernel memo revision
   moves to 18.
 
-- The derivative-precision search also offers F16 weight gradients with BF16
-  input gradients, after the uniform BF16 and F16 choices.
+- After uniform BF16 and F16, the derivative search can try F16 for AT
+  products and BF16 for BT products when both transpose layouts occur.
 
 - Measured construction accepts `BuildSearchOptions::qualification_runs` to
   check repeated executions of each candidate outside timing. Persistent
