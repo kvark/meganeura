@@ -49,6 +49,7 @@ pub(crate) fn schedule(
         }
     }
     let early_inputs = inputs.intersection(&ready).copied().collect();
+    let base_pinned = super::non_aliasable_hint(plan, &plan.dispatches);
     let mut prefix = Vec::new();
     let mut suffix = Vec::new();
     for (index, dispatch) in std::mem::take(&mut plan.dispatches).into_iter().enumerate() {
@@ -60,11 +61,17 @@ pub(crate) fn schedule(
             suffix.push(dispatch);
         }
     }
-    let base_pinned = super::non_aliasable_hint(plan);
+    // Pin only ready buffers that cross the prefix->suffix boundary (requested
+    // outputs are already pinned in `base_pinned`). Prefix-internal intermediates
+    // stay unpinned so the prefix gets memory-aware scheduling too.
     let mut prefix_pinned = base_pinned.clone();
-    for &b in &ready {
-        if let Some(slot) = prefix_pinned.get_mut(b.0 as usize) {
-            *slot = true;
+    for dispatch in &suffix {
+        for b in dispatch.read_buffers() {
+            if ready.contains(&b)
+                && let Some(slot) = prefix_pinned.get_mut(b.0 as usize)
+            {
+                *slot = true;
+            }
         }
     }
     let mut groups =
@@ -153,5 +160,58 @@ mod tests {
         let mut p = plan();
         p.dispatches.push(p.dispatches[0].clone());
         schedule(&mut p, &[1], false, true);
+    }
+
+    #[test]
+    fn prefix_schedules_internal_skip_branch_memory_aware() {
+        // Prefix computes a 4-stage main path (16 KiB each) plus a 1 MiB skip
+        // branch that merges into prepared output 6; suffix consumes output 6.
+        // Because prefix-internal intermediates are no longer over-pinned,
+        // the skip branch should be delayed right before the merge in group 3.
+        let make = |inputs: &[u32], out: u32| crate::compile::Dispatch {
+            input_buffers: inputs
+                .iter()
+                .map(|&b| crate::compile::BufferRef(b))
+                .collect(),
+            output_buffer: crate::compile::BufferRef(out),
+            ..Default::default()
+        };
+        let mut p = ExecutionPlan {
+            buffers: vec![
+                16_384,
+                16_384,
+                16_384,
+                16_384,
+                16_384,
+                1 << 20,
+                16_384,
+                16_384,
+            ],
+            input_buffers: vec![("x".into(), crate::compile::BufferRef(0))],
+            output_buffers: vec![crate::compile::BufferRef(6), crate::compile::BufferRef(7)],
+            dispatches: vec![
+                make(&[0], 5),    // large prefix-internal skip branch (1 MiB)
+                make(&[0], 1),    // main 0
+                make(&[1], 2),    // main 1
+                make(&[2], 3),    // main 2
+                make(&[3], 4),    // main 3
+                make(&[4, 5], 6), // prepared output 0
+                make(&[6], 7),    // suffix output 1
+            ],
+            ..crate::compile::compile(&crate::Graph::new())
+        };
+        let layout = schedule(&mut p, &[0], false, false);
+        assert_eq!(layout.groups, 5);
+        let skip_group = p.groups[..layout.groups]
+            .iter()
+            .position(|r| {
+                r.clone()
+                    .any(|i| p.dispatches[i].output_buffer == crate::compile::BufferRef(5))
+            })
+            .unwrap();
+        assert_eq!(
+            skip_group, 3,
+            "prefix-internal skip branch should be delayed right before its merge"
+        );
     }
 }

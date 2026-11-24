@@ -1,13 +1,15 @@
-//! Lifetime-based buffer aliasing for the execution plan.
+//! Lifetime-based buffer aliasing and 2D slab sub-allocation for the execution plan.
 //!
 //! The dispatch sequence is static and partitioned into barrier groups
-//! (one compute pass each, with a full barrier between groups), so
-//! buffer reuse is classic linear-scan allocation: two logical buffers
-//! may share one physical GPU allocation when their live intervals are
-//! disjoint at *barrier-group* granularity. Dispatches inside a group
-//! run concurrently, so disjointness must be strict — the old tenant's
-//! last use group must come strictly before the new tenant's first
-//! write group, guaranteeing a barrier separates them.
+//! (one compute pass each, with a full barrier between groups). Step-local
+//! intermediates are sub-allocated inside shared device-local slabs at
+//! 256-byte-aligned byte ranges (`AliasPlan::offsets`): concurrent tenants
+//! may share one physical slab at disjoint byte ranges, while two logical
+//! buffers may occupy overlapping byte ranges (see [`AliasPlan::overlap`])
+//! only when their live intervals are strictly disjoint at *barrier-group*
+//! granularity. Dispatches inside a group run concurrently, so disjointness
+//! must be strict — the old tenant's last use group must come strictly before
+//! the new tenant's first write group, guaranteeing a barrier separates them.
 //!
 //! Coop-padding safety: only matmul output and addend buffers are
 //! padded for full-tile cooperative stores, and those stores write the
@@ -61,7 +63,8 @@ pub struct AliasPlan {
     pub map: Vec<usize>,
     /// Byte offset of each logical buffer within its physical allocation.
     pub offsets: Vec<usize>,
-    /// Size in bytes of each physical allocation (max over its tenants).
+    /// Size in bytes of each physical allocation (furthest tenant end: max of
+    /// `offset + size` across its tenants).
     pub sizes: Vec<usize>,
     /// Per physical allocation: every tenant is a step-local
     /// intermediate that no host path ever touches, so the allocation
@@ -371,41 +374,120 @@ pub fn plan_buffer_aliasing(
         )
     });
 
+    const BLOCK_CAP: usize = 256;
     struct SlabTenant {
         start: usize,
         end: usize,
         offset: usize,
         aligned_size: usize,
     }
+    struct TenantBlock {
+        min_start: usize,
+        max_end: usize,
+        tenants: Vec<SlabTenant>,
+    }
     struct IntermediateSlab {
         phys: usize,
         size: usize,
-        tenants: Vec<SlabTenant>,
+        min_start: usize,
+        max_end: usize,
+        blocks: Vec<TenantBlock>,
+    }
+    impl IntermediateSlab {
+        fn new(phys: usize, size: usize, first: SlabTenant) -> Self {
+            let (min_start, max_end) = (first.start, first.end);
+            Self {
+                phys,
+                size,
+                min_start,
+                max_end,
+                blocks: vec![TenantBlock {
+                    min_start,
+                    max_end,
+                    tenants: vec![first],
+                }],
+            }
+        }
+
+        fn insert(&mut self, tenant: SlabTenant) {
+            self.min_start = self.min_start.min(tenant.start);
+            self.max_end = self.max_end.max(tenant.end);
+            let bi = self
+                .blocks
+                .partition_point(|b| b.min_start <= tenant.start)
+                .saturating_sub(1);
+            let block = &mut self.blocks[bi];
+            let pos = block.tenants.partition_point(|t| t.start <= tenant.start);
+            block.min_start = block.min_start.min(tenant.start);
+            block.max_end = block.max_end.max(tenant.end);
+            block.tenants.insert(pos, tenant);
+            if block.tenants.len() >= BLOCK_CAP {
+                let mid = block.tenants.len() / 2;
+                let right_tenants = block.tenants.split_off(mid);
+                block.min_start = block.tenants[0].start;
+                block.max_end = block.tenants.iter().map(|t| t.end).max().unwrap();
+                let right = TenantBlock {
+                    min_start: right_tenants[0].start,
+                    max_end: right_tenants.iter().map(|t| t.end).max().unwrap(),
+                    tenants: right_tenants,
+                };
+                self.blocks.insert(bi + 1, right);
+            }
+        }
+
+        fn collect_overlapping(&self, start: usize, end: usize, busy: &mut Vec<(usize, usize)>) {
+            busy.clear();
+            if end < self.min_start || start > self.max_end {
+                return;
+            }
+            for block in &self.blocks {
+                if block.min_start > end {
+                    break;
+                }
+                if block.max_end < start {
+                    continue;
+                }
+                for t in &block.tenants {
+                    if t.start > end {
+                        break;
+                    }
+                    if start <= t.end {
+                        busy.push((t.offset, t.offset + t.aligned_size));
+                    }
+                }
+            }
+        }
     }
 
     let find_slab_offset = |slab: &IntermediateSlab,
                             start: usize,
                             end: usize,
                             need: usize,
-                            aligned_size: usize|
+                            aligned_size: usize,
+                            busy: &mut Vec<(usize, usize)>|
      -> Option<(usize, usize)> {
         let oversized = need > ARENA_CHUNK_BYTES;
-        if oversized != (slab.size > ARENA_CHUNK_BYTES) {
-            return None;
-        }
-        let mut busy: Vec<(usize, usize)> = slab
-            .tenants
-            .iter()
-            .filter(|t| t.start <= end && start <= t.end)
-            .map(|t| (t.offset, t.offset + t.aligned_size))
-            .collect();
+        slab.collect_overlapping(start, end, busy);
         if oversized {
+            // An oversized tensor can reuse any idle slab (normal or oversized)
+            // at offset 0, growing it if needed.
             return busy.is_empty().then_some((0, slab.size.max(need)));
+        }
+        // Normal tensors can sub-allocate inside normal slabs up to
+        // ARENA_CHUNK_BYTES, or reuse free ranges inside an existing oversized
+        // slab without growing it past its current size.
+        let ceiling = if slab.size > ARENA_CHUNK_BYTES {
+            slab.size
+        } else {
+            ARENA_CHUNK_BYTES
+        };
+        if busy.is_empty() {
+            return (need <= ceiling).then_some((0, slab.size.max(need)));
         }
         busy.sort_unstable();
         let mut cursor = 0usize;
         let mut best_gap: Option<(usize, usize)> = None; // (gap_bytes, offset)
-        for (lo, hi) in busy {
+        for &(lo, hi) in busy.iter() {
             if lo > cursor {
                 let gap = lo - cursor;
                 if gap >= aligned_size && best_gap.is_none_or(|(best_size, _)| gap < best_size) {
@@ -418,7 +500,7 @@ pub fn plan_buffer_aliasing(
             return Some((offset, slab.size.max(offset + need)));
         }
         let end_offset = cursor.checked_add(need)?;
-        if end_offset <= ARENA_CHUNK_BYTES {
+        if end_offset <= ceiling {
             Some((cursor, slab.size.max(end_offset)))
         } else {
             None
@@ -426,17 +508,20 @@ pub fn plan_buffer_aliasing(
     };
 
     let mut slabs: Vec<IntermediateSlab> = Vec::new();
+    let mut busy: Vec<(usize, usize)> = Vec::new();
     for i in order {
         let start = uses[i].first_write.unwrap();
         let end = uses[i].last_use.unwrap();
         let need = plan.buffers[i];
         let aligned_size = need.max(16).next_multiple_of(ARENA_ALIGNMENT);
 
-        // Prefer a slab that fits with zero growth (smallest offset first);
-        // otherwise pick the slab with minimum growth within ARENA_CHUNK_BYTES.
+        // Prefer a slab that fits with zero growth (smallest slab first,
+        // smallest offset on ties); otherwise pick the slab with minimum
+        // growth within its ceiling.
         let mut best: Option<(usize, usize, usize, usize)> = None; // (growth, new_size, offset, slab_idx)
         for (si, slab) in slabs.iter().enumerate() {
-            let Some((offset, new_size)) = find_slab_offset(slab, start, end, need, aligned_size)
+            let Some((offset, new_size)) =
+                find_slab_offset(slab, start, end, need, aligned_size, &mut busy)
             else {
                 continue;
             };
@@ -452,7 +537,7 @@ pub fn plan_buffer_aliasing(
                 let slab = &mut slabs[si];
                 slab.size = new_size;
                 sizes[slab.phys] = new_size;
-                slab.tenants.push(SlabTenant {
+                slab.insert(SlabTenant {
                     start,
                     end,
                     offset,
@@ -465,16 +550,16 @@ pub fn plan_buffer_aliasing(
                 let phys = sizes.len();
                 sizes.push(need);
                 device_local.push(true);
-                slabs.push(IntermediateSlab {
+                slabs.push(IntermediateSlab::new(
                     phys,
-                    size: need,
-                    tenants: vec![SlabTenant {
+                    need,
+                    SlabTenant {
                         start,
                         end,
                         offset: 0,
                         aligned_size,
-                    }],
-                });
+                    },
+                ));
                 map[i] = phys;
                 offsets[i] = 0;
             }
@@ -994,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn same_group_buffers_never_share() {
+    fn same_group_buffers_never_overlap() {
         // Two independent branches in one barrier group run concurrently;
         // their byte ranges must not overlap even though they may share a slab.
         let mut p = plan(
@@ -1078,6 +1163,62 @@ mod tests {
             "disjoint oversized buffers still alias"
         );
         assert_eq!(alias.sizes[alias.map[3]], m160);
+    }
+
+    #[test]
+    fn dead_oversized_slab_reused_by_normal_intermediates() {
+        // A 160 MiB logits intermediate dies at group 1; two concurrent 40 MiB
+        // backward intermediates at group 2 reuse the dead oversized slab with
+        // zero additional device-local memory.
+        let m160 = 160 << 20;
+        let m40 = 40 << 20;
+        let mut p = plan(
+            vec![16, m160, m40, m40, 16, 16],
+            vec![
+                dispatch(&[0], 1),    // group 0: write 160 MiB
+                dispatch(&[1], 4),    // group 1: consume 160 MiB -> out 4
+                dispatch(&[0], 2),    // group 2: write 40 MiB #1
+                dispatch(&[0], 3),    // group 2: write 40 MiB #2
+                dispatch(&[2, 3], 5), // group 3: consume both -> out 5
+            ],
+        );
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.extend([BufferRef(4), BufferRef(5)]);
+        let groups = vec![0..1, 1..2, 2..4, 4..5];
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+
+        check_disjoint(&p, &groups, &alias);
+        assert_eq!(alias.map[1], alias.map[2]);
+        assert_eq!(alias.map[1], alias.map[3]);
+        assert!(!alias.overlap(&p.buffers, 2, 3));
+        assert_eq!(
+            alias.device_local_bytes(),
+            m160,
+            "normal intermediates should reuse the idle oversized slab with zero growth"
+        );
+    }
+
+    #[test]
+    fn slab_block_splitting_preserves_disjointness_on_long_chains() {
+        // 600 sequential intermediates force multiple TenantBlock splits
+        // (BLOCK_CAP = 256) and still reuse a single slab cleanly.
+        let steps = 600usize;
+        let mut buffers = vec![16usize]; // 0 = input
+        let mut dispatches = Vec::with_capacity(steps + 1);
+        for s in 0..steps {
+            buffers.push(4096 + (s % 7) * 512);
+            dispatches.push(dispatch(&[s as u32], (s + 1) as u32));
+        }
+        buffers.push(16); // final output
+        dispatches.push(dispatch(&[steps as u32], (steps + 1) as u32));
+        let mut p = plan(buffers, dispatches);
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.push(BufferRef((steps + 1) as u32));
+        let groups: Vec<Range<usize>> = (0..=steps).map(|i| i..i + 1).collect();
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+        check_disjoint(&p, &groups, &alias);
+        // At most two intermediates live simultaneously, so slab stays tiny.
+        assert!(alias.device_local_bytes() <= 32 * 1024);
     }
 
     #[test]
