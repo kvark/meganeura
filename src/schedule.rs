@@ -740,16 +740,17 @@ pub struct ReductionKernel {
 }
 
 /// Maximum number of input streams supported by a fused [`PointwiseDAG`].
-/// Matches the 8-bit [`PointwiseStorage::bf16_inputs`] mask and keeps total
-/// storage bindings well within portable Vulkan/Metal descriptor limits.
-pub const MAX_POINTWISE_INPUTS: u8 = 8;
+/// Capped at 7 inputs + 1 output = 8 storage buffers so fused kernels fit
+/// devices exposing an 8-storage-buffer-per-stage limit (and stay within the
+/// 8-bit [`PointwiseStorage::bf16_inputs`] mask).
+pub const MAX_POINTWISE_INPUTS: u8 = 7;
 
 /// Static binding names for `n` pointwise (or per-element reduction) input
 /// streams. Preserves `src` / `src_a`..`src_c` for `n <= 3` and extends to
-/// `src_h` for wider fused DAGs.
+/// `src_g` for wider fused DAGs.
 pub(crate) fn pointwise_input_binding_names(n: u8) -> Vec<&'static str> {
     const NAMES: [&str; MAX_POINTWISE_INPUTS as usize] = [
-        "src_a", "src_b", "src_c", "src_d", "src_e", "src_f", "src_g", "src_h",
+        "src_a", "src_b", "src_c", "src_d", "src_e", "src_f", "src_g",
     ];
     match n {
         1 => vec!["src"],
@@ -1364,7 +1365,12 @@ fn lower_reduction(
                     let _ = writeln!(src, "    let wave_val_{k} = subgroupMax(acc_{k});");
                     let _ = writeln!(
                         src,
-                        "    let wave_idx_{k} = subgroupMin(select(0xffffffffu, index_{k}, index_{k} != 0xffffffffu && acc_{k} == wave_val_{k}));"
+                        "    let wave_match_{k} = subgroupMin(select(0xffffffffu, index_{k}, index_{k} != 0xffffffffu && acc_{k} == wave_val_{k}));"
+                    );
+                    let _ = writeln!(src, "    let wave_first_{k} = subgroupMin(index_{k});");
+                    let _ = writeln!(
+                        src,
+                        "    let wave_idx_{k} = select(wave_match_{k}, wave_first_{k}, wave_match_{k} == 0xffffffffu);"
                     );
                 }
             }

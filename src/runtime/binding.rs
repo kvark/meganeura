@@ -166,10 +166,25 @@ impl Session {
                 _pad1: 0,
                 _pad2: 0,
             };
-            let mut buffers: Vec<blade_graphics::BufferPiece> =
-                dispatch.input_buffers.iter().map(|&r| buf(r)).collect();
-            buffers.push(buf(dispatch.output_buffer));
-            pc.bind(0, &DynPointwiseData { buffers, params });
+            let dst = buf(dispatch.output_buffer);
+            let n = dispatch.input_buffers.len();
+            assert!(
+                n <= crate::schedule::MAX_POINTWISE_INPUTS as usize,
+                "pointwise arity {n} exceeds MAX_POINTWISE_INPUTS"
+            );
+            let mut buffers = [dst; crate::schedule::MAX_POINTWISE_INPUTS as usize + 1];
+            for (slot, &r) in dispatch.input_buffers.iter().enumerate() {
+                buffers[slot] = buf(r);
+            }
+            buffers[n] = dst;
+            pc.bind(
+                0,
+                &DynPointwiseData {
+                    buffers,
+                    count: n + 1,
+                    params,
+                },
+            );
             return;
         }
         // Prologue-fused coop matmul: 2-factor prologue (RmsNorm rsqrt + w_norm).

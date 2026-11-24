@@ -2653,11 +2653,16 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
-            let use_subgroups = caps.subgroup_size > 0
+            // Keep plain RmsNorm on the scalar tree path so debug sessions and
+            // `fuse_rmsnorm_into_add` (`rms_norm.wgsl`) preserve identical
+            // floating-point reduction order.
+            let plain_rmsnorm = crate::compile::is_plain_rmsnorm(dispatch);
+            let use_subgroups = !plain_rmsnorm
+                && caps.subgroup_size > 0
                 && kernel.rows_per_workgroup == 1
                 && kernel.workgroup_size > 1;
             let inner = dispatch.params.get(1).copied().unwrap_or(0);
-            let vec4 = kernel.can_vectorize(dispatch.pointwise_storage, inner);
+            let vec4 = !plain_rmsnorm && kernel.can_vectorize(dispatch.pointwise_storage, inner);
             if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
                 return Variant::Reduction(kernel.hash_key(), use_subgroups, vec4);
             }
@@ -2931,8 +2936,27 @@ type HorizMatMulData = BufferListData<MatMulParams>;
 /// Gather-reduction bindings: one buffer per gathered stream, then `params`.
 type DynReductionData = BufferListData<ReductionParams>;
 
-/// Dynamic pointwise bindings: one buffer per DAG input stream, `dst`, then `params`.
-type DynPointwiseData = BufferListData<UnaryParams>;
+/// Stack-backed dynamic pointwise bindings: `1..=MAX_POINTWISE_INPUTS` inputs,
+/// `dst`, then `params`. Avoids per-dispatch heap allocation while keeping one
+/// general layout for every fused pointwise arity.
+struct DynPointwiseData {
+    buffers: [blade_graphics::BufferPiece; crate::schedule::MAX_POINTWISE_INPUTS as usize + 1],
+    count: usize,
+    params: UnaryParams,
+}
+
+impl blade_graphics::ShaderData for DynPointwiseData {
+    fn layout() -> blade_graphics::ShaderDataLayout {
+        blade_graphics::ShaderDataLayout::default()
+    }
+    fn fill(&self, mut context: blade_graphics::PipelineContext) {
+        use blade_graphics::ShaderBindable;
+        for (index, b) in self.buffers[..self.count].iter().enumerate() {
+            b.bind_to(&mut context, index as u32);
+        }
+        self.params.bind_to(&mut context, self.count as u32);
+    }
+}
 
 /// ShaderDataLayout for a schedule-template reduction pipeline, chosen
 /// by (n_per_elem, n_per_row, n_per_col), or built from
