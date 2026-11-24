@@ -1,7 +1,7 @@
 // MaxPool2d backward in two passes of one shader, `_pad0` selecting the pass.
 // Pass 0 writes the winner of each output window, its first maximum in
 // row-major (kh, kw) order as in PyTorch (ties go to the earlier element),
-// as an f32 in-plane index (planes stay under 2^24 elements). Pass 1 sums,
+// as a u32 in-plane index. Pass 1 sums,
 // for each input element, the gradients of the windows it won. No atomics,
 // and the result is deterministic.
 //
@@ -25,8 +25,8 @@ struct Params {
 }
 
 var<storage> grad_out: array<f32>;
-var<storage> src: array<f32>;
-var<storage, read_write> dst: array<f32>;
+var<storage> src: array<u32>;
+var<storage, read_write> dst: array<u32>;
 var<uniform> params: Params;
 
 // Flat in-plane index of the winner of output window (oh, ow).
@@ -40,7 +40,7 @@ fn window_winner(plane_in: u32, oh: u32, ow: u32) -> u32 {
             let iw = ow * params.stride + kw - params.padding;
             if iw >= params.in_w { continue; }
             let at = ih * params.in_w + iw;
-            let value = src[plane_in + at];
+            let value = bitcast<f32>(src[plane_in + at]);
             if winner == 0xffffffffu || value > best {
                 best = value;
                 winner = at;
@@ -69,7 +69,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let plane = idx / out_len;
         let o = idx - plane * out_len;
         let oh = o / params.out_w;
-        dst[idx] = f32(window_winner(plane * plane_len, oh, o - oh * params.out_w));
+        dst[idx] = window_winner(plane * plane_len, oh, o - oh * params.out_w);
         return;
     }
     if idx >= planes * plane_len { return; }
@@ -80,15 +80,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let plane_out = plane * out_len;
     let rows = covering(ih, params.kernel_h, params.out_h);
     let cols = covering(iw, params.kernel_w, params.out_w);
-    let mine = f32(at);
     var acc = 0.0;
     for (var oh = rows.x; oh <= rows.y; oh++) {
         for (var ow = cols.x; ow <= cols.y; ow++) {
             let o = plane_out + oh * params.out_w + ow;
-            if src[o] == mine {
+            if src[o] == at {
                 acc += grad_out[o];
             }
         }
     }
-    dst[idx] = acc;
+    dst[idx] = bitcast<u32>(acc);
 }

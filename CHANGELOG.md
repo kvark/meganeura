@@ -7,9 +7,7 @@
 - `Graph::gelu_erf` builds `Op::GeluErf`, a composite that lowers to one
   pointwise kernel and differentiates from its input alone. Reductions, norm
   gradients and the max-pool gradient size their launches to occupy the
-  device, LayerNorm sums with subgroups where the device has them, and a
-  dense sum with an atomic scatter (a tied embedding's gradient) scatters onto
-  the dense result in place.
+  device. LayerNorm sums with subgroups where the device has them.
 
 - Measured construction automatically considers device-qualified BF16 and rectangular F16
   multiplication for eligible dense products and forward convolutions under

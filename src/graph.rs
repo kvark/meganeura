@@ -3525,8 +3525,7 @@ impl Graph {
 
     /// Exact GELU, `x · (1 + erf(x/√2)) / 2` (PyTorch's default).
     pub fn gelu_erf(&mut self, x: NodeId) -> NodeId {
-        let ty = self.node(x).ty.clone();
-        self.add_node(Op::GeluErf, vec![x], ty)
+        self.f32_unary(Op::GeluErf, x, "gelu_erf")
     }
 
     #[track_caller]

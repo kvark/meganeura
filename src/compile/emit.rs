@@ -3322,12 +3322,7 @@ impl<'a> Compiler<'a> {
                 let batch = total / (channels * in_h * in_w);
                 let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
-                // Pass 0 finds each window's winner, as an exact f32 index;
-                // pass 1 sums each input's won gradients.
-                assert!(
-                    in_h * in_w < 1 << 24,
-                    "max-pool planes index exactly in f32"
-                );
+                // Store each winning index as a u32 for the gather pass.
                 let windows = batch * channels * out_h * out_w;
                 let winners = self.alloc_buffer(windows as usize * 4);
                 for (pass, workgroups, inputs, output) in [

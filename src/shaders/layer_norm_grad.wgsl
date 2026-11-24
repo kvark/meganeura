@@ -117,9 +117,8 @@ fn layer_norm_grad_wb(
 //
 // One 64-lane workgroup per row: rows here are a few hundred elements, so
 // 256 lanes held one or two each and spent the kernel in four eight-level
-// trees. Paired sums now share two six-level trees: (x, dy·w), then
-// ((x - mean)², dy·w·(x - mean)), whose second component times rstd is
-// the normed dot product.
+// trees. Compute the variance before the derivative dot product so the
+// centered values are normalized before multiplication by dy.
 //
 // Dispatch: [rows, 1, 1], workgroup_size(64)
 const X_LANES: u32 = 64u;
@@ -162,17 +161,24 @@ fn layer_norm_grad_x(
     let mean = sums.x * inv_n;
     let dot_dy_w = sums.y;
 
-    var second = vec2<f32>(0.0);
+    var variance = 0.0;
     j = tid;
     loop {
         if j >= cols { break; }
         let diff = src_b[offset + j] - mean;
-        second += vec2<f32>(diff * diff, src_a[offset + j] * bias[j] * diff);
+        variance += diff * diff;
         j += X_LANES;
     }
-    let centered = pair_sum(tid, second);
-    let rstd = inverseSqrt(centered.x * inv_n + eps);
-    let dot_dy_w_norm = centered.y * rstd;
+    let rstd = inverseSqrt(pair_sum(tid, vec2<f32>(variance, 0.0)).x * inv_n + eps);
+    var dot = 0.0;
+    j = tid;
+    loop {
+        if j >= cols { break; }
+        let normed = (src_b[offset + j] - mean) * rstd;
+        dot += src_a[offset + j] * bias[j] * normed;
+        j += X_LANES;
+    }
+    let dot_dy_w_norm = pair_sum(tid, vec2<f32>(dot, 0.0)).x;
 
     j = tid;
     loop {

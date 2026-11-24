@@ -1715,7 +1715,6 @@ impl ExecutionPlan {
             fuse_winograd_add(&mut self);
             fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
-            fuse_scatter_into_sum(&mut self);
             bf16::fuse_boundaries(&mut self);
         }
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
@@ -2973,101 +2972,6 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     }
 }
 
-/// `X + ScatterAdd(indices, src)` where the scatter zero-fills a whole
-/// buffer only to be summed with X, as a tied embedding's gradient is: let
-/// X's writer write the sum's buffer and scatter the rows onto it. The zero
-/// fill and the full-size Add, three passes over the table, disappear.
-fn fuse_scatter_into_sum(plan: &mut ExecutionPlan) {
-    use std::collections::{HashMap, HashSet};
-    let protected: HashSet<BufferRef> = plan.externally_visible_buffers();
-    let add = pointwise(2, [Pw::Add(0, 1)]);
-    loop {
-        let mut writers = HashMap::<BufferRef, Vec<usize>>::new();
-        let mut reads = HashMap::<BufferRef, usize>::new();
-        for (index, dispatch) in plan.dispatches.iter().enumerate() {
-            writers
-                .entry(dispatch.output_buffer)
-                .or_default()
-                .push(index);
-            for &buffer in dispatch.extra_outputs.iter() {
-                writers.entry(buffer).or_default().push(index);
-            }
-            for &buffer in &dispatch.input_buffers {
-                *reads.entry(buffer).or_default() += 1;
-            }
-        }
-        let mut candidate = None;
-        'adds: for (ai, a) in plan.dispatches.iter().enumerate() {
-            if a.pointwise() != Some(&add)
-                || a.input_buffers.len() != 2
-                || a.fusion_barrier
-                || a.pointwise_storage != crate::schedule::PointwiseStorage::default()
-                || !a.extra_outputs.is_empty()
-            {
-                continue;
-            }
-            let out = a.output_buffer;
-            // Nothing before the Add may touch its output.
-            if plan.dispatches[..ai].iter().any(|d| {
-                d.output_buffer == out
-                    || d.input_buffers.contains(&out)
-                    || d.extra_outputs.contains(&out)
-            }) {
-                continue;
-            }
-            for side in 0..2 {
-                let (scattered, dense) = (a.input_buffers[side], a.input_buffers[1 - side]);
-                if scattered == dense
-                    || protected.contains(&scattered)
-                    || protected.contains(&dense)
-                {
-                    continue;
-                }
-                let (Some(sw), Some(dw)) = (writers.get(&scattered), writers.get(&dense)) else {
-                    continue;
-                };
-                let &[zi, si] = sw.as_slice() else { continue };
-                let &[xi] = dw.as_slice() else { continue };
-                let (zero, scatter) = (&plan.dispatches[zi], &plan.dispatches[si]);
-                if !zero.is_zero_fill()
-                    || scatter.shader != ShaderEntry::ScatterAddAtomic
-                    || scatter.input_buffers.last() != Some(&scattered)
-                    || !(zi < si && si < ai && xi < ai)
-                    || reads.get(&scattered).copied() != Some(2)
-                    || reads.get(&dense).copied() != Some(1)
-                    || scatter.params.first() != a.params.first()
-                    || zero.params.first() != a.params.first()
-                    || plan.dispatches[xi].fusion_barrier
-                {
-                    continue;
-                }
-                candidate = Some((ai, zi, si, xi, scattered));
-                break 'adds;
-            }
-        }
-        let Some((ai, zi, si, xi, scattered)) = candidate else {
-            break;
-        };
-        let add = plan.dispatches[ai].clone();
-        let out = add.output_buffer;
-        plan.dispatches[xi].output_buffer = out;
-        let mut scatter = plan.dispatches[si].clone();
-        for buffer in scatter.input_buffers.iter_mut() {
-            if *buffer == scattered {
-                *buffer = out;
-            }
-        }
-        scatter.output_buffer = out;
-        scatter.requires_full_precision |= add.requires_full_precision;
-        scatter.is_derivative |= add.is_derivative;
-        scatter.origin.extend_from_slice(&add.origin);
-        plan.dispatches[ai] = scatter;
-        let (low, high) = (zi.min(si), zi.max(si));
-        plan.dispatches.remove(high);
-        plan.dispatches.remove(low);
-    }
-}
-
 /// Fuse a residual addition into the Winograd output transform. Keep the
 /// fused operation at the add's position: its other input may be produced
 /// after the transform in the original schedule.
@@ -4086,92 +3990,6 @@ mod tests {
                 .input_buffers
                 .contains(&large_plan.dispatches[1].output_buffer)
         );
-    }
-
-    #[test]
-    fn dense_sum_with_a_scatter_takes_the_rows_in_place() {
-        const SEQ: usize = 256;
-        const VOCAB: usize = 4097;
-        let mut graph = Graph::new();
-        let indices = graph.input_u32("indices", &[SEQ]);
-        let src = graph.input("src", &[SEQ, 8]);
-        let a = graph.input("a", &[16, VOCAB]);
-        let b = graph.input("b", &[16, 8]);
-        let dense = graph.matmul_at(a, b);
-        let rows = graph.scatter_add(indices, src, VOCAB);
-        let sum = graph.add(dense, rows);
-        graph.set_outputs(vec![sum]);
-        let plan = compile(&graph);
-        assert!(!plan.dispatches.iter().any(|d| d.is_zero_fill()));
-        assert!(
-            !plan
-                .dispatches
-                .iter()
-                .any(|d| d.pointwise() == Some(&pointwise(2, [Pw::Add(0, 1)])))
-        );
-        let scatter = plan.dispatches.last().unwrap();
-        assert_eq!(scatter.shader, ShaderEntry::ScatterAddAtomic);
-        assert_eq!(plan.dispatches[0].output_buffer, scatter.output_buffer);
-        assert_eq!(scatter.input_buffers.last(), Some(&scatter.output_buffer));
-        assert_eq!(plan.dispatches.len(), 2);
-    }
-
-    #[test]
-    #[ignore = "GPU: a dense sum with an atomic scatter, fused in place"]
-    fn scatter_into_dense_sum_matches_f64() {
-        use crate::reference::{self, Feeds};
-        let gpu = reference::gpu::shared_context();
-        const SEQ: usize = 256;
-        const VOCAB: usize = 4097;
-        let mut g = Graph::new();
-        let indices = g.input_u32("indices", &[SEQ]);
-        let src = g.input("src", &[SEQ, 8]);
-        let a = g.input("a", &[16, VOCAB]);
-        let b = g.input("b", &[16, 8]);
-        let dense = g.matmul_at(a, b);
-        let rows = g.scatter_add(indices, src, VOCAB);
-        let sum = g.add(dense, rows);
-        g.set_outputs(vec![sum]);
-        // Repeated indices exercise the atomic accumulation.
-        let idx: Vec<u32> = (0..SEQ as u32).map(|i| (i * 37) % 300).collect();
-        let srcs: Vec<f32> = (0..SEQ * 8).map(|i| ((i % 13) as f32 - 6.) / 8.).collect();
-        let av: Vec<f32> = (0..16 * VOCAB)
-            .map(|i| ((i % 11) as f32 - 5.) / 16.)
-            .collect();
-        let bv: Vec<f32> = (0..16 * 8).map(|i| ((i % 7) as f32 - 3.) / 4.).collect();
-        let mut feeds = Feeds::new();
-        feeds.set_u32("indices", &idx);
-        feeds.set("src", &srcs);
-        feeds.set("a", &av);
-        feeds.set("b", &bv);
-        let values = reference::evaluate(&g, &feeds).unwrap();
-        let want = &values[sum as usize];
-        let plan = compile(&g);
-        assert_eq!(plan.dispatches.len(), 2, "the pass applies");
-        let mut session = crate::runtime::Session::with_context_opts(
-            plan,
-            gpu.clone(),
-            crate::runtime::SessionOptions {
-                poison: true,
-                ..Default::default()
-            },
-        );
-        session.set_input_u32("indices", &idx);
-        session.set_input("src", &srcs);
-        session.set_input("a", &av);
-        session.set_input("b", &bv);
-        for _ in 0..2 {
-            session.step();
-            session.wait();
-            let mut got = vec![0.; want.data.len()];
-            session.read_output_by_index(0, &mut got);
-            let worst = got
-                .iter()
-                .zip(&want.data)
-                .map(|(&g, &w)| (f64::from(g) - w).abs())
-                .fold(0.0, f64::max);
-            assert!(worst < 1e-4, "largest error {worst}");
-        }
     }
 
     #[test]
