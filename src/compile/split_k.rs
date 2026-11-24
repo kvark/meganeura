@@ -431,7 +431,10 @@ impl ExecutionPlan {
                 .checked_mul(class.n)
                 .ok_or(TuneError("split-K output index overflow"))?;
             // Every accepted selection keeps the total within the cap.
-            let bytes = partial_bytes(columns, splits, false, max_partial_bytes - total_bytes)?;
+            // A few partials sum one thread a column: eight row lanes would
+            // mostly idle (three chunks took 12.3 µs on 147k columns).
+            let serial = splits <= 16;
+            let bytes = partial_bytes(columns, splits, serial, max_partial_bytes - total_bytes)?;
             total_bytes += bytes;
             let buffer_index = self
                 .buffers
@@ -464,7 +467,7 @@ impl ExecutionPlan {
             producer.output_buffer = partial;
             producer.label = format!("{} split-K partials ({splits})", dispatch.label);
             let reduction =
-                dispatch.partial_sum(partial, dispatch.output_buffer, columns, splits, false);
+                dispatch.partial_sum(partial, dispatch.output_buffer, columns, splits, serial);
             replacements.push((index, bytes, producer, reduction));
         }
         self.buffers.extend(replacements.iter().map(|r| r.1));
@@ -1043,9 +1046,17 @@ mod tests {
 
     #[test]
     fn partial_indices_and_final_reduction_geometry_are_bounded() {
+        // Eight row lanes per 32 columns past 16 partials, one thread a
+        // column (256 to a workgroup) up to 16.
         for (channels, width, splits, error) in [
             (
                 2048,
+                1024,
+                17,
+                "split-K final reduction exceeds portable dispatch limits",
+            ),
+            (
+                4100,
                 32,
                 2,
                 "split-K final reduction exceeds portable dispatch limits",

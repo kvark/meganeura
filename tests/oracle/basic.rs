@@ -242,6 +242,7 @@ fn unary_ops() {
                     g.exp(x),
                     g.silu(x),
                     g.gelu(x),
+                    g.gelu_erf(x),
                     g.clamp(x, -0.25, 0.5),
                     g.scale(x, -1.75),
                 ]
@@ -265,6 +266,7 @@ fn unary_ops_over_a_wide_range() {
                 g.tanh(x),
                 g.silu(x),
                 g.gelu(x),
+                g.gelu_erf(x),
                 g.softplus(x, 1.0),
                 g.softplus(x, 3.5),
                 g.softplus(x, 0.2),

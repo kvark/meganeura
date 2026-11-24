@@ -180,8 +180,11 @@ impl<'a> Compiler<'a> {
         if trip <= 64 || groups >= 128 {
             return 1;
         }
-        let want = 128u32.div_ceil(groups);
-        let cap = trip.div_ceil(32).clamp(2, 256);
+        // About 256 workgroups, each slice at least 8 rows a lane. Whisper's
+        // bias gradients (1500 × 384) took 7.0 µs on 6 slices of 32 rows a
+        // lane, 4.8 on 22 (RTX 5070, profiled); 12544 × 64 6.9 → 5.1.
+        let want = 256u32.div_ceil(groups);
+        let cap = trip.div_ceil(8).clamp(2, 256);
         want.clamp(2, cap)
     }
 
@@ -445,7 +448,15 @@ impl<'a> Compiler<'a> {
         inner: u32,
     ) {
         const WORKGROUP_SIZE: u32 = 256;
-        let rows_per_workgroup = if inner <= 32 { WORKGROUP_SIZE } else { 1 };
+        // About 16 elements a lane: wider rows keep a whole workgroup, and
+        // short ones share it. ResNet-50's BatchNorm sums over a 7×7 stage
+        // (8192 rows of 49) took 29.6 µs on one row a workgroup and 4.7 on
+        // 64; 4096 rows of 196 17.2 → 4.9 (RTX 5070, profiled).
+        let rows_per_workgroup = if inner <= 32 {
+            WORKGROUP_SIZE
+        } else {
+            WORKGROUP_SIZE / inner.div_ceil(16).next_power_of_two().min(WORKGROUP_SIZE)
+        };
         self.emit_inner_reduction(op, input, output, rows, inner, rows_per_workgroup);
     }
 
@@ -3311,19 +3322,26 @@ impl<'a> Compiler<'a> {
                 let batch = total / (channels * in_h * in_w);
                 let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MaxPool2dGrad,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_out, input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding, out_h,
-                        out_w, 0, 0,
-                    ],
-
-                    ..Default::default()
-                });
+                // Store each winning index as a u32 for the gather pass.
+                let windows = batch * channels * out_h * out_w;
+                let winners = self.alloc_buffer(windows as usize * 4);
+                for (pass, workgroups, inputs, output) in [
+                    (0, windows.div_ceil(256), vec![grad_out, input], winners),
+                    (1, total.div_ceil(256), vec![grad_out, winners], out_buf),
+                ] {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::MaxPool2dGrad,
+                        workgroups: [workgroups, 1, 1],
+                        input_buffers: inputs,
+                        output_buffer: output,
+                        extra_outputs: vec![],
+                        params: vec![
+                            batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding,
+                            out_h, out_w, pass, 0,
+                        ],
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::GlobalAvgPool { channels, spatial } if spatial > 32 => {
@@ -3404,6 +3422,10 @@ impl<'a> Compiler<'a> {
 
             Op::Gelu => {
                 self.emit_pointwise(pointwise(1, gelu_ops(0, 1)), node, out_buf);
+            }
+
+            Op::GeluErf => {
+                self.emit_pointwise(pointwise(1, gelu_erf_ops(0, 1)), node, out_buf);
             }
 
             Op::LayerNorm { eps } => {

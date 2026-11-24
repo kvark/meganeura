@@ -326,6 +326,7 @@ pub fn eval_node(
         | Op::Silu
         | Op::SiluGrad
         | Op::Gelu
+        | Op::GeluErf
         | Op::SwiGLU
         | Op::SwiGLUConcat
         | Op::SwiGLUConcatGrad

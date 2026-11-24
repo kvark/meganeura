@@ -262,6 +262,15 @@ fn elementwise_and_norms() {
             |_| {},
         ),
         case(
+            "gelu_erf",
+            true,
+            |g| {
+                let x = g.parameter("x", &[6, 10]);
+                g.gelu_erf(x)
+            },
+            |_| {},
+        ),
+        case(
             "softplus",
             true,
             |g| {
@@ -753,6 +762,7 @@ fn every_composite_is_covered() {
         ("Softplus", "softplus"),
         ("Silu", "silu"),
         ("Gelu", "gelu"),
+        ("GeluErf", "gelu_erf"),
         ("SwiGLU", "swiglu"),
         ("GeGLU", "geglu"),
         ("MeanAll", "mean_all"),

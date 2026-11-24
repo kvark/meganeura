@@ -1,7 +1,7 @@
 // LayerNorm gradient shaders (parallel).
 // Two entry points:
 //   layer_norm_grad_wb: gradient wrt weight and bias — row-parallel
-//   layer_norm_grad_x: gradient wrt input — 256-thread per row
+//   layer_norm_grad_x: gradient wrt input — one 64-lane workgroup per row
 // Params: m=rows, n=cols, k=eps_bits
 
 struct Params {
@@ -115,8 +115,28 @@ fn layer_norm_grad_wb(
 // grad_x[i,j] = rstd * (dy[i,j]*w[j] - normed[i,j]*s_i - mean(dy*w)/cols)
 // where s_i = sum_j(dy[i,j]*w[j]*normed[i,j]) / cols
 //
-// Dispatch: [rows, 1, 1], workgroup_size(256)
-@compute @workgroup_size(256)
+// One 64-lane workgroup per row: rows here are a few hundred elements, so
+// 256 lanes held one or two each and spent the kernel in four eight-level
+// trees. Compute the variance before the derivative dot product so the
+// centered values are normalized before multiplication by dy.
+//
+// Dispatch: [rows, 1, 1], workgroup_size(64)
+const X_LANES: u32 = 64u;
+var<workgroup> pair_data: array<vec2<f32>, 64>;
+
+fn pair_sum(tid: u32, value: vec2<f32>) -> vec2<f32> {
+    pair_data[tid] = value;
+    workgroupBarrier();
+    for (var stride = X_LANES / 2u; stride > 0u; stride >>= 1u) {
+        if tid < stride { pair_data[tid] += pair_data[tid + stride]; }
+        workgroupBarrier();
+    }
+    let total = pair_data[0];
+    workgroupBarrier();
+    return total;
+}
+
+@compute @workgroup_size(64)
 fn layer_norm_grad_x(
     @builtin(workgroup_id) wgid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -127,82 +147,45 @@ fn layer_norm_grad_x(
     let cols = params.n;
     let eps = bitcast<f32>(params.k);
     if row >= rows { return; }
-
     let offset = row * cols;
+    let inv_n = 1.0 / f32(cols);
 
-    // Phase 1: Cooperative mean
-    var s = 0.0;
+    var first = vec2<f32>(0.0);
     var j = tid;
     loop {
         if j >= cols { break; }
-        s += src_b[offset + j];
-        j += 256u;
+        first += vec2<f32>(src_b[offset + j], src_a[offset + j] * bias[j]);
+        j += X_LANES;
     }
-    wg_data[tid] = s;
-    workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride { wg_data[tid] += wg_data[tid + stride]; }
-        workgroupBarrier();
-    }
-    let mean = wg_data[0] / f32(cols);
-    workgroupBarrier();
+    let sums = pair_sum(tid, first);
+    let mean = sums.x * inv_n;
+    let dot_dy_w = sums.y;
 
-    // Phase 2: Cooperative variance
-    var v = 0.0;
+    var variance = 0.0;
     j = tid;
     loop {
         if j >= cols { break; }
         let diff = src_b[offset + j] - mean;
-        v += diff * diff;
-        j += 256u;
+        variance += diff * diff;
+        j += X_LANES;
     }
-    wg_data[tid] = v;
-    workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride { wg_data[tid] += wg_data[tid + stride]; }
-        workgroupBarrier();
-    }
-    let rstd = inverseSqrt(wg_data[0] / f32(cols) + eps);
-    workgroupBarrier();
-
-    // Phase 3: Cooperative dot products (dot_dy_w and dot_dy_w_norm)
-    var d1 = 0.0;
-    var d2 = 0.0;
+    let rstd = inverseSqrt(pair_sum(tid, vec2<f32>(variance, 0.0)).x * inv_n + eps);
+    var dot = 0.0;
     j = tid;
     loop {
         if j >= cols { break; }
-        let dy_w = src_a[offset + j] * bias[j];
         let normed = (src_b[offset + j] - mean) * rstd;
-        d1 += dy_w;
-        d2 += dy_w * normed;
-        j += 256u;
+        dot += src_a[offset + j] * bias[j] * normed;
+        j += X_LANES;
     }
-    // Reduce d1 and d2 together
-    wg_data[tid] = d1;
-    workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride { wg_data[tid] += wg_data[tid + stride]; }
-        workgroupBarrier();
-    }
-    let dot_dy_w = wg_data[0];
-    workgroupBarrier();
+    let dot_dy_w_norm = pair_sum(tid, vec2<f32>(dot, 0.0)).x;
 
-    wg_data[tid] = d2;
-    workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride { wg_data[tid] += wg_data[tid + stride]; }
-        workgroupBarrier();
-    }
-    let dot_dy_w_norm = wg_data[0];
-
-    // Phase 4: Write grad_x
-    let inv_n = 1.0 / f32(cols);
     j = tid;
     loop {
         if j >= cols { break; }
         let normed = (src_b[offset + j] - mean) * rstd;
         let dy_w = src_a[offset + j] * bias[j];
         dst[offset + j] = rstd * (dy_w - inv_n * dot_dy_w - normed * inv_n * dot_dy_w_norm);
-        j += 256u;
+        j += X_LANES;
     }
 }

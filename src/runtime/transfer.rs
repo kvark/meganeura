@@ -827,6 +827,9 @@ impl Session {
     }
 
     fn dispatch_output_dtype(d: &crate::compile::Dispatch) -> crate::DType {
+        if d.shader == crate::compile::ShaderEntry::MaxPool2dGrad && d.params.get(10) == Some(&0) {
+            return crate::DType::U32;
+        }
         if d.pointwise_storage.f16_output {
             return crate::DType::F16;
         }
@@ -906,12 +909,15 @@ impl Session {
         self.wait();
         let mut report = DebugStepReport::default();
         for (i, d) in self.plan.dispatches.iter().enumerate() {
+            let dtype = Self::dispatch_output_dtype(d);
+            if dtype == crate::DType::U32 {
+                continue;
+            }
             if !self.debug && !self.buffer_unaliased(d.output_buffer) {
                 report.skipped_aliased += 1;
                 continue;
             }
-            let data =
-                self.read_dispatch_output(d.output_buffer, Self::dispatch_output_dtype(d), 65536);
+            let data = self.read_dispatch_output(d.output_buffer, dtype, 65536);
             let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let has_nan = data.iter().any(|v| v.is_nan());
             let has_inf = data.iter().any(|v| v.is_infinite());
@@ -940,8 +946,11 @@ impl Session {
     /// instability first appears in the forward/backward chain.
     pub fn trace_dispatches(&self, threshold: f32) {
         for (i, d) in self.plan.dispatches.iter().enumerate() {
-            let data =
-                self.read_dispatch_output(d.output_buffer, Self::dispatch_output_dtype(d), 65536);
+            let dtype = Self::dispatch_output_dtype(d);
+            if dtype == crate::DType::U32 {
+                continue;
+            }
+            let data = self.read_dispatch_output(d.output_buffer, dtype, 65536);
             let n = data.len();
             let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let has_nan = data.iter().any(|v| v.is_nan());

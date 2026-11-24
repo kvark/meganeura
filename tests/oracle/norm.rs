@@ -10,7 +10,7 @@
 //!   kernel with row blocks of 1, 2, 4 and 32 plus SumRows.
 //! * RmsNormGradX: packed rows (`cols` in 2..=32) and 256-lane rows.
 //! * LayerNormGradWB: one block written directly (`rows = 1`), blocks of 1,
-//!   2, 4 and 32 rows plus SumRows. LayerNormGradX: 256-lane rows.
+//!   2, 4 and 32 rows plus SumRows. LayerNormGradX: 64-lane rows.
 //! * RoPE: static offset, dynamic offset, dynamic offset with frequency
 //!   factors, explicit positions; RoPEGrad.
 //! * Pairwise ops: the generated reductions and `pairwise_grad.wgsl` modes.
@@ -182,8 +182,7 @@ fn norm_grad_graph(rows: usize, cols: usize, ops: [NormGrad; 2]) -> Graph {
     g
 }
 
-/// Row counts reaching every weight-gradient block size:
-/// `clamp(rows / 1024, 1, 32)` rounded down to a power of two.
+/// Row counts covering short rows and folded weight-gradient blocks.
 const WEIGHT_GRAD_ROWS: &[usize] = &[1, 2, 3, 4, 37, 2050, 4100, 33_000];
 
 #[test]
@@ -212,6 +211,22 @@ fn norm_grad_weights() {
         }
     }
     sweep.finish();
+}
+
+#[test]
+fn layer_norm_grad_normalizes_before_multiplying() {
+    let mut g = Graph::new();
+    let dy = g.input("dy", &[1, 4]);
+    let x = g.input("x", &[1, 4]);
+    let w = g.parameter("w", &[4]);
+    let dx = g.layer_norm_grad_x(dy, x, w, EPS);
+    g.set_outputs(vec![dx]);
+    let mut feeds = Feeds::new();
+    feeds.set("dy", &[1e30, 0., 0., 0.]);
+    feeds.set("x", &[1e10, -1e10, 1e10, -1e10]);
+    feeds.set("w", &[1.; 4]);
+    let report = gpu::check_inference(&g, &feeds, &options(false)).unwrap();
+    assert!(report.passed(), "{report}");
 }
 
 #[test]

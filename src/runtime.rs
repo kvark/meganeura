@@ -2064,6 +2064,11 @@ impl Pipelines {
                         gpu.capabilities().subgroup_size,
                     )
                 }
+                // Subgroup sums where the device has subgroups: two barriers
+                // a reduction where the shared-memory tree takes eight.
+                crate::codegen::ShaderGroup::LayerNorm if gpu.capabilities().subgroup_size > 0 => {
+                    crate::codegen::generate_layer_norm_subgroup()
+                }
                 _ => crate::codegen::generate_module(group, matmul_knobs),
             },
             Variant::SmallTile(_) => crate::codegen::generate_module_small(group, matmul_knobs),

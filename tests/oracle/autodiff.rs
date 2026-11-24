@@ -118,7 +118,7 @@ fn contractions() {
 #[test]
 fn elementwise() {
     type Unary = fn(&mut Graph, NodeId) -> NodeId;
-    let unary: [(&str, Unary, f32); 13] = [
+    let unary: [(&str, Unary, f32); 14] = [
         ("relu", Graph::relu, -1.0),
         ("sigmoid", Graph::sigmoid, -1.0),
         ("tanh", Graph::tanh, -1.0),
@@ -129,6 +129,7 @@ fn elementwise() {
         ("exp", Graph::exp, -1.0),
         ("silu", Graph::silu, -1.0),
         ("gelu", Graph::gelu, -1.0),
+        ("gelu_erf", Graph::gelu_erf, -1.0),
         ("softplus", |g, x| g.softplus(x, 1.5), -1.0),
         ("scale", |g, x| g.scale(x, -2.5), -1.0),
         ("materialize", Graph::materialize, -1.0),

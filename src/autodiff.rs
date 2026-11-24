@@ -864,6 +864,24 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let grad_x = graph.mul(grad_output, dgelu);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::GeluErf => {
+                // Φ(x) + x·φ(x), from x alone so the forward keeps only x,
+                // and each intermediate with one consumer so the derivative
+                // fuses into one kernel over x and the output gradient.
+                let x = node.inputs[0];
+                let scaled = graph.scale(x, std::f32::consts::FRAC_1_SQRT_2);
+                let erf = graph.erf(scaled);
+                let shifted = graph.add_scalar(erf, 1.0);
+                let cdf = graph.scale(shifted, 0.5);
+                let square = graph.mul(x, x);
+                let exponent = graph.scale(square, -0.5);
+                let density = graph.exp(exponent);
+                let density = graph.scale(density, 0.398_942_3);
+                let tail = graph.mul(x, density);
+                let slope = graph.add(cdf, tail);
+                let grad_x = graph.mul(grad_output, slope);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Scale { factor } => {
                 let grad_x = graph.scale(grad_output, factor);
                 accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);

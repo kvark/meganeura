@@ -999,14 +999,17 @@ pub fn group_norm_chunks(batch: u32, channels: u32, spatial: u32, num_groups: u3
 /// Rows each workgroup folds into one partial row of a norm weight gradient.
 ///
 /// Folding rows shrinks the `[blocks, cols]` partial buffer that SumRows
-/// reads back, at the cost of workgroups. Blocks only grow once there would
-/// still be at least 1024 workgroups, enough to occupy any current GPU, so
-/// short inputs keep one row per workgroup. The kernels split their 256
-/// lanes evenly across a block's rows, so a block is a power of two up to 32.
+/// reads back, at the cost of workgroups. Blocks grow until about 192
+/// workgroups remain (a few per SM): Whisper's 1500 × 384 LayerNorm took
+/// 19.3 µs plus two SumRows passes on one row a workgroup, 9.1 µs plus one
+/// on eight (RTX 5070, profiled); 3000 rows did best on 16, 128 on one or
+/// two. The kernels split their 256 lanes evenly across a block's rows, so
+/// a block is a power of two up to 32.
 fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
-    const MIN_WORKGROUPS: u32 = 1024;
-    let block = (rows / MIN_WORKGROUPS).clamp(1, 32);
-    1 << block.ilog2()
+    const TARGET_WORKGROUPS: u32 = 192;
+    rows.div_ceil(TARGET_WORKGROUPS)
+        .next_power_of_two()
+        .clamp(1, 32)
 }
 
 /// Order dependent dispatches, form barrier groups, then fuse within groups.
@@ -3165,6 +3168,21 @@ fn gelu_ops(x: u16, next: u16) -> [Pw; 9] {
     ]
 }
 
+/// Exact GELU as its decomposition computes it: `(x/2) · (1 + erf(x/√2))`.
+fn gelu_erf_ops(x: u16, next: u16) -> [Pw; 8] {
+    let n = next;
+    [
+        Pw::const_f32(std::f32::consts::FRAC_1_SQRT_2), // n
+        Pw::Mul(x, n),                                  // n+1 = x/√2
+        Pw::Erf(n + 1),                                 // n+2
+        Pw::const_f32(1.0),                             // n+3
+        Pw::Add(n + 2, n + 3),                          // n+4 = 1 + erf
+        Pw::const_f32(0.5),                             // n+5
+        Pw::Mul(x, n + 5),                              // n+6 = x/2
+        Pw::Mul(n + 6, n + 4),                          // n+7 = gelu(x)
+    ]
+}
+
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Conservative launch domain shared by automatic promotion and tuning.
@@ -3257,8 +3275,8 @@ mod row_reduction {
     #[test]
     fn splits_only_tall_narrow_row_reductions() {
         // 12544 x 64 is the ResNet stem bias reduction: 2 column groups.
-        assert_eq!(super::Compiler::row_reduction_splits(12544, 64), 49);
-        assert_eq!(super::Compiler::row_reduction_splits(3136, 64), 13);
+        assert_eq!(super::Compiler::row_reduction_splits(12544, 64), 128);
+        assert_eq!(super::Compiler::row_reduction_splits(3136, 64), 49);
         // Few rows, and matrices wide enough to fill the launch, stay one reduction.
         assert_eq!(super::Compiler::row_reduction_splits(32, 64), 1);
         assert_eq!(super::Compiler::row_reduction_splits(10_000, 4096), 1);
@@ -3779,7 +3797,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_inner_packs_narrow_rows_only() {
+    fn sum_inner_packs_rows_by_width() {
         let mut narrow = Graph::new();
         let input = narrow.input("input", &[100, 9]);
         let output = narrow.sum_inner(input);
@@ -3789,8 +3807,19 @@ mod tests {
         assert_eq!(narrow_dispatch.workgroups, [1, 1, 1]);
         assert_eq!(narrow_dispatch.reduction().unwrap().rows_per_workgroup, 256);
 
+        // Past 32, about 16 elements a lane: 33 takes four lanes, so 64
+        // rows share a workgroup; 4096 takes all 256.
+        let mut short = Graph::new();
+        let input = short.input("input", &[100, 33]);
+        let output = short.sum_inner(input);
+        short.set_outputs(vec![output]);
+        let short_plan = compile(&short);
+        let short_dispatch = &short_plan.dispatches[0];
+        assert_eq!(short_dispatch.workgroups, [2, 1, 1]);
+        assert_eq!(short_dispatch.reduction().unwrap().rows_per_workgroup, 64);
+
         let mut wide = Graph::new();
-        let input = wide.input("input", &[100, 33]);
+        let input = wide.input("input", &[100, 4096]);
         let output = wide.sum_inner(input);
         wide.set_outputs(vec![output]);
         let wide_plan = compile(&wide);

@@ -108,6 +108,7 @@ impl Op {
             Op::Softplus { .. }
             | Op::Silu
             | Op::Gelu
+            | Op::GeluErf
             | Op::SwiGLU
             | Op::GeGLU
             | Op::MeanAll
@@ -198,6 +199,7 @@ impl Op {
             Op::Softplus { .. }
             | Op::Silu
             | Op::Gelu
+            | Op::GeluErf
             | Op::SwiGLU
             | Op::GeGLU
             | Op::MeanAll
