@@ -77,11 +77,22 @@ impl Session {
         }
         // Schedule-template reduction dispatches bind every input stream in
         // `reduction_input_binding_names` order, followed by `dst` and `params`.
-        if dispatch.reduction().is_some() {
+        if let Some(kernel) = dispatch.reduction() {
+            // Plain RmsNorm (`arity (1, 0, 1)`) carries `eps_bits` in
+            // `dispatch.params[2]` for `fuse_rmsnorm_into_add`; keep the
+            // reduction template's `round_one_bits` slot at identity `1.0`
+            // so single-lane rows are never scaled by eps.
+            let n_per_col = kernel.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
+            let round_one_bits =
+                if kernel.n_per_elem == 1 && kernel.n_per_row == 0 && n_per_col == 1 {
+                    1.0f32.to_bits()
+                } else {
+                    dispatch.params.get(2).copied().unwrap_or(0)
+                };
             let params = ReductionParams {
                 outer: dispatch.params[0],
                 inner: dispatch.params[1],
-                round_one_bits: dispatch.params.get(2).copied().unwrap_or(0),
+                round_one_bits,
                 table_rows: dispatch.params.get(3).copied().unwrap_or(0),
             };
             match dispatch.input_buffers.as_slice() {
