@@ -355,6 +355,10 @@ pub fn build_measured_with_inputs(
         .iter()
         .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
     programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
+    programs.parallel_width = match options.tuning.calibration {
+        crate::tune::TuneCalibration::Profile(ref profile) => profile.parallel_width,
+        _ => None,
+    };
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     programs.enable_gradient_inputs(&supported);
     programs.enable_conv_gradient_inputs(&supported);
@@ -818,6 +822,7 @@ fn implementations(
         attention_subgroup_size: 0,
         defer_bf16: false,
         allow_matrix_storage: false,
+        parallel_width: None,
         matrix_shapes: collections::HashMap::new(),
     }
 }
@@ -837,6 +842,7 @@ struct Implementations {
     attention_subgroup_size: u32,
     defer_bf16: bool,
     allow_matrix_storage: bool,
+    parallel_width: Option<u32>,
     matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
 
@@ -872,21 +878,30 @@ impl Implementations {
     fn enable_conv_gradient_inputs(&mut self, inputs: &[crate::DType]) {
         let ordinary = self.choices.clone();
         for multiply in [crate::DType::BF16, crate::DType::F16] {
+            let Some(&(shape, subgroup)) = self.matrix_shapes.get(&multiply) else {
+                continue;
+            };
             if !inputs.contains(&multiply)
-                || !self.matrix_shapes.contains_key(&multiply)
                 || !self.seeds.iter().any(|seed| {
                     fill_conv_gradient_candidates(
                         &mut seed.plan.clone(),
                         multiply,
                         self.replace_extracted_matrices,
+                        gathered(multiply, shape, subgroup),
+                    ) + winograd::fill_derivatives(
+                        &mut seed.plan.clone(),
+                        multiply,
+                        shape,
+                        subgroup,
                     ) != 0
                 })
             {
                 continue;
             }
             // Convolution graphs can reach this trial early. Attention graphs
-            // retain their arithmetic and derivative-layout priorities: no
-            // whole-model gain justifies interrupting them for pointwise dX.
+            // keep their arithmetic and derivative-layout priorities first and
+            // queue this one after them: their convolutions are small (Whisper's
+            // two stem layers), but their gradients now all have typed kernels.
             if !self
                 .seeds
                 .iter()
@@ -894,6 +909,8 @@ impl Implementations {
             {
                 self.order.arithmetic_layouts = 1;
                 self.order.priority_choices.push_front(self.choices.len());
+            } else {
+                self.order.priority_choices.push_back(self.choices.len());
             }
             self.choices
                 .extend(ordinary.iter().map(|choice| AxisChoice {
@@ -1062,19 +1079,23 @@ impl Implementations {
             }) {
                 winograd.push(Some(multiply));
             }
+            let subgroup_tiles = gathered(multiply, shape, caps.subgroup_size);
             if self.seeds.iter().any(|s| {
                 fill_matrix_candidates(
                     &mut s.plan.clone(),
                     multiply,
                     self.replace_extracted_matrices,
+                    false,
+                    subgroup_tiles,
                 ) > 0
             }) {
                 let mixed = self.seeds.iter().any(|seed| {
-                    let vector = fill_matrix_candidates_scoped(
+                    let vector = fill_matrix_candidates(
                         &mut seed.plan.clone(),
                         multiply,
                         self.replace_extracted_matrices,
                         true,
+                        subgroup_tiles,
                     );
                     vector > 0
                         && vector
@@ -1082,6 +1103,8 @@ impl Implementations {
                                 &mut seed.plan.clone(),
                                 multiply,
                                 self.replace_extracted_matrices,
+                                false,
+                                subgroup_tiles,
                             )
                 });
                 if mixed {
@@ -1095,6 +1118,8 @@ impl Implementations {
                             &mut plan,
                             multiply,
                             self.replace_extracted_matrices,
+                            false,
+                            subgroup_tiles,
                         );
                         storage::fill(&mut plan) != 0
                     })
@@ -1189,6 +1214,33 @@ fn fill_attention_products(
     count
 }
 
+/// Choose a K-split count for a low-occupancy gathered subgroup convolution
+/// and validate its partial allocation and final `SumRows` reduction against
+/// portable limits and the remaining byte budget.
+#[allow(clippy::too_many_arguments)]
+fn plan_gathered_k_split(
+    grid: [u32; 3],
+    stages: u32,
+    batch: u32,
+    total_cols: Option<u32>,
+    remaining_budget: usize,
+    parallel_width: Option<u32>,
+) -> Option<(u32, [u32; 3], u32, usize)> {
+    let low_threshold = compile::split_target_workgroups(parallel_width, 4, 192);
+    let target_groups = compile::split_target_workgroups(parallel_width, 8, 384);
+    let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
+    if workgroups == 0 || workgroups >= low_threshold || stages < 32 {
+        return None;
+    }
+    let chunks = target_groups.div_ceil(workgroups).clamp(2, stages / 8);
+    let total_cols = total_cols?;
+    let bytes = compile::plan_k_split(total_cols, chunks, chunks <= 16, remaining_budget).ok()?;
+    let z = batch.checked_mul(chunks)?;
+    let split_grid = [grid[0], grid[1], z];
+    compile::workgroups_within_portable_limits(split_grid)
+        .then_some((chunks, split_grid, total_cols, bytes))
+}
+
 /// Checked typed products preserve the existing F32 or F16 weight bindings,
 /// including tails. Conversion happens inside each timed dispatch. This reaches
 /// rectangular subgroup shapes and workgroup tuning without the legacy heuristic.
@@ -1196,18 +1248,32 @@ fn fill_matrix_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
+    vector_convolutions_only: bool,
+    subgroup_tiles: bool,
 ) -> usize {
-    fill_matrix_candidates_scoped(plan, multiply, replace_extracted, false)
+    fill_matrix_candidates_with_width(
+        plan,
+        multiply,
+        replace_extracted,
+        vector_convolutions_only,
+        subgroup_tiles,
+        None,
+    )
 }
 
-fn fill_matrix_candidates_scoped(
+fn fill_matrix_candidates_with_width(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
     vector_convolutions_only: bool,
+    subgroup_tiles: bool,
+    parallel_width: Option<u32>,
 ) -> usize {
+    const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
-    for d in &mut plan.dispatches {
+    let mut remaining_budget = MAX_SPLIT_PARTIAL_BYTES;
+    let mut splits_to_add = Vec::new();
+    for (index, d) in plan.dispatches.iter_mut().enumerate() {
         if d.shader.is_conv2d_gemm()
             && (!vector_convolutions_only
                 || crate::kernels::conv::Params::from(&*d).vectorized_forward())
@@ -1221,9 +1287,47 @@ fn fill_matrix_candidates_scoped(
             let Some(positions) = p[9].checked_mul(p[10]) else {
                 continue;
             };
-            let grid = [p[4].div_ceil(32), positions.div_ceil(32), p[0]];
+            let batch = p[0].max(1);
+            let (rows, cols) = if subgroup_tiles {
+                let tile = crate::codegen::conv_product_tile(p[4], positions, batch);
+                (tile.rows, tile.columns)
+            } else {
+                (32, 32)
+            };
+            let mut grid = [p[4].div_ceil(rows), positions.div_ceil(cols), p[0]];
+            // Few workgroups over a long K (a 7×7 stage's 1×1 convs over 2048
+            // channels) split K over workgroup Z: gathered forwards only.
+            let stages = p[1]
+                .checked_mul(p[5])
+                .and_then(|v| v.checked_mul(p[6]))
+                .map_or(0, |taps| taps.div_ceil(32));
+            let gathered =
+                subgroup_tiles && !crate::kernels::conv::Params::from(&*d).vectorized_forward();
+            let mut chunks = 1;
+            let mut split_info = None;
+            if gathered {
+                let total_cols = batch
+                    .checked_mul(p[4])
+                    .and_then(|v| v.checked_mul(positions));
+                if let Some((candidate_chunks, split_grid, cols, bytes)) = plan_gathered_k_split(
+                    grid,
+                    stages,
+                    batch,
+                    total_cols,
+                    remaining_budget,
+                    parallel_width,
+                ) {
+                    chunks = candidate_chunks;
+                    grid = split_grid;
+                    split_info = Some((cols, bytes));
+                }
+            }
             if !compile::workgroups_within_portable_limits(grid) {
                 continue;
+            }
+            if let Some((total_cols, bytes)) = split_info {
+                remaining_budget -= bytes;
+                splits_to_add.push((index, chunks, total_cols, bytes));
             }
             d.shader = compile::ShaderEntry::Conv2dGemmCoopGen(p[5], p[6], p[7]);
             d.kernel = compile::Kernel::CooperativeTyped {
@@ -1232,7 +1336,7 @@ fn fill_matrix_candidates_scoped(
                     multiply,
                     ..crate::codegen::MatrixTypes::F32_AS_F16
                 },
-                splits: 1,
+                splits: chunks,
             };
             d.workgroups = grid;
             count += 1;
@@ -1243,19 +1347,55 @@ fn fill_matrix_candidates_scoped(
             count += 1;
         }
     }
+    // Each split convolution writes partials, and a SumRows adds its chunks.
+    for &(index, chunks, columns, bytes) in splits_to_add.iter().rev() {
+        plan.splice_k_split(index, columns, chunks, chunks <= 16, bytes)
+            .expect("pre-validated split-K reduction");
+    }
     count
 }
 
-/// A pointwise NCHW derivative is Wᵀ × dY independently for each image.
-/// Reuse checked matrix staging, including rectangular native tiles and tails.
+/// Whether reduced `multiply` products on this device run the gathered
+/// subgroup-tiled convolutions.
+fn gathered(multiply: crate::DType, native: [u32; 3], subgroup: u32) -> bool {
+    crate::codegen::gathered_convolutions(
+        crate::codegen::MatrixTypes {
+            multiply,
+            ..crate::codegen::MatrixTypes::F32_AS_F16
+        },
+        native,
+        subgroup,
+    )
+}
+
+/// An NCHW input derivative is Wᵀ × dY independently for each image: a
+/// pointwise one reuses checked matrix staging, including rectangular native
+/// tiles and tails. With `gathered`, a strided one runs as one product per
+/// image and stride phase (workgroup Z), gathering its operands and
+/// scattering its output.
 /// Only measured construction installs reduced derivative operands.
 fn fill_conv_gradient_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
+    gathered: bool,
 ) -> usize {
+    fill_conv_gradient_candidates_with_width(plan, multiply, replace_extracted, gathered, None)
+}
+
+fn fill_conv_gradient_candidates_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    gathered: bool,
+    parallel_width: Option<u32>,
+) -> usize {
+    const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
-    for dispatch in &mut plan.dispatches {
+    let mut remaining_budget = MAX_SPLIT_PARTIAL_BYTES;
+    let mut splits_to_add = Vec::new();
+    let mut transposes_to_add = Vec::new();
+    for (index, dispatch) in plan.dispatches.iter_mut().enumerate() {
         if !matches!(
             dispatch.shader,
             compile::ShaderEntry::Conv2dGradInputGemm
@@ -1272,37 +1412,298 @@ fn fill_conv_gradient_candidates(
             continue;
         }
         let p = &dispatch.params;
-        if p[5..8] != [1, 1, 1] || p[8] != 0 || p[11] != 0 || p[4] < 4 {
+        let pointwise = p[5..8] == [1, 1, 1] && p[8] == 0 && p[11] == 0;
+        let phased = gathered
+            && crate::codegen::phased_grad_input(&crate::kernels::conv::Params::from(&*dispatch));
+        if !(pointwise || phased) || p[4] < 4 {
             continue;
         }
-        let Some(columns) = p[2].checked_mul(p[3]) else {
-            continue;
+        let mut chunks = 1;
+        let mut split_info = None;
+        let grid = if pointwise {
+            let Some(columns) = p[2].checked_mul(p[3]) else {
+                continue;
+            };
+            let batch = p[0].max(1);
+            // Without whole vectors a gathered product runs where the device
+            // has one, and the checked kernel on 32x32 tiles where not.
+            let params = crate::kernels::conv::Params::from(&*dispatch);
+            let (rows, cols) = if gathered {
+                let tile =
+                    crate::codegen::conv_tile(crate::codegen::ConvProduct::InputGradient, &params);
+                (tile.rows, tile.columns)
+            } else {
+                (32, 32)
+            };
+            let mut grid = [p[1].div_ceil(rows), columns.div_ceil(cols), p[0]];
+            // A gathered one with few workgroups over a long K (a 7×7
+            // stage's over 2048 channels) splits K over workgroup Z.
+            if gathered && !params.vectorized_forward() {
+                let total_cols = batch.checked_mul(p[1]).and_then(|v| v.checked_mul(columns));
+                if let Some((candidate_chunks, split_grid, cols, bytes)) = plan_gathered_k_split(
+                    grid,
+                    p[4].div_ceil(32),
+                    batch,
+                    total_cols,
+                    remaining_budget,
+                    parallel_width,
+                ) {
+                    chunks = candidate_chunks;
+                    grid = split_grid;
+                    split_info = Some((cols, bytes));
+                }
+            }
+            grid
+        } else {
+            // The largest phase, (0, 0), has ⌈H/s⌉ × ⌈W/s⌉ positions.
+            let s = p[7];
+            let Some(z) = p[0].checked_mul(s * s) else {
+                continue;
+            };
+            let tile = crate::codegen::conv_tile(
+                crate::codegen::ConvProduct::PhasedInputGradient,
+                &crate::kernels::conv::Params::from(&*dispatch),
+            );
+            [
+                p[1].div_ceil(tile.rows),
+                (p[2].div_ceil(s) * p[3].div_ceil(s)).div_ceil(tile.columns),
+                z,
+            ]
         };
-        let grid = [p[1].div_ceil(32), columns.div_ceil(32), p[0]];
         if !compile::workgroups_within_portable_limits(grid)
             || grid.into_iter().map(u64::from).product::<u64>()
                 < crate::kernels::conv::MIN_F16_WORKGROUPS
         {
             continue;
         }
-        dispatch.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
+        let needs_transpose = !pointwise
+            && crate::codegen::phased_transposed_weights(&crate::kernels::conv::Params::from(
+                &*dispatch,
+            ));
+        if needs_transpose {
+            let Some(k) = p[1].checked_mul(p[5]).and_then(|v| v.checked_mul(p[6])) else {
+                continue;
+            };
+            if !compile::workgroups_within_portable_limits([k.div_ceil(16), p[4].div_ceil(16), 1]) {
+                continue;
+            }
+            transposes_to_add.push((index, p[4], k));
+        }
+        if let Some((total_cols, bytes)) = split_info {
+            remaining_budget -= bytes;
+            splits_to_add.push((index, chunks, total_cols, bytes));
+        }
+        dispatch.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(p[5], p[6], p[7]);
         dispatch.kernel = compile::Kernel::CooperativeTyped {
             specialize: false,
             types: crate::codegen::MatrixTypes {
                 multiply,
                 ..crate::codegen::MatrixTypes::F32_AS_F16
             },
-            splits: 1,
+            splits: chunks,
         };
+        dispatch.conv_transposed_weights = needs_transpose;
         dispatch.workgroups = grid;
         count += 1;
+    }
+    // Each split input gradient writes partials, and a SumRows adds its chunks.
+    for &(index, chunks, columns, bytes) in splits_to_add.iter().rev() {
+        plan.splice_k_split(index, columns, chunks, chunks <= 16, bytes)
+            .expect("pre-validated split-K reduction");
+    }
+    // Phased input gradients read W[co, (ci, ky, kx)] transposed, from a
+    // tiled Transpose just before them (after the reductions shifted them).
+    for &(index, co, k) in transposes_to_add.iter().rev() {
+        let index = index
+            + splits_to_add
+                .iter()
+                .filter(|&&(i, _, _, _)| i < index)
+                .count();
+        let d = &plan.dispatches[index];
+        let transposed = compile::BufferRef(plan.buffers.len() as u32);
+        let transpose = compile::Dispatch {
+            shader: compile::ShaderEntry::Transpose,
+            workgroups: [k.div_ceil(16), co.div_ceil(16), 1],
+            input_buffers: vec![d.input_buffers[1]],
+            output_buffer: transposed,
+            params: vec![co, k, 0, 0],
+            is_derivative: d.is_derivative,
+            label: format!("{} weight transpose", d.label),
+            origin: d.origin.clone(),
+            ..Default::default()
+        };
+        plan.buffers.push(co as usize * k as usize * 4);
+        plan.dispatches[index].input_buffers[1] = transposed;
+        plan.dispatches.insert(index, transpose);
+    }
+    count
+        + if gathered {
+            fill_conv_weight_gradients_with_width(plan, multiply, replace_extracted, parallel_width)
+        } else {
+            0
+        }
+}
+
+/// Convolution weight gradients as typed per-image BT products over K chunks
+/// (output positions): enough `batch × chunks` partitions to occupy the
+/// device, summed by the SumRows a split producer already feeds, or by one
+/// this adds. Pointwise convolutions load vectors; the rest gather their
+/// im2col elements. Partials and the gradient stay F32.
+#[cfg(test)]
+fn fill_conv_weight_gradients(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+) -> usize {
+    fill_conv_weight_gradients_with_width(plan, multiply, replace_extracted, None)
+}
+
+fn fill_conv_weight_gradients_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    parallel_width: Option<u32>,
+) -> usize {
+    use compile::ShaderEntry as E;
+    // Partition workgroups aimed for, and the fewest K positions per chunk.
+    let target_workgroups = compile::split_target_workgroups(parallel_width, 4, 192);
+    const MIN_CHUNK: u32 = 128;
+    const MAX_PARTIAL_BYTES: usize = 256 << 20;
+    let mut count = 0;
+    let mut partial_bytes = 0usize;
+    let mut index = 0;
+    while index < plan.dispatches.len() {
+        let d = &plan.dispatches[index];
+        let split = matches!(
+            d.shader,
+            E::Conv2dGradWeightGemmSplit
+                | E::Conv2dGradWeightGemmSplitSmall
+                | E::Conv2dGradWeightGemmSplit16
+        );
+        let whole = matches!(
+            d.shader,
+            E::Conv2dGradWeightGemm | E::Conv2dGradWeightGemmSmall | E::Conv2dGradWeightGemm16
+        );
+        if !(split || whole) || d.params.len() < 12 {
+            index += 1;
+            continue;
+        }
+        let params = crate::kernels::conv::Params::from(d);
+        if !d.is_derivative
+            || d.requires_full_precision
+            || (d.schedule_locked && !replace_extracted)
+            || d.matmul_epilogue.is_some()
+            || !d.extra_outputs.is_empty()
+            || d.input_buffers.len() != 2
+            || d.weight_format != compile::WeightFormat::F32
+            || matches!(d.kernel, compile::Kernel::CooperativeTyped { .. })
+            || params.in_channels == 0
+        {
+            index += 1;
+            continue;
+        }
+        let Some(n) = params
+            .in_channels
+            .checked_mul(params.kernel_h)
+            .and_then(|v| v.checked_mul(params.kernel_w))
+        else {
+            index += 1;
+            continue;
+        };
+        let m = params.out_channels;
+        let batch = params.batch.max(1);
+        let tile = crate::codegen::conv_tile(crate::codegen::ConvProduct::WeightGradient, &params);
+        let tiles = m
+            .div_ceil(tile.rows)
+            .saturating_mul(n.div_ceil(tile.columns));
+        if tiles == 0 {
+            index += 1;
+            continue;
+        }
+        let partitions = if params.vectorized_forward() {
+            // Per-image products, each split into chunks of its positions.
+            let k = params.out_h.saturating_mul(params.out_w);
+            batch.saturating_mul(
+                target_workgroups
+                    .div_ceil(tiles.saturating_mul(batch))
+                    .clamp(1, (k / MIN_CHUNK).max(1)),
+            )
+        } else {
+            // One product over the batch's positions: chunks only where the
+            // grid alone cannot occupy the device, and at least two when the
+            // producer already feeds a reduction.
+            let k = batch
+                .saturating_mul(params.out_h)
+                .saturating_mul(params.out_w);
+            let chunks = target_workgroups
+                .div_ceil(tiles)
+                .clamp(1, (k / MIN_CHUNK).max(1));
+            if split { chunks.max(2) } else { chunks }
+        };
+        let Some(cols) = m.checked_mul(n) else {
+            index += 1;
+            continue;
+        };
+        let remaining = MAX_PARTIAL_BYTES.saturating_sub(partial_bytes);
+        let bytes = if partitions > 1 {
+            let Ok(bytes) = compile::plan_k_split(cols, partitions, partitions <= 16, remaining)
+            else {
+                index += 1;
+                continue;
+            };
+            bytes
+        } else {
+            0
+        };
+        let grid = [m.div_ceil(tile.rows), n.div_ceil(tile.columns), partitions];
+        if partitions > 65_535 || !compile::workgroups_within_portable_limits(grid) {
+            index += 1;
+            continue;
+        }
+        if split {
+            let partial = d.output_buffer;
+            if !plan.update_split_sum_rows(partial, partitions, bytes) {
+                index += 1;
+                continue;
+            }
+        } else if partitions > 1
+            && plan
+                .split_conv_weight_gradients(&[(index, partitions)], remaining)
+                .is_err()
+        {
+            index += 1;
+            continue;
+        }
+        if partitions > 1 {
+            partial_bytes += bytes;
+        }
+        let d = &mut plan.dispatches[index];
+        d.shader = if partitions > 1 {
+            E::Conv2dGradWeightGemmSplit
+        } else {
+            E::Conv2dGradWeightGemm
+        };
+        d.kernel = compile::Kernel::CooperativeTyped {
+            specialize: false,
+            types: crate::codegen::MatrixTypes {
+                multiply,
+                ..crate::codegen::MatrixTypes::F32_AS_F16
+            },
+            splits: partitions,
+        };
+        d.schedule_locked = false;
+        d.workgroups = grid;
+        count += 1;
+        index += 1;
     }
     count
 }
 
 /// Only AT/BT derivative products were qualified by the dense controls. In
 /// particular, SmolLM2's long-K NN gradient fails the unchanged F16 gate.
-/// Bindings, partials and automatic derivative protection remain F32.
+/// Their fused forms add an F32 addend after the F32 accumulation, so they
+/// round the same operands. Bindings, partials and automatic derivative
+/// protection remain F32.
 /// Reduced inputs are admitted by the caller's quality check on search-time
 /// data only. F16 can lose small derivative values as training converges;
 /// passing that check does not establish range or accuracy for future steps.
@@ -1311,24 +1712,101 @@ fn fill_gradient_candidates(
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> usize {
+    fill_gradient_candidates_with_width(plan, multiply, replace_extracted, None)
+}
+
+fn fill_gradient_candidates_with_width(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    parallel_width: Option<u32>,
+) -> usize {
+    split_long_weight_gradients(plan, replace_extracted, parallel_width);
     let mut count = 0;
     for d in &mut plan.dispatches {
         if d.is_derivative
             && !d.requires_full_precision
-            && matches!(
-                d.shader,
-                compile::ShaderEntry::MatMulAT | compile::ShaderEntry::MatMulBT
-            )
+            && match d.shader {
+                compile::ShaderEntry::MatMulAT | compile::ShaderEntry::MatMulBT => {
+                    d.input_buffers.len() == 2
+                }
+                compile::ShaderEntry::FusedMatMulATAdd | compile::ShaderEntry::FusedMatMulBTAdd => {
+                    d.input_buffers.len() == 3
+                }
+                _ => false,
+            }
             && matches!(
                 d.kernel,
                 compile::Kernel::Default
                     | compile::Kernel::ScalarMatmul(_)
                     | compile::Kernel::SplitMatmul { .. }
             )
-            && d.input_buffers.len() == 2
             && d.extra_outputs.is_empty()
             && fill_dense_product(d, multiply, replace_extracted)
         {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Weight gradients over many positions (Whisper's 384×384 products with
+/// K = 1500) walk K serially in few 64×64 tiles: 36 workgroups for 48
+/// SMs, each waiting on memory at every K stage. Split those K walks into
+/// partitions summed by a SumRows before the products become typed, so
+/// the typed and subgroup kernels inherit `tiles × splits` workgroups.
+/// Input gradients over a long K do the same: SmolLM2's MLP down
+/// projection (128 × 576 over K = 3072) took 36.8 µs a layer on 32×16
+/// tiles, 12 TFLOP/s.
+fn split_long_weight_gradients(
+    plan: &mut ExecutionPlan,
+    replace_extracted: bool,
+    parallel_width: Option<u32>,
+) -> usize {
+    // Workgroups aimed for, and the fewest K positions per partition.
+    let target_workgroups = compile::split_target_workgroups(parallel_width, 3, 144);
+    const MIN_CHUNK: u32 = 256;
+    let mut budget: usize = 64 << 20;
+    let mut count = 0;
+    for index in (0..plan.dispatches.len()).rev() {
+        let d = &plan.dispatches[index];
+        let Some((m, n, k)) = d.mnk() else {
+            continue;
+        };
+        let long_input_gradient = d.shader == compile::ShaderEntry::MatMulBT && k >= 2048;
+        if !d.is_derivative
+            || d.requires_full_precision
+            || !(d.shader == compile::ShaderEntry::MatMulAT || long_input_gradient)
+            || d.input_buffers.len() != 2
+            || !matches!(
+                d.kernel,
+                compile::Kernel::Default | compile::Kernel::ScalarMatmul(_)
+            )
+            || (d.schedule_locked && !replace_extracted)
+            || d.horizontal_batch > 1
+            || d.matmul_prologue.is_some()
+            || d.matmul_epilogue.is_some()
+            || !d.extra_outputs.is_empty()
+            || d.weight_format != compile::WeightFormat::F32
+        {
+            continue;
+        }
+        let tiles = m.div_ceil(64) * n.div_ceil(64);
+        let splits = target_workgroups.div_ceil(tiles).min(k / MIN_CHUNK);
+        if splits < 2 {
+            continue;
+        }
+        let shape = crate::codegen::ScalarMatmulShape {
+            tile_size: 32,
+            tile_n: 0,
+            k_stage: 16,
+            interleave_columns: false,
+            unroll_k: false,
+            vector_fragments: false,
+        };
+        let buffers = plan.buffers.len();
+        if plan.split_matmul(index, shape, splits, budget).is_ok() {
+            budget -= plan.buffers[buffers];
             count += 1;
         }
     }
@@ -1785,29 +2263,42 @@ impl measure::Frontier for Implementations {
                 continue;
             }
             if let Some(multiply) = matrix_inputs {
-                if fill_matrix_candidates_scoped(
+                let (shape, subgroup) = self.matrix_shapes[&multiply];
+                if fill_matrix_candidates_with_width(
                     &mut plan,
                     multiply,
                     self.replace_extracted_matrices,
                     vector_convolutions_only,
+                    gathered(multiply, shape, subgroup),
+                    self.parallel_width,
                 ) == 0
                 {
                     continue;
                 }
             }
             if let Some(multiply) = gradient_inputs {
-                if fill_gradient_candidates(&mut plan, multiply, self.replace_extracted_matrices)
-                    == 0
+                if fill_gradient_candidates_with_width(
+                    &mut plan,
+                    multiply,
+                    self.replace_extracted_matrices,
+                    self.parallel_width,
+                ) == 0
                 {
                     continue;
                 }
             }
             if let Some(multiply) = conv_gradient_inputs {
-                if fill_conv_gradient_candidates(
+                // Pointwise input gradients on the typed kernel, and the
+                // derivative Winograd products with their transforms.
+                let (shape, subgroup) = self.matrix_shapes[&multiply];
+                if fill_conv_gradient_candidates_with_width(
                     &mut plan,
                     multiply,
                     self.replace_extracted_matrices,
-                ) == 0
+                    gathered(multiply, shape, subgroup),
+                    self.parallel_width,
+                ) + winograd::fill_derivatives(&mut plan, multiply, shape, subgroup)
+                    == 0
                 {
                     continue;
                 }
@@ -2000,7 +2491,7 @@ mod tests {
     }
 
     #[test]
-    fn convolution_precision_preserves_attention_graph_coverage() {
+    fn convolution_precision_queues_behind_attention_graph_coverage() {
         use measure::Frontier as _;
         let mut graph = pointwise_gradient_graph(256, 64, 28, 28, 4);
         let q = graph.input("q", &[128, 64]);
@@ -2028,13 +2519,22 @@ mod tests {
                 .iter()
                 .any(|c| c.conv_gradient_inputs.is_some())
         );
+        // Convolution derivatives queue behind the attention graph's arithmetic.
+        let queue: Vec<_> = frontier
+            .order
+            .priority_choices
+            .iter()
+            .map(|&i| frontier.choices[i])
+            .collect();
+        let first = queue
+            .iter()
+            .position(|c| c.conv_gradient_inputs.is_some())
+            .expect("convolution derivatives are queued");
         assert!(
-            frontier
-                .order
-                .priority_choices
+            queue[first..]
                 .iter()
-                .all(|&i| { frontier.choices[i].conv_gradient_inputs.is_none() }),
-            "pointwise dX must not interrupt attention arithmetic"
+                .all(|c| c.conv_gradient_inputs.is_some()),
+            "convolution derivatives must not interrupt attention arithmetic"
         );
         let first = frontier.next(None).unwrap();
         let next = frontier.next(first.origin).unwrap();
@@ -2047,12 +2547,34 @@ mod tests {
     }
 
     #[test]
+    fn checked_convolution_launches_match_the_fallback_shader() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4 * 64 * 56 * 56]);
+        let w = g.parameter("w", &[256 * 64]);
+        let y = g.conv2d(x, w, 4, 64, 56, 56, 256, 1, 1, 1, 0);
+        g.set_outputs(vec![y]);
+        let mut plan = compile::compile(&g);
+        assert_eq!(
+            fill_matrix_candidates(&mut plan, crate::DType::F16, true, false, false),
+            1
+        );
+        assert_eq!(plan.dispatches[0].workgroups, [8, 98, 4]);
+
+        let mut dx = compile::compile(&pointwise_gradient_graph(256, 64, 56, 56, 4));
+        assert_eq!(
+            fill_conv_gradient_candidates(&mut dx, crate::DType::F16, true, false),
+            1
+        );
+        assert_eq!(dx.dispatches[0].workgroups, [8, 98, 4]);
+    }
+
+    #[test]
     fn pointwise_derivative_candidates_preserve_pins_and_exact_output_size() {
         let base = compile::compile(&pointwise_gradient_graph(256, 64, 14, 14, 4));
         for dtype in [crate::DType::F16, crate::DType::BF16] {
             let mut candidate = base.clone();
             assert_eq!(
-                fill_conv_gradient_candidates(&mut candidate, dtype, true),
+                fill_conv_gradient_candidates(&mut candidate, dtype, true, false),
                 1
             );
             assert_eq!(candidate.buffers, base.buffers);
@@ -2062,12 +2584,22 @@ mod tests {
                 candidate.dispatches[0].requires_full_precision = pin;
                 candidate.dispatches[0].schedule_locked = !pin;
                 assert_eq!(
-                    fill_conv_gradient_candidates(&mut candidate, dtype, false),
+                    fill_conv_gradient_candidates(&mut candidate, dtype, false, false),
                     0
                 );
                 assert_eq!(candidate.dispatches[0].shader, base.dispatches[0].shader);
             }
         }
+    }
+
+    fn device_subgroup_tiles(gpu: &blade_graphics::Context, dtype: crate::DType) -> bool {
+        let caps = gpu.capabilities();
+        let shapes = match dtype {
+            crate::DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
+            _ => &caps.cooperative_matrix.f16_f32_shapes,
+        };
+        crate::codegen::checked_cooperative_shape(shapes)
+            .is_some_and(|shape| gathered(dtype, shape, caps.subgroup_size))
     }
 
     #[test]
@@ -2079,7 +2611,15 @@ mod tests {
             if !runtime::typed_matrix_supported(&gpu, dtype) {
                 continue;
             }
-            for (ci, co, h, w, batch) in [(20, 19, 4, 5, 3), (17, 19, 7, 9, 2), (32, 32, 4, 4, 2)] {
+            for (ci, co, h, w, batch) in [
+                (512, 2048, 7, 7, 4),
+                (2048, 512, 7, 7, 4),
+                (256, 64, 56, 56, 4),
+                (1024, 256, 14, 14, 4),
+                (20, 19, 4, 5, 3),
+                (17, 19, 7, 9, 2),
+                (32, 32, 4, 4, 2),
+            ] {
                 let g = pointwise_gradient_graph(ci, co, h, w, batch);
                 let mut feeds = Feeds::new();
                 let dy: Vec<_> = (0..batch * co * h * w)
@@ -2097,17 +2637,29 @@ mod tests {
                 let want = &values[id as usize];
                 let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
                 let mut plan = compile::compile(&g);
-                let d = &mut plan.dispatches[0];
-                d.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
-                d.kernel = compile::Kernel::CooperativeTyped {
-                    specialize: false,
-                    types: crate::codegen::MatrixTypes {
-                        multiply: dtype,
-                        ..crate::codegen::MatrixTypes::F32_AS_F16
-                    },
-                    splits: 1,
-                };
-                d.workgroups = [ci.div_ceil(32), (h * w).div_ceil(32), batch];
+                let gathered = device_subgroup_tiles(&gpu, dtype);
+                // Cases under the fill's workgroup floor take the kernel directly.
+                if fill_conv_gradient_candidates(&mut plan, dtype, true, gathered) == 0 {
+                    let d = &mut plan.dispatches[0];
+                    d.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
+                    d.kernel = compile::Kernel::CooperativeTyped {
+                        specialize: false,
+                        types: crate::codegen::MatrixTypes {
+                            multiply: dtype,
+                            ..crate::codegen::MatrixTypes::F32_AS_F16
+                        },
+                        splits: 1,
+                    };
+                    let tile = crate::codegen::conv_tile(
+                        crate::codegen::ConvProduct::InputGradient,
+                        &crate::kernels::conv::Params::from(&*d),
+                    );
+                    d.workgroups = [
+                        ci.div_ceil(if gathered { tile.rows } else { 32 }),
+                        (h * w).div_ceil(if gathered { tile.columns } else { 32 }),
+                        batch,
+                    ];
+                }
                 compile::schedule_dispatches(&mut plan, false, false);
                 let mut session = Session::with_context_opts(
                     plan,
@@ -2126,6 +2678,458 @@ mod tests {
                     session.read_output_by_index(0, &mut got);
                     reference::check(&got, &want.data, &magnitude, Default::default())
                         .unwrap_or_else(|e| panic!("{dtype:?} ({ci},{co},{h},{w},{batch}): {e}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: typed pointwise forward convolutions, tails, batches and both reduced types"]
+    fn pointwise_forward_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            // Ragged rows and columns of the 32x32 grid, several images, and
+            // one case of whole tiles; the second keeps the checked kernel.
+            for (ci, co, h, w, batch) in [(20, 36, 4, 5, 3), (17, 19, 7, 9, 2), (64, 64, 8, 8, 2)] {
+                let mut g = Graph::new();
+                let x = g.input("x", &[(batch * ci * h * w) as usize]);
+                let weight = g.parameter("w", &[(co * ci) as usize]);
+                let y = g.conv2d(x, weight, batch, ci, h, w, co, 1, 1, 1, 0);
+                g.set_outputs(vec![y]);
+                let mut feeds = Feeds::new();
+                let xs: Vec<_> = (0..batch * ci * h * w)
+                    .map(|i| (((i * 7) % 17) as f32 - 8.) / 32.)
+                    .collect();
+                let weights: Vec<_> = (0..co * ci)
+                    .map(|i| (((i * 3) % 17) as f32 - 8.) / 16.)
+                    .collect();
+                feeds.set("x", &xs);
+                feeds.set("w", &weights);
+                let values = reference::evaluate(&g, &feeds).unwrap();
+                let id = g.outputs()[0];
+                let node = g.node(id);
+                let args: Vec<_> = node.inputs.iter().map(|&n| &values[n as usize]).collect();
+                let want = &values[id as usize];
+                let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
+                let mut plan = compile::compile(&g);
+                assert_eq!(
+                    fill_matrix_candidates(
+                        &mut plan,
+                        dtype,
+                        true,
+                        false,
+                        device_subgroup_tiles(&gpu, dtype)
+                    ),
+                    1,
+                    "({ci},{co},{h},{w},{batch})"
+                );
+                compile::schedule_dispatches(&mut plan, false, false);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    runtime::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("x", &xs);
+                session.set_parameter("w", &weights);
+                for _ in 0..2 {
+                    session.step();
+                    session.wait();
+                    let mut got = vec![0.; want.len()];
+                    session.read_output_by_index(0, &mut got);
+                    reference::check(&got, &want.data, &magnitude, Default::default())
+                        .unwrap_or_else(|e| panic!("{dtype:?} ({ci},{co},{h},{w},{batch}): {e}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: typed pointwise weight gradients over images, K chunks and split reductions"]
+    fn pointwise_weight_gradient_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            // Ragged tiles over three images; an output compile already
+            // splits; and a long reduction in several chunks per image.
+            for (ci, co, h, w, batch) in [
+                (256, 64, 56, 56, 4),
+                (1024, 256, 14, 14, 4),
+                (20, 36, 4, 5, 3),
+                (64, 64, 16, 32, 2),
+                (32, 48, 28, 28, 4),
+            ] {
+                let mut g = Graph::new();
+                let dy = g.input("dy", &[(batch * co * h * w) as usize]);
+                let x = g.input("x", &[(batch * ci * h * w) as usize]);
+                let dw = g.conv2d_grad_weight(dy, x, ci, h, w, co, 1, 1, 1, 0, 0);
+                g.nodes_mut()[dw as usize].is_derivative = true;
+                g.set_outputs(vec![dw]);
+                let mut feeds = Feeds::new();
+                let dys: Vec<_> = (0..batch * co * h * w)
+                    .map(|i| (((i * 7) % 17) as f32 - 8.) / 64.)
+                    .collect();
+                let xs: Vec<_> = (0..batch * ci * h * w)
+                    .map(|i| (((i * 5) % 13) as f32 - 6.) / 16.)
+                    .collect();
+                feeds.set("dy", &dys);
+                feeds.set("x", &xs);
+                let values = reference::evaluate(&g, &feeds).unwrap();
+                let id = g.outputs()[0];
+                let node = g.node(id);
+                let args: Vec<_> = node.inputs.iter().map(|&n| &values[n as usize]).collect();
+                let want = &values[id as usize];
+                let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
+                let mut plan = compile::compile(&g);
+                let split = plan.dispatches.len() > 1;
+                assert_eq!(
+                    fill_conv_weight_gradients(&mut plan, dtype, true),
+                    1,
+                    "({ci},{co},{h},{w},{batch}) split={split}"
+                );
+                let producer = &plan.dispatches[0];
+                assert!(matches!(
+                    producer.kernel,
+                    compile::Kernel::CooperativeTyped { .. }
+                ));
+                assert_eq!(producer.workgroups[2] % batch, 0);
+                compile::schedule_dispatches(&mut plan, false, false);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    runtime::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("dy", &dys);
+                session.set_input("x", &xs);
+                for _ in 0..2 {
+                    session.step();
+                    session.wait();
+                    let mut got = vec![0.; want.len()];
+                    session.read_output_by_index(0, &mut got);
+                    reference::check(&got, &want.data, &magnitude, Default::default())
+                        .unwrap_or_else(|e| panic!("{dtype:?} ({ci},{co},{h},{w},{batch}): {e}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: typed gathered weight gradients for strided and padded convolutions"]
+    fn gathered_weight_gradient_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            // 3×3 at stride 1 and 2 with padding, a strided 1×1, odd output
+            // sizes (7×7: no whole vectors), ragged channel tiles.
+            for (ci, co, h, w, k, stride, pad, batch) in [
+                (256, 256, 14, 14, 3, 1, 1, 4),
+                (64, 64, 56, 56, 3, 1, 1, 4),
+                (128, 128, 28, 28, 3, 2, 1, 4),
+                (3, 64, 224, 224, 7, 2, 3, 4),
+                (16, 32, 14, 14, 3, 1, 1, 2),
+                (24, 40, 15, 13, 3, 2, 1, 3),
+                (64, 64, 14, 14, 1, 2, 0, 2),
+                (32, 48, 7, 7, 3, 1, 1, 4),
+                (3, 64, 32, 32, 7, 2, 3, 1),
+            ] {
+                let oh = (h + 2 * pad - k) / stride + 1;
+                let ow = (w + 2 * pad - k) / stride + 1;
+                let mut g = Graph::new();
+                let dy = g.input("dy", &[(batch * co * oh * ow) as usize]);
+                let x = g.input("x", &[(batch * ci * h * w) as usize]);
+                let dw = g.conv2d_grad_weight(dy, x, ci, h, w, co, k, k, stride, pad, pad);
+                g.nodes_mut()[dw as usize].is_derivative = true;
+                g.set_outputs(vec![dw]);
+                let mut feeds = Feeds::new();
+                let dys: Vec<_> = (0..batch * co * oh * ow)
+                    .map(|i| (((i * 7) % 17) as f32 - 8.) / 64.)
+                    .collect();
+                let xs: Vec<_> = (0..batch * ci * h * w)
+                    .map(|i| (((i * 5) % 13) as f32 - 6.) / 16.)
+                    .collect();
+                feeds.set("dy", &dys);
+                feeds.set("x", &xs);
+                let values = reference::evaluate(&g, &feeds).unwrap();
+                let id = g.outputs()[0];
+                let node = g.node(id);
+                let args: Vec<_> = node.inputs.iter().map(|&n| &values[n as usize]).collect();
+                let want = &values[id as usize];
+                let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
+                let case = format!("{dtype:?} ({ci},{co},{h},{w}) k{k} s{stride} p{pad} b{batch}");
+                let mut plan = compile::compile(&g);
+                assert_eq!(
+                    fill_conv_weight_gradients(&mut plan, dtype, true),
+                    1,
+                    "{case}"
+                );
+                assert!(matches!(
+                    plan.dispatches[0].kernel,
+                    compile::Kernel::CooperativeTyped { .. }
+                ));
+                compile::schedule_dispatches(&mut plan, false, false);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    runtime::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("dy", &dys);
+                session.set_input("x", &xs);
+                for _ in 0..2 {
+                    session.step();
+                    session.wait();
+                    let mut got = vec![0.; want.len()];
+                    session.read_output_by_index(0, &mut got);
+                    reference::check(&got, &want.data, &magnitude, Default::default())
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: typed input gradients of strided convolutions by stride phases"]
+    fn phased_input_gradient_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        let mut checked = 0;
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            let caps = gpu.capabilities();
+            let shapes = match dtype {
+                crate::DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
+                _ => &caps.cooperative_matrix.f16_f32_shapes,
+            };
+            if !gathered(dtype, [16, 16, 16], caps.subgroup_size) || !shapes.contains(&[16, 16, 16])
+            {
+                continue;
+            }
+            // ResNet-50's windows (3×3 padded, 1×1 with three empty phases) at
+            // stride 2, ragged channel and column tiles, a 2×2 window, stride
+            // 3 with taps past the output, odd extents (phases of unequal
+            // size), and Whisper's 1-D stem (3×1 over width 1, so two phases
+            // are empty). Enough workgroups for the derivative gate.
+            for (ci, co, h, w, kh, kw, stride, pad, pad_w, batch) in [
+                (256, 256, 28, 28, 3, 3, 2, 1, 1, 4),
+                (512, 256, 28, 28, 1, 1, 2, 0, 0, 4),
+                (200, 120, 30, 26, 3, 3, 2, 1, 1, 8),
+                (64, 64, 28, 28, 3, 3, 2, 1, 1, 4),
+                (128, 48, 14, 14, 1, 1, 2, 0, 0, 4),
+                (40, 24, 30, 26, 3, 3, 2, 1, 1, 3),
+                (48, 32, 16, 16, 2, 2, 2, 0, 0, 8),
+                (32, 40, 18, 21, 3, 3, 3, 1, 1, 8),
+                (40, 32, 27, 25, 3, 3, 2, 1, 1, 4),
+                (128, 96, 1200, 1, 3, 1, 2, 1, 0, 1),
+            ] {
+                let oh = (h + 2 * pad - kh) / stride + 1;
+                let ow = (w + 2 * pad_w - kw) / stride + 1;
+                let mut g = Graph::new();
+                let dy = g.input("dy", &[(batch * co * oh * ow) as usize]);
+                let wt = g.parameter("w", &[(co * ci * kh * kw) as usize]);
+                let dx =
+                    g.conv2d_grad_input(dy, wt, batch, ci, h, w, co, kh, kw, stride, pad, pad_w);
+                g.nodes_mut()[dx as usize].is_derivative = true;
+                g.set_outputs(vec![dx]);
+                let dys: Vec<_> = (0..batch * co * oh * ow)
+                    .map(|i| (((i * 7) % 17) as f32 - 8.) / 64.)
+                    .collect();
+                let ws: Vec<_> = (0..co * ci * kh * kw)
+                    .map(|i| (((i * 5) % 13) as f32 - 6.) / 16.)
+                    .collect();
+                let mut feeds = Feeds::new();
+                feeds.set("dy", &dys);
+                feeds.set("w", &ws);
+                let values = reference::evaluate(&g, &feeds).unwrap();
+                let id = g.outputs()[0];
+                let node = g.node(id);
+                let args: Vec<_> = node.inputs.iter().map(|&n| &values[n as usize]).collect();
+                let want = &values[id as usize];
+                let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
+                let case = format!(
+                    "{dtype:?} ({ci},{co},{h},{w}) k{kh}x{kw} s{stride} p{pad},{pad_w} b{batch}"
+                );
+                let mut plan = compile::compile(&g);
+                assert_eq!(
+                    fill_conv_gradient_candidates(&mut plan, dtype, true, true),
+                    1,
+                    "{case}"
+                );
+                let d = plan
+                    .dispatches
+                    .iter()
+                    .find(|d| {
+                        matches!(
+                            d.shader,
+                            compile::ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(d.workgroups[2], batch * stride * stride, "{case}");
+                compile::schedule_dispatches(&mut plan, false, false);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    runtime::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("dy", &dys);
+                session.set_parameter("w", &ws);
+                for _ in 0..2 {
+                    session.step();
+                    session.wait();
+                    let mut got = vec![0.; want.len()];
+                    session.read_output_by_index(0, &mut got);
+                    reference::check(&got, &want.data, &magnitude, Default::default())
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("phased input gradients checked: {checked} cases");
+    }
+
+    #[test]
+    fn weight_gradients_require_gathered_subgroup_kernels() {
+        let mut g = Graph::new();
+        let dy = g.input("dy", &[4 * 64 * 28 * 28]);
+        let x = g.input("x", &[4 * 64 * 28 * 28]);
+        let dw = g.conv2d_grad_weight(dy, x, 64, 28, 28, 64, 1, 1, 1, 0, 0);
+        g.nodes_mut()[dw as usize].is_derivative = true;
+        g.set_outputs(vec![dw]);
+        let baseline = compile::compile(&g);
+        let mut without_gathered = baseline.clone();
+        assert_eq!(
+            fill_conv_gradient_candidates(&mut without_gathered, crate::DType::F16, true, false),
+            0
+        );
+        assert_eq!(without_gathered, baseline);
+        let mut with_gathered = baseline;
+        assert_eq!(
+            fill_conv_gradient_candidates(&mut with_gathered, crate::DType::F16, true, true),
+            1
+        );
+    }
+
+    #[test]
+    fn strided_input_gradients_need_gathered_kernels() {
+        // Odd extents decompose too; pointwise stride-1 needs no gathers.
+        for (h, k, stride, pad, gathered, admitted) in [
+            (28, 3, 2, 1, true, true),
+            (28, 3, 2, 1, false, false),
+            (27, 3, 2, 1, true, true),
+            (28, 1, 1, 0, false, true),
+        ] {
+            let mut g = Graph::new();
+            let oh = (h + 2 * pad - k) / stride + 1;
+            let dy = g.input("dy", &[(4 * 64 * oh * oh) as usize]);
+            let wt = g.parameter("w", &[(64 * 64 * k * k) as usize]);
+            let dx = g.conv2d_grad_input(dy, wt, 4, 64, h, h, 64, k, k, stride, pad, pad);
+            g.nodes_mut()[dx as usize].is_derivative = true;
+            g.set_outputs(vec![dx]);
+            let mut plan = compile::compile(&g);
+            let count = fill_conv_gradient_candidates(&mut plan, crate::DType::F16, true, gathered);
+            assert_eq!(
+                count == 1,
+                admitted,
+                "h{h} k{k} s{stride} gathered {gathered}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: typed gathered forward convolutions for strided and padded windows"]
+    fn gathered_forward_conv_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            // 3×3 at stride 2 and 1, a 7×7 stride-2 stem over three channels
+            // (147 taps: gathered weights), a strided 1×1, ragged tiles.
+            for (ci, co, h, w, k, stride, pad, batch) in [
+                (256, 256, 14, 14, 3, 1, 1, 4),
+                (64, 256, 56, 56, 1, 1, 0, 4),
+                (512, 512, 7, 7, 3, 1, 1, 4),
+                // ResNet-50's 7×7 stage: a 1×1 over 2048 channels splits K.
+                (2048, 512, 7, 7, 1, 1, 0, 4),
+                (32, 64, 14, 14, 3, 2, 1, 2),
+                (24, 40, 15, 13, 3, 1, 1, 3),
+                (3, 64, 32, 32, 7, 2, 3, 2),
+                (64, 48, 14, 14, 1, 2, 0, 2),
+            ] {
+                let mut g = Graph::new();
+                let x = g.input("x", &[(batch * ci * h * w) as usize]);
+                let wt = g.parameter("w", &[(co * ci * k * k) as usize]);
+                let y = g.conv2d(x, wt, batch, ci, h, w, co, k, k, stride, pad);
+                g.set_outputs(vec![y]);
+                let xs: Vec<_> = (0..batch * ci * h * w)
+                    .map(|i| (((i * 5) % 13) as f32 - 6.) / 16.)
+                    .collect();
+                let ws: Vec<_> = (0..co * ci * k * k)
+                    .map(|i| (((i * 7) % 17) as f32 - 8.) / 64.)
+                    .collect();
+                let mut feeds = Feeds::new();
+                feeds.set("x", &xs);
+                feeds.set("w", &ws);
+                let values = reference::evaluate(&g, &feeds).unwrap();
+                let id = g.outputs()[0];
+                let node = g.node(id);
+                let args: Vec<_> = node.inputs.iter().map(|&n| &values[n as usize]).collect();
+                let want = &values[id as usize];
+                let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
+                let case = format!("{dtype:?} ({ci},{co},{h},{w}) k{k} s{stride} p{pad} b{batch}");
+                let mut plan = compile::compile(&g);
+                assert_eq!(
+                    fill_matrix_candidates(
+                        &mut plan,
+                        dtype,
+                        true,
+                        false,
+                        device_subgroup_tiles(&gpu, dtype)
+                    ),
+                    1,
+                    "{case}"
+                );
+                compile::schedule_dispatches(&mut plan, false, false);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    runtime::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("x", &xs);
+                session.set_parameter("w", &ws);
+                for _ in 0..2 {
+                    session.step();
+                    session.wait();
+                    let mut got = vec![0.; want.len()];
+                    session.read_output_by_index(0, &mut got);
+                    reference::check(&got, &want.data, &magnitude, Default::default())
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
                 }
             }
         }
@@ -2363,6 +3367,51 @@ mod tests {
             neighbor.attention,
             frontier.choices[forward_index].attention
         );
+    }
+
+    #[test]
+    fn long_weight_gradients_split_before_they_become_typed() {
+        // Whisper's projection weight gradient: 36 tiles of 64×64, K = 1500.
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[1500, 384]);
+        let w = graph.parameter("w", &[384, 384]);
+        let y = graph.matmul(x, w);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let baseline = graph_frontier(crate::autodiff::differentiate(&graph))
+            .seeds
+            .remove(0)
+            .plan;
+        let mut plan = baseline.clone();
+        assert!(fill_gradient_candidates(&mut plan, crate::DType::BF16, true) >= 1);
+        let (index, producer) = plan
+            .dispatches
+            .iter()
+            .enumerate()
+            .find(|&(_, d)| {
+                d.shader == compile::ShaderEntry::MatMulAT && d.mnk() == Some((384, 384, 1500))
+            })
+            .expect("weight gradient");
+        assert!(
+            matches!(
+                producer.kernel,
+                compile::Kernel::CooperativeTyped { splits: 4, .. }
+            ),
+            "{:?}",
+            producer.kernel
+        );
+        assert_eq!(producer.workgroups, [12, 12, 4]);
+        let sum = &plan.dispatches[index + 1];
+        assert_eq!(sum.shader, compile::ShaderEntry::SumRows);
+        assert_eq!(sum.input_buffers, [producer.output_buffer]);
+        assert_eq!(sum.params[..2], [4, 384 * 384]);
+        assert_eq!(plan.dispatches.len(), baseline.dispatches.len() + 1);
+
+        // Short reductions and products that fill the device stay whole.
+        let mut small = gradient_frontier().seeds.remove(0).plan;
+        let before = small.dispatches.len();
+        fill_gradient_candidates(&mut small, crate::DType::BF16, true);
+        assert_eq!(small.dispatches.len(), before);
     }
 
     #[test]
@@ -3088,7 +4137,7 @@ mod tests {
         assert_eq!(dispatch.weight_format, WeightFormat::F16);
         let mut candidate = original.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut candidate, DType::F16, false),
+            fill_matrix_candidates(&mut candidate, DType::F16, false, false, false),
             1,
             "a legacy F16 weight must not hide a legal typed mixed-storage alternative"
         );
@@ -3103,7 +4152,7 @@ mod tests {
                     && types.multiply == DType::F16 && types.output == DType::F32));
         let mut bf16 = original.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut bf16, DType::BF16, false),
+            fill_matrix_candidates(&mut bf16, DType::BF16, false, false, false),
             0,
             "F16 storage cannot be reinterpreted as BF16"
         );
@@ -3117,7 +4166,10 @@ mod tests {
             .position(|d| d.mnk().is_some())
             .unwrap();
         plan.dispatches[index].kernel = compile::Kernel::Cooperative;
-        assert_eq!(fill_matrix_candidates(&mut plan, DType::BF16, false), 1);
+        assert_eq!(
+            fill_matrix_candidates(&mut plan, DType::BF16, false, false, false),
+            1
+        );
         assert!(matches!(plan.dispatches[index].kernel,
             compile::Kernel::CooperativeTyped { types, splits: 1, specialize: false }
                 if types.multiply == DType::BF16 && types.a == DType::F32
@@ -3138,17 +4190,18 @@ mod tests {
             k_stage: 16,
             interleave_columns: false,
             unroll_k: false,
+            vector_fragments: false,
         };
         plan.split_matmul(0, shape, 4, 1 << 20).unwrap();
         plan.dispatches[0].schedule_locked = true;
         let original = plan.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::F16, false),
+            fill_matrix_candidates(&mut plan, crate::DType::F16, false, false, false),
             0
         );
         assert_eq!(plan, original);
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::F16, true),
+            fill_matrix_candidates(&mut plan, crate::DType::F16, true, false, false),
             1
         );
         assert!(matches!(
@@ -3173,7 +4226,7 @@ mod tests {
             }
             let before = plan.clone();
             assert_eq!(
-                fill_matrix_candidates(&mut plan, crate::DType::BF16, true),
+                fill_matrix_candidates(&mut plan, crate::DType::BF16, true, false, false),
                 0
             );
             assert_eq!(plan, before);
@@ -3200,7 +4253,7 @@ mod tests {
                 }
                 let original = plan.dispatches.clone();
                 assert_eq!(
-                    fill_matrix_candidates(&mut plan, crate::DType::BF16, false),
+                    fill_matrix_candidates(&mut plan, crate::DType::BF16, false, false, false),
                     usize::from(valid)
                 );
                 if !valid {
@@ -3218,7 +4271,7 @@ mod tests {
         dispatch.params = vec![1, 1, 1, 1, 32, 1, 1, 1, 0, u32::MAX, 2];
         let original = plan.dispatches.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::BF16, false),
+            fill_matrix_candidates(&mut plan, crate::DType::BF16, false, false, false),
             0
         );
         assert_eq!(plan.dispatches, original);
@@ -3302,7 +4355,7 @@ mod tests {
         graph.set_outputs(vec![y]);
         let mut plan = compile::compile(&graph);
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::BF16, false),
+            fill_matrix_candidates(&mut plan, crate::DType::BF16, false, false, false),
             1
         );
         let gpu = crate::reference::gpu::shared_context();
@@ -3418,7 +4471,13 @@ mod tests {
                 .collect();
                 let mut plan = compile::compile(&graph);
                 assert_eq!(
-                    fill_matrix_candidates_scoped(&mut plan, dtype, false, true),
+                    fill_matrix_candidates(
+                        &mut plan,
+                        dtype,
+                        false,
+                        true,
+                        device_subgroup_tiles(&gpu, dtype)
+                    ),
                     1
                 );
                 let mut session = Session::with_context(plan, gpu.clone());

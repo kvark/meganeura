@@ -209,6 +209,7 @@ pub(crate) const WIDE_TILE: ScalarMatmulShape = ScalarMatmulShape {
     k_stage: 16,
     interleave_columns: true,
     unroll_k: false,
+    vector_fragments: false,
 };
 
 impl Family for Path {

@@ -8,6 +8,7 @@ mod bf16;
 mod params;
 mod softplus;
 mod split_k;
+pub(crate) use split_k::{plan_k_split, split_target_workgroups};
 pub(crate) mod stages;
 pub(crate) use params::{
     AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams, WinogradInputParams,
@@ -1276,6 +1277,10 @@ pub struct Dispatch {
     /// remain F32; automatic stores follow the readers' chosen matrix types.
     #[serde(default)]
     pub pointwise_storage: crate::schedule::PointwiseStorage,
+    /// Phased strided convolution input gradient reads pre-transposed weights
+    /// `Wt[(ci, ky, kx), co]` produced by an explicit preceding `Transpose`.
+    #[serde(default)]
+    pub conv_transposed_weights: bool,
 }
 
 /// Mutually exclusive implementations. Bindings and launch geometry live on
@@ -3530,6 +3535,7 @@ mod tests {
                 k_stage: 32,
                 interleave_columns: false,
                 unroll_k: true,
+                vector_fragments: false,
             },
             splits: 1,
         });
@@ -3551,6 +3557,7 @@ mod tests {
                 k_stage: 8,
                 interleave_columns: false,
                 unroll_k: true,
+                vector_fragments: false,
             },
             splits: 8,
         });
@@ -3580,6 +3587,7 @@ mod tests {
                 k_stage: 8,
                 interleave_columns: false,
                 unroll_k: true,
+                vector_fragments: false,
             },
             splits: 8,
         });

@@ -13,6 +13,10 @@ pub(crate) mod winograd;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
+pub(crate) use workgroup::{
+    ConvProduct, conv_product_tile, conv_tile, conv_tile_for, generate_workgroup_matmul_for_device,
+    native_subgroup_shape,
+};
 pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
@@ -396,6 +400,9 @@ pub struct MatmulKnobs {
     pub integer_dot: bool,
     /// Straight-line K loop instead of a counted loop.
     pub unroll_k: bool,
+    /// Transposed A and 16-byte aligned shared rows, read as vec4 fragments
+    /// (4×4 and 8×8 register tiles, plain weights, no column interleave).
+    pub vector_fragments: bool,
 }
 
 impl Default for MatmulKnobs {
@@ -405,6 +412,7 @@ impl Default for MatmulKnobs {
             interleave_columns: false,
             integer_dot: false,
             unroll_k: false,
+            vector_fragments: false,
         }
     }
 }
@@ -422,6 +430,9 @@ pub struct ScalarMatmulShape {
     /// Emit a straight-line K stage. The counted loop remains an alternative.
     #[serde(default)]
     pub unroll_k: bool,
+    /// Read 4×4 and 8×8 register tiles from shared memory as vec4 fragments.
+    #[serde(default)]
+    pub vector_fragments: bool,
 }
 
 impl ScalarMatmulShape {
@@ -448,6 +459,16 @@ impl ScalarMatmulShape {
             && matches!(bn, 16 | 32 | 64 | 128)
             && bm * k % 256 == 0
             && bn * k % 256 == 0
+    }
+
+    /// Padded A and B tiles staged by the scalar kernel, in bytes.
+    pub(crate) fn shared_bytes(self) -> u32 {
+        let (m, n, k) = (self.rows(), self.cols(), self.k_stage);
+        if self.vector_fragments && !self.interleave_columns && m % 64 == 0 && n % 64 == 0 {
+            4 * k * (m + 4 + n + 4)
+        } else {
+            4 * (m * (k + 1) + k * (n + 1))
+        }
     }
 
     pub fn geometry(self) -> MatMulTile {
@@ -509,6 +530,7 @@ pub(crate) fn generate_split_matmul(
                 k_stage: shape.k_stage,
                 interleave_columns: shape.interleave_columns,
                 unroll_k: shape.unroll_k,
+                vector_fragments: shape.vector_fragments,
                 ..knobs
             },
         },
@@ -1159,9 +1181,58 @@ pub(crate) fn generate_checked_conv(
     shape: [u32; 3],
     params: &crate::kernels::conv::Params,
     subgroup: u32,
+    split: bool,
 ) -> ShaderModule {
     // Keep native C stores inside each channel's spatial row.
     let backward = matches!(group, ShaderGroup::Conv2dPointwiseGradInput);
+    let pointwise = backward
+        || group
+            == ShaderGroup::Conv2dChecked {
+                kernel_h: 1,
+                kernel_w: 1,
+                stride: 1,
+            };
+    // Pointwise products run subgroup-tiled, and so do other forward
+    // windows, gathering their im2col elements; `conv_tile` sizes both, as
+    // it does their grids. Pointwise input gradients without whole vectors
+    // keep the checked kernel and its 32x32 grid.
+    if pointwise
+        && workgroup::pointwise_conv_subgroup_shape(types, shape, subgroup, params).is_some()
+    {
+        let product = if backward {
+            ConvProduct::InputGradient
+        } else {
+            ConvProduct::Forward
+        };
+        return workgroup::generate_subgroup_pointwise_conv(
+            backward,
+            conv_tile_for(product, params, subgroup),
+            types,
+            shape,
+            subgroup,
+            params,
+        );
+    }
+    // Pointwise input gradients without whole vectors gather both operands.
+    if backward && workgroup::gathered_conv_subgroup_shape(types, shape, subgroup).is_some() {
+        let tile = conv_tile_for(ConvProduct::InputGradient, params, subgroup);
+        return workgroup::generate_subgroup_gathered_pointwise_grad_input(
+            tile, types, shape, subgroup, params, split,
+        );
+    }
+    if !backward
+        && matches!(group, ShaderGroup::Conv2dChecked { .. })
+        && workgroup::gathered_conv_subgroup_shape(types, shape, subgroup).is_some()
+    {
+        return workgroup::generate_subgroup_gathered_conv(
+            conv_tile_for(ConvProduct::Forward, params, subgroup),
+            types,
+            shape,
+            subgroup,
+            params,
+            split,
+        );
+    }
     let (rows, columns, contiguous) = if backward {
         (
             params.in_channels,
@@ -1191,6 +1262,71 @@ pub(crate) fn generate_checked_conv(
             ..Default::default()
         },
     )
+}
+
+/// A typed input gradient of a strided convolution by stride phases, when
+/// the device runs the subgroup-tiled kernel; see
+/// [`workgroup::generate_subgroup_phased_grad_input`].
+pub(crate) fn generate_subgroup_phased_grad_input(
+    types: MatrixTypes,
+    shape: [u32; 3],
+    subgroup: u32,
+    params: &crate::kernels::conv::Params,
+    transposed: bool,
+) -> Option<ShaderModule> {
+    workgroup::gathered_conv_subgroup_shape(types, shape, subgroup)?;
+    let tile = conv_tile_for(ConvProduct::PhasedInputGradient, params, subgroup);
+    phased_grad_input(params).then(|| {
+        workgroup::generate_subgroup_phased_grad_input(
+            tile, types, shape, subgroup, params, transposed,
+        )
+    })
+}
+
+/// Whether a phased input gradient reads its weights transposed,
+/// `Wt[(ci, ky, kx), co]`, from a Transpose its fill inserts: whole vectors
+/// of output channels, windows of several taps, and weights reread at least
+/// 16 times (column tiles of a phase over the batch), so the transpose pays.
+/// In ResNet-50 (RTX 5070, in the program) the transitions at 56 and 28 went
+/// 71.6 → 53.0 and 100.4 → 80.0 µs with their transposes; at 14 (eight
+/// rereads) 151.6 → 157.7, and a strided 1×1 0.068 → 0.072 ms.
+pub(crate) fn phased_transposed_weights(p: &crate::kernels::conv::Params) -> bool {
+    let s = p.stride.max(1);
+    let tile = conv_tile(ConvProduct::PhasedInputGradient, p);
+    let rereads = p.batch.max(1) * (p.in_h.div_ceil(s) * p.in_w.div_ceil(s)).div_ceil(tile.columns);
+    p.out_channels.is_multiple_of(4) && p.kernel_h * p.kernel_w > 1 && rereads >= 16
+}
+
+/// Whether the device runs the gathered subgroup-tiled convolutions.
+pub(crate) fn gathered_convolutions(types: MatrixTypes, shape: [u32; 3], subgroup: u32) -> bool {
+    workgroup::gathered_conv_subgroup_shape(types, shape, subgroup).is_some()
+}
+
+/// Whether an input gradient decomposes into stride phases: any strided one.
+pub(crate) fn phased_grad_input(params: &crate::kernels::conv::Params) -> bool {
+    params.stride > 1
+}
+
+/// A typed weight gradient, when the device runs the subgroup-tiled kernel:
+/// vector loads for pointwise convolutions
+/// ([`workgroup::generate_subgroup_pointwise_weight_grad`]), gathered elements
+/// for the rest ([`workgroup::generate_subgroup_gathered_weight_grad`]).
+pub(crate) fn generate_subgroup_weight_grad(
+    types: MatrixTypes,
+    shape: [u32; 3],
+    subgroup: u32,
+    params: &crate::kernels::conv::Params,
+) -> Option<ShaderModule> {
+    let tile = conv_tile_for(ConvProduct::WeightGradient, params, subgroup);
+    if workgroup::pointwise_conv_subgroup_shape(types, shape, subgroup, params).is_some() {
+        return Some(workgroup::generate_subgroup_pointwise_weight_grad(
+            tile, types, shape, subgroup, params,
+        ));
+    }
+    workgroup::gathered_conv_subgroup_shape(types, shape, subgroup)?;
+    Some(workgroup::generate_subgroup_gathered_weight_grad(
+        tile, types, shape, subgroup, params,
+    ))
 }
 
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
@@ -1853,6 +1989,16 @@ fn matmul_vars_tiled(
         WeightFormat::Q3K if tile == MatMulTile::Large => Some("dequant_q3k_pack8"),
         _ => None,
     };
+    let a_stage_body = r"for (var e = 0u; e < $A_STAGE_EPT_U; e++) {
+            let flat = tid + e * 256u;
+            let row_local = $A_ROW;
+            let col_local = $A_COL;
+            let a_row = tile_row + row_local;
+            let a_col = t + col_local;
+            let in_bounds = (a_row < params.m) && (a_col < params.k);
+            // `select` evaluates both arms: an index past the end reads element 0.
+            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);
+        }";
     let b_stage_body = if let Some(pack8) = pack8 {
         format!(
             "\
@@ -1917,6 +2063,106 @@ fn matmul_vars_tiled(
     } else {
         compute_body
     };
+    // vec4 fragments: A stored transposed ([K][BM + 4]) and B as [K][BN + 4],
+    // so a thread's TM values of A and TN values of B for one k are aligned
+    // vec4s. One invocation stages all four components of each shared vector.
+    let fragments = knobs.vector_fragments
+        && pack8.is_none()
+        && !interleave_columns
+        && tm.is_multiple_of(4)
+        && tn.is_multiple_of(4);
+    let (shared_a_decl, shared_b_decl, a_stage_body, b_stage_body, k_math) = if fragments {
+        let (bmp, bnp) = (bm + 4, bn + 4);
+        let shared_a = format!(
+            "var<workgroup> shared_a: array<vec4<f32>, {}>;",
+            k_tile * bmp / 4
+        );
+        let shared_b = format!(
+            "var<workgroup> shared_b: array<vec4<f32>, {}>;",
+            k_tile * bnp / 4
+        );
+        let a_stage = r"
+            for (var i = tid; i < $BM_U * $K_TILE_U / 4u; i += 256u) {
+                let k_local = i % $K_TILE_U;
+                let rows = i / $K_TILE_U;
+                let a_col = t + k_local;
+                var values: vec4<f32>;
+                for (var lane = 0u; lane < 4u; lane++) {
+                    let a_row = tile_row + rows * 4u + lane;
+                    let in_bounds = a_row < params.m && a_col < params.k;
+                    values[lane] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);
+                }
+                shared_a[k_local * ($BM_U / 4u + 1u) + rows] = values;
+            }";
+        let b_stage = r"
+            for (var i = tid; i < $BN_U * $K_TILE_U / 4u; i += 256u) {
+                let k_local = i / ($BN_U / 4u);
+                let cols = i % ($BN_U / 4u);
+                let b_row = t + k_local;
+                var values: vec4<f32>;
+                for (var lane = 0u; lane < 4u; lane++) {
+                    let b_col = tile_col + cols * 4u + lane;
+                    let in_bounds = b_row < params.k && b_col < params.n;
+                    values[lane] = select(0.0, $B_LOAD_EXPR, in_bounds);
+                }
+                shared_b[k_local * ($BN_U / 4u + 1u) + cols] = values;
+            }";
+        let lanes = ["x", "y", "z", "w"];
+        let mut body = String::new();
+        for i4 in 0..tm / 4 {
+            body += &format!(
+                "            let av{i4} = shared_a[(kk * {bmp}u + ty * {tm}u + {o}u) / 4u];\n",
+                o = i4 * 4
+            );
+        }
+        for j4 in 0..tn / 4 {
+            body += &format!(
+                "            let bv{j4} = shared_b[(kk * {bnp}u + tx * {tn}u + {o}u) / 4u];\n",
+                o = j4 * 4
+            );
+        }
+        for i in 0..tm {
+            body += &format!(
+                "            let a{i} = av{}.{};\n",
+                i / 4,
+                lanes[(i % 4) as usize]
+            );
+        }
+        for j in 0..tn {
+            body += &format!(
+                "            let b{j} = bv{}.{};\n",
+                j / 4,
+                lanes[(j % 4) as usize]
+            );
+        }
+        for i in 0..tm {
+            body += "            ";
+            for j in 0..tn {
+                body += &format!("s{i}_{j} += a{i} * b{j}; ");
+            }
+            body += "\n";
+        }
+        let math = if knobs.unroll_k {
+            unroll_k_math(&body, k_tile)
+        } else {
+            body
+        };
+        (shared_a, shared_b, a_stage, b_stage.to_owned(), math)
+    } else {
+        (
+            format!(
+                "var<workgroup> shared_a: array<f32, {}>;",
+                bm * (k_tile + 1)
+            ),
+            format!(
+                "var<workgroup> shared_b: array<f32, {}>;",
+                k_tile * (bn + 1)
+            ),
+            a_stage_body,
+            b_stage_body,
+            k_math,
+        )
+    };
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
     } else {
@@ -1930,6 +2176,7 @@ fn matmul_vars_tiled(
                 "$K_UNROLL_U",
                 &format!("{}u", if knobs.unroll_k { k_tile } else { 1 }),
             ),
+            ("$A_STAGE_BODY", a_stage_body),
             ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
             ("$B_LOAD_EXPR", &b_load_expr),
@@ -1955,8 +2202,8 @@ fn matmul_vars_tiled(
             ("$K_TILE_U", &format!("{k_tile}u")),
             ("$A_STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
             ("$B_STAGE_EPT_U", &format!("{}u", bn * k_tile / 256)),
-            ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
-            ("$SHARED_B_SIZE", &(k_tile * (bn + 1)).to_string()),
+            ("$SHARED_A_DECL", &shared_a_decl),
+            ("$SHARED_B_DECL", &shared_b_decl),
             ("$ACC_DECL", &acc_decl),
             ("$ACC_ARRAY", &acc_array),
         ],

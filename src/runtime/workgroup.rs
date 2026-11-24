@@ -51,7 +51,10 @@ pub(super) fn select(
                 | ShaderEntry::FusedMatMulBTAdd
         ) || dispatch.horizontal_batch > 1
             || dispatch.matmul_prologue.is_some()
-            || dispatch.matmul_epilogue.is_some()
+            || dispatch
+                .matmul_epilogue
+                .as_ref()
+                .is_some_and(|e| shape.subgroup_rows == 0 || !e.inputs.is_empty())
             || dispatch.full_precision()
             || dispatch.weight_format != WeightFormat::F32
             || (types.is_none() && dispatch.schedule_locked)
@@ -60,9 +63,15 @@ pub(super) fn select(
             continue;
         }
         if let Some((m, n, k)) = dispatch.mnk() {
-            if shape.supports(caps, types.unwrap_or(MatrixTypes::F32_AS_F16), m, n, k)
-                && splits > 0
-                && splits <= k / shape.k_stage
+            if shape.supports_layout(
+                caps,
+                types.unwrap_or(MatrixTypes::F32_AS_F16),
+                Some(dispatch.shader.shader_group()),
+                m,
+                n,
+                k,
+            ) && splits > 0
+                && splits <= shape.k_blocks(k)
             {
                 dispatch.kernel = Kernel::CooperativeWorkgroup {
                     shape,
@@ -86,6 +95,8 @@ mod tests {
         k_stage: 32,
         threads: 64,
         stage_operands: false,
+        subgroup_rows: 0,
+        prefetch: false,
     };
 
     fn caps() -> blade_graphics::Capabilities {
@@ -137,6 +148,8 @@ mod tests {
             k_stage: 32,
             threads: 256,
             stage_operands: false,
+            subgroup_rows: 0,
+            prefetch: false,
         };
         assert!(tile.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
         let deeper = WorkgroupMatmulShape {

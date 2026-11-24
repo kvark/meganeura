@@ -43,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 16;
+const KERNEL_MEMO_REVISION: u32 = 18;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -367,6 +367,7 @@ pub(super) fn tile_module(
                 k_stage: shape.k_stage,
                 interleave_columns: shape.interleave_columns,
                 unroll_k: shape.unroll_k,
+                vector_fragments: shape.vector_fragments,
                 ..knobs
             },
         };
@@ -530,12 +531,20 @@ fn retain_tunable_classes(
     let shared_limit = capabilities.max_compute_shared_memory_size;
     for class in classes.iter_mut() {
         class.challengers.retain(|tile| match *tile {
+            MatmulTile::Scalar(shape) => shared_limit == 0 || shape.shared_bytes() <= shared_limit,
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 class.key.effective_matrix_types().is_some_and(|types| {
-                    shape.supports(capabilities, types, class.key.m, class.key.n, class.key.k)
+                    shape.supports_layout(
+                        capabilities,
+                        types,
+                        Some(class.key.shader.shader_group()),
+                        class.key.m,
+                        class.key.n,
+                        class.key.k,
+                    )
                 })
             }
             _ => true,
@@ -664,6 +673,7 @@ fn collect_classes(
                         k_stage: plan.knobs.matmul_k_stage,
                         interleave_columns: plan.knobs.matmul_interleave_columns,
                         unroll_k: false,
+                        vector_fragments: false,
                     }))
                 }
                 _ => None,
@@ -695,7 +705,12 @@ fn collect_classes(
             super::cooperative_shapes(&capabilities.cooperative_matrix, types.multiply)
         });
         let challengers = key
-            .challengers(initial, coop_config, native_shapes)
+            .challengers_for_device(
+                initial,
+                coop_config,
+                native_shapes,
+                capabilities.subgroup_size,
+            )
             .into_iter()
             .filter(|candidate| Some(*candidate) != equivalent)
             .collect();
@@ -2832,6 +2847,8 @@ mod tests {
             k_stage: 64,
             threads: 128,
             stage_operands: false,
+            subgroup_rows: 0,
+            prefetch: false,
         };
         let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 2 };
         assert!(tile.fits(&class.key));
@@ -3531,6 +3548,7 @@ mod tests {
                     k_stage: 8,
                     interleave_columns: true,
                     unroll_k: false,
+                    vector_fragments: false,
                 })
                 .apply(&mut right.dispatches[index], &class.key);
             }
@@ -3713,6 +3731,7 @@ mod tests {
                 k_stage: 8,
                 interleave_columns: true,
                 unroll_k: false,
+                vector_fragments: false,
             })
         };
         b.pipelines
@@ -4185,6 +4204,7 @@ mod tests {
                     k_stage,
                     interleave_columns,
                     unroll_k: false,
+                    vector_fragments: false,
                 })
             };
             let tiles = [

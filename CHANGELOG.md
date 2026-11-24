@@ -15,6 +15,14 @@
   subject to whole-program accuracy and timing gates. Unsupported arithmetic is
   reported and omitted before construction; strict policies keep their F32 paths.
 
+- Reduced matrix products, Winograd products and convolutions run on
+  subgroup-tiled cooperative kernels on devices with 32-wide subgroups and
+  16x16 F16/BF16 matrices. Convolutions of any window, stride and padding
+  gather their operands, and strided input gradients run per stride phase.
+  `WorkgroupMatmulShape` gains `subgroup_rows` and `prefetch`,
+  `ScalarMatmulShape` gains `vector_fragments`, and the kernel memo revision
+  moves to 18.
+
 - Measured construction accepts `BuildSearchOptions::qualification_runs` to
   check repeated executions of each candidate outside timing. Persistent
   writes and representative inputs are restored before every qualification

@@ -61,6 +61,8 @@ fn main() {
             k_stage: values[2],
             threads: values[3],
             stage_operands,
+            subgroup_rows: 0,
+            prefetch: false,
         }]
     } else if sweep {
         [
@@ -81,6 +83,8 @@ fn main() {
             k_stage,
             threads,
             stage_operands,
+            subgroup_rows: 0,
+            prefetch: false,
         })
         .to_vec()
     } else {
@@ -90,6 +94,8 @@ fn main() {
             k_stage: 32,
             threads: 64,
             stage_operands,
+            subgroup_rows: 0,
+            prefetch: false,
         }]
     };
     if search {

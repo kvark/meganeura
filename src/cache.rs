@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 41 adds subgroup-tiled Winograd and convolution grids, WorkgroupMatmulShape
+// subgroup_rows/prefetch, and ScalarMatmulShape vector_fragments.
 // Version 40 splits MaxPool2dGrad into a winner-index pass and a gather pass.
 // Version 39 adds the ArgMax reduction lowering `Graph::argmax_inner`.
 // Version 38 marks parameter-invariant Winograd weight transforms and gives
@@ -54,7 +56,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 40;
+const CACHE_FORMAT_VERSION: u32 = 41;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
