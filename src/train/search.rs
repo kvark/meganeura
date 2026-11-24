@@ -1741,6 +1741,7 @@ fn fill_gradient_candidates(
 
 /// Mixed precision qualifies AT and BT derivative layouts independently.
 /// A mixed trial only differs from both uniform trials if both layouts change.
+/// Returns 0 without mutating `plan` when the mixed trial is ineligible.
 fn fill_gradient_candidates_typed(
     plan: &mut ExecutionPlan,
     at_type: crate::DType,
@@ -1757,9 +1758,10 @@ fn fill_gradient_candidates_typed_with_width(
     replace_extracted: bool,
     parallel_width: Option<u32>,
 ) -> usize {
-    split_long_weight_gradients(plan, replace_extracted, parallel_width);
+    let mut candidate = plan.clone();
+    split_long_weight_gradients(&mut candidate, replace_extracted, parallel_width);
     let (mut at, mut bt) = (0, 0);
-    for d in &mut plan.dispatches {
+    for d in &mut candidate.dispatches {
         if d.is_derivative
             && !d.requires_full_precision
             && match d.shader {
@@ -1793,6 +1795,10 @@ fn fill_gradient_candidates_typed_with_width(
     if at_type != bt_type && (at == 0 || bt == 0) {
         return 0;
     }
+    if at + bt == 0 {
+        return 0;
+    }
+    *plan = candidate;
     at + bt
 }
 
@@ -2157,7 +2163,10 @@ impl measure::Frontier for Implementations {
                             active.matrix_storage,
                         ),
                     ) + usize::from(choice.winograd != active.winograd)
-                        + usize::from(choice.gradient_inputs != active.gradient_inputs)
+                        + usize::from(
+                            (choice.gradient_inputs, choice.bf16_bt_gradients)
+                                != (active.gradient_inputs, active.bf16_bt_gradients),
+                        )
                         + usize::from(choice.conv_gradient_inputs != active.conv_gradient_inputs),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
@@ -3558,6 +3567,28 @@ mod tests {
             assert_eq!(fill_gradient_candidates(&mut locked, dtype, false), 0);
             assert_eq!(fill_gradient_candidates(&mut locked, dtype, true), 2);
         }
+    }
+
+    #[test]
+    fn mixed_gradient_rejection_leaves_plan_unchanged() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[1500, 384]);
+        let w = graph.parameter("w", &[384, 384]);
+        let y = graph.matmul(x, w);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let mut plan = compile::compile(&crate::autodiff::differentiate(&graph));
+        for d in &mut plan.dispatches {
+            if d.is_derivative && d.shader == compile::ShaderEntry::MatMulBT {
+                d.requires_full_precision = true;
+            }
+        }
+        let original = plan.clone();
+        assert_eq!(
+            fill_gradient_candidates_typed(&mut plan, crate::DType::F16, crate::DType::BF16, true),
+            0
+        );
+        assert_eq!(plan, original);
     }
 
     #[test]
