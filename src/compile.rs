@@ -1017,15 +1017,70 @@ fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
 
 /// Order dependent dispatches, form barrier groups, then fuse within groups.
 pub fn schedule_dispatches(plan: &mut ExecutionPlan, serial: bool, fuse_horizontal: bool) {
-    plan.groups = schedule_sequence(&mut plan.dispatches, serial, fuse_horizontal);
+    let pinned = non_aliasable_hint(plan);
+    plan.groups = schedule_sequence(
+        &mut plan.dispatches,
+        &plan.buffers,
+        &pinned,
+        serial,
+        fuse_horizontal,
+    );
+}
+
+/// Buffers that stay live across the whole step (parameters, inputs, outputs,
+/// gradients, constants, caches) and therefore should not count as reclaimable
+/// intermediate pressure during memory-aware dispatch scheduling.
+pub(crate) fn non_aliasable_hint(plan: &ExecutionPlan) -> Vec<bool> {
+    let n = plan.buffers.len();
+    let mut pinned = vec![false; n];
+    let mut mark = |b: BufferRef| {
+        if let Some(slot) = pinned.get_mut(b.0 as usize) {
+            *slot = true;
+        }
+    };
+    for &(_, b) in &plan.param_buffers {
+        mark(b);
+    }
+    for &(_, b) in &plan.input_buffers {
+        mark(b);
+    }
+    for &(b, _) in &plan.constant_buffers {
+        mark(b);
+    }
+    for &b in &plan.output_buffers {
+        mark(b);
+    }
+    if let Some(b) = plan.loss_buffer {
+        mark(b);
+    }
+    for &(p, g) in &plan.param_grad_pairs {
+        mark(p);
+        mark(g);
+    }
+    for entry in &plan.derived_params {
+        mark(entry.0);
+    }
+    for &b in plan.weight_buffers.keys() {
+        mark(b);
+    }
+    for d in &plan.dispatches {
+        if d.shader == ShaderEntry::CacheWrite
+            || (d.parameter_invariant && plan.param_grad_pairs.is_empty())
+        {
+            mark(d.output_buffer);
+        }
+    }
+    pinned
 }
 
 fn schedule_sequence(
     dispatches: &mut Vec<Dispatch>,
+    buffer_sizes: &[usize],
+    pinned: &[bool],
     serial: bool,
     fuse_horizontal: bool,
 ) -> Vec<std::ops::Range<usize>> {
-    reorder_by_level(dispatches);
+    reorder_memory_aware(dispatches, buffer_sizes, pinned, fuse_horizontal);
     let mut groups = if serial {
         (0..dispatches.len()).map(|i| i..i + 1).collect()
     } else {
@@ -1038,50 +1093,421 @@ fn schedule_sequence(
     groups
 }
 
-/// Stable dependency ordering places independent dispatches next to each other.
-fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
+/// Build RAW, WAR, and WAW dependency edges in original dispatch order.
+fn dependency_dag(dispatches: &[Dispatch]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let n = dispatches.len();
-    if n == 0 {
-        return;
-    }
-    // Map: buffer id → index of the dispatch that writes it.
-    let mut producer: HashMap<u32, usize> = HashMap::new();
-    let mut levels = vec![0u32; n];
+    let mut preds = vec![Vec::new(); n];
+    let mut succs = vec![Vec::new(); n];
+    let mut last_writer: HashMap<u32, usize> = HashMap::new();
+    let mut last_readers: HashMap<u32, Vec<usize>> = HashMap::new();
+
+    let add_edge = |from: usize, to: usize, preds: &mut [Vec<usize>], succs: &mut [Vec<usize>]| {
+        if from != to && !preds[to].contains(&from) {
+            preds[to].push(from);
+            succs[from].push(to);
+        }
+    };
+
     for (i, dispatch) in dispatches.iter().enumerate() {
-        let level = dispatch
-            .input_buffers
-            .iter()
-            .filter_map(|b| producer.get(&b.0))
-            .map(|&pred| levels[pred] + 1)
-            .max()
-            .unwrap_or(0);
-        levels[i] = level;
-        producer.insert(dispatch.output_buffer.0, i);
-        for &extra in &dispatch.extra_outputs {
-            producer.insert(extra.0, i);
+        let reads = dispatch.read_buffers();
+        let writes: Vec<BufferRef> = dispatch.write_buffers().collect();
+
+        // RAW: reader depends on most recent writer.
+        for b in &reads {
+            if let Some(&w) = last_writer.get(&b.0) {
+                add_edge(w, i, &mut preds, &mut succs);
+            }
+        }
+        // WAW and WAR: writer depends on prior writer and any readers since.
+        for b in &writes {
+            if let Some(&w) = last_writer.get(&b.0) {
+                add_edge(w, i, &mut preds, &mut succs);
+            }
+            if let Some(readers) = last_readers.get(&b.0) {
+                for &r in readers {
+                    add_edge(r, i, &mut preds, &mut succs);
+                }
+            }
+        }
+
+        for b in reads {
+            let readers = last_readers.entry(b.0).or_default();
+            if !readers.contains(&i) {
+                readers.push(i);
+            }
+        }
+        for b in writes {
+            last_writer.insert(b.0, i);
+            last_readers.remove(&b.0);
         }
     }
-    // Stable sort by level keeps topological order within a level.
+    (preds, succs)
+}
+
+/// Memory-aware level ordering within the minimum barrier-group depth.
+///
+/// Preserves the exact minimum number of barrier groups (`max_level + 1`) and
+/// keeps horizontally-fusable same-A matmul siblings on the same level, while
+/// using each dispatch's `[ASAP, ALAP]` slack to minimize peak live
+/// intermediate bytes (and total byte-groups as a tie-breaker).
+fn reorder_memory_aware(
+    dispatches: &mut Vec<Dispatch>,
+    buffer_sizes: &[usize],
+    pinned: &[bool],
+    fuse_horizontal: bool,
+) {
+    let n = dispatches.len();
+    if n <= 1 {
+        return;
+    }
+    let (preds, succs) = dependency_dag(dispatches);
+    let mut asap = vec![0u32; n];
+    for i in 0..n {
+        asap[i] = preds[i].iter().map(|&p| asap[p] + 1).max().unwrap_or(0);
+    }
+    let max_level = asap.iter().copied().max().unwrap_or(0);
+    if max_level == 0 {
+        return;
+    }
+
+    // Group horizontally-fusable siblings at the same ASAP level so memory
+    // scheduling never separates Q/K/V or Gate/Up pairs that could fuse.
+    let mut clique_of = vec![usize::MAX; n];
+    let mut cliques: Vec<Vec<usize>> = Vec::new();
+    for i in 0..n {
+        if clique_of[i] != usize::MAX {
+            continue;
+        }
+        let cid = cliques.len();
+        let mut members = vec![i];
+        clique_of[i] = cid;
+        if fuse_horizontal {
+            for j in (i + 1)..n {
+                if clique_of[j] == usize::MAX
+                    && asap[j] == asap[i]
+                    && can_horizontal_fuse(&dispatches[i], &dispatches[j])
+                {
+                    clique_of[j] = cid;
+                    members.push(j);
+                }
+            }
+        }
+        cliques.push(members);
+    }
+
+    let num_cliques = cliques.len();
+    let mut c_preds = vec![Vec::<usize>::new(); num_cliques];
+    let mut c_succs = vec![Vec::<usize>::new(); num_cliques];
+    for (u, edges) in succs.iter().enumerate() {
+        let cu = clique_of[u];
+        for &v in edges {
+            let cv = clique_of[v];
+            if cu != cv && !c_succs[cu].contains(&cv) {
+                c_succs[cu].push(cv);
+                c_preds[cv].push(cu);
+            }
+        }
+    }
+
+    // Topological order of cliques (guaranteed acyclic since every edge
+    // increases `asap` strictly and cliques group equal-`asap` dispatches).
+    let mut topo_cliques: Vec<usize> = (0..num_cliques).collect();
+    topo_cliques.sort_by_key(|&c| asap[cliques[c][0]]);
+
+    let mut c_asap = vec![0u32; num_cliques];
+    for &c in &topo_cliques {
+        c_asap[c] = c_preds[c].iter().map(|&p| c_asap[p] + 1).max().unwrap_or(0);
+    }
+    let mut c_alap = vec![max_level; num_cliques];
+    for &c in topo_cliques.iter().rev() {
+        c_alap[c] = c_succs[c]
+            .iter()
+            .map(|&s| c_alap[s] - 1)
+            .min()
+            .unwrap_or(max_level);
+    }
+
+    // Track only written, non-pinned buffers with known positive byte size.
+    let mut written_in_seq = HashSet::<usize>::new();
+    for d in dispatches.iter() {
+        for b in d.write_buffers() {
+            written_in_seq.insert(b.0 as usize);
+        }
+    }
+    let mut buf_to_tracked: HashMap<usize, usize> = HashMap::new();
+    let mut tracked_sizes: Vec<u64> = Vec::new();
+    let mut tracked_cliques: Vec<Vec<usize>> = Vec::new();
+    let mut clique_tracked: Vec<Vec<usize>> = vec![Vec::new(); num_cliques];
+
+    for (cid, members) in cliques.iter().enumerate() {
+        for &di in members {
+            let d = &dispatches[di];
+            for b in d.read_buffers().into_iter().chain(d.write_buffers()) {
+                let bi = b.0 as usize;
+                let size = buffer_sizes.get(bi).copied().unwrap_or(0) as u64;
+                let is_pinned = pinned.get(bi).copied().unwrap_or(false);
+                if size == 0 || is_pinned || !written_in_seq.contains(&bi) {
+                    continue;
+                }
+                let tid = *buf_to_tracked.entry(bi).or_insert_with(|| {
+                    let id = tracked_sizes.len();
+                    tracked_sizes.push(size);
+                    tracked_cliques.push(Vec::new());
+                    id
+                });
+                if !tracked_cliques[tid].contains(&cid) {
+                    tracked_cliques[tid].push(cid);
+                }
+                if !clique_tracked[cid].contains(&tid) {
+                    clique_tracked[cid].push(tid);
+                }
+            }
+        }
+    }
+
+    let chosen_clique_levels = if tracked_sizes.is_empty() {
+        c_asap
+    } else {
+        let rev_topo: Vec<usize> = topo_cliques.iter().copied().rev().collect();
+        let (asap_levels, asap_peak, asap_area) = optimize_clique_levels(
+            &c_asap,
+            &rev_topo,
+            max_level,
+            &c_preds,
+            &c_succs,
+            &tracked_sizes,
+            &tracked_cliques,
+            &clique_tracked,
+        );
+        let (alap_levels, alap_peak, alap_area) = optimize_clique_levels(
+            &c_alap,
+            &topo_cliques,
+            max_level,
+            &c_preds,
+            &c_succs,
+            &tracked_sizes,
+            &tracked_cliques,
+            &clique_tracked,
+        );
+        if (alap_peak, alap_area) < (asap_peak, asap_area) {
+            alap_levels
+        } else {
+            asap_levels
+        }
+    };
+
+    // Place dispatches that depend on level `L - 1` first within each level `L`
+    // so `compute_groups` opens a new barrier group at the start of every level
+    // rather than pulling a slack-delayed dispatch back into level `L - 1`.
+    let has_prev_level_pred = |i: usize| -> bool {
+        let lvl = chosen_clique_levels[clique_of[i]];
+        lvl > 0
+            && preds[i]
+                .iter()
+                .any(|&p| chosen_clique_levels[clique_of[p]] + 1 == lvl)
+    };
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&i| levels[i]);
+    order.sort_by_key(|&i| (chosen_clique_levels[clique_of[i]], !has_prev_level_pred(i)));
     let old = std::mem::take(dispatches);
     *dispatches = order.iter().map(|&i| old[i].clone()).collect();
 }
 
-/// Start a new compute pass when a dispatch reads an earlier write.
+/// Coordinate descent on clique levels to minimize `(peak_live_bytes, total_byte_groups)`.
+#[allow(clippy::too_many_arguments)]
+fn optimize_clique_levels(
+    initial: &[u32],
+    visit_order: &[usize],
+    max_level: u32,
+    c_preds: &[Vec<usize>],
+    c_succs: &[Vec<usize>],
+    tracked_sizes: &[u64],
+    tracked_cliques: &[Vec<usize>],
+    clique_tracked: &[Vec<usize>],
+) -> (Vec<u32>, u64, u128) {
+    let mut level = initial.to_vec();
+    let num_levels = max_level as usize + 1;
+    let mut live = vec![0u64; num_levels];
+    let mut total_area = 0u128;
+
+    let span_of = |tid: usize, level: &[u32]| -> (usize, usize) {
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for &cid in &tracked_cliques[tid] {
+            let l = level[cid] as usize;
+            lo = lo.min(l);
+            hi = hi.max(l);
+        }
+        (lo, hi)
+    };
+
+    for (tid, &size) in tracked_sizes.iter().enumerate() {
+        let (lo, hi) = span_of(tid, &level);
+        for slot in &mut live[lo..=hi] {
+            *slot += size;
+        }
+        total_area += u128::from(size) * (hi - lo + 1) as u128;
+    }
+
+    let mut other_bounds: Vec<(usize, usize, u64)> = Vec::new();
+    let mut candidates: Vec<u32> = Vec::new();
+    for _pass in 0..3 {
+        let mut moved = false;
+        for &cid in visit_order {
+            if clique_tracked[cid].is_empty() {
+                continue;
+            }
+            let lo = c_preds[cid]
+                .iter()
+                .map(|&p| level[p] + 1)
+                .max()
+                .unwrap_or(0);
+            let hi = c_succs[cid]
+                .iter()
+                .map(|&s| level[s] - 1)
+                .min()
+                .unwrap_or(max_level);
+            if lo >= hi {
+                continue;
+            }
+
+            // Remove this clique's tracked buffers from `live` and precompute
+            // each buffer's span across all *other* cliques touching it.
+            other_bounds.clear();
+            for &tid in &clique_tracked[cid] {
+                let size = tracked_sizes[tid];
+                let (cur_lo, cur_hi) = span_of(tid, &level);
+                for slot in &mut live[cur_lo..=cur_hi] {
+                    *slot -= size;
+                }
+                total_area -= u128::from(size) * (cur_hi - cur_lo + 1) as u128;
+
+                let mut o_lo = usize::MAX;
+                let mut o_hi = 0usize;
+                for &other in &tracked_cliques[tid] {
+                    if other != cid {
+                        let l = level[other] as usize;
+                        o_lo = o_lo.min(l);
+                        o_hi = o_hi.max(l);
+                    }
+                }
+                other_bounds.push((o_lo, o_hi, size));
+            }
+
+            let base_peak = live.iter().copied().max().unwrap_or(0);
+            candidates.clear();
+            if hi - lo <= 64 {
+                candidates.extend(lo..=hi);
+            } else {
+                candidates.push(lo);
+                candidates.push(hi);
+                candidates.push(level[cid]);
+                for &(o_lo, o_hi, _) in &other_bounds {
+                    if o_lo != usize::MAX {
+                        candidates.push((o_lo as u32).clamp(lo, hi));
+                        candidates.push((o_hi as u32).clamp(lo, hi));
+                    }
+                }
+                let step = ((hi - lo) / 32).max(1);
+                let mut g = lo;
+                while g < hi {
+                    candidates.push(g);
+                    g += step;
+                }
+                candidates.sort_unstable();
+                candidates.dedup();
+            }
+
+            let mut best_lvl = level[cid];
+            let mut best_score = (u64::MAX, u128::MAX);
+            for &cand in &candidates {
+                let c = cand as usize;
+                let mut area = total_area;
+                let mut union_lo = usize::MAX;
+                let mut union_hi = 0usize;
+                for &(o_lo, o_hi, size) in &other_bounds {
+                    let (s, e) = if o_lo == usize::MAX {
+                        (c, c)
+                    } else {
+                        (o_lo.min(c), o_hi.max(c))
+                    };
+                    union_lo = union_lo.min(s);
+                    union_hi = union_hi.max(e);
+                    area += u128::from(size) * (e - s + 1) as u128;
+                    for slot in &mut live[s..=e] {
+                        *slot += size;
+                    }
+                }
+                let mut peak = base_peak;
+                for &v in &live[union_lo..=union_hi] {
+                    peak = peak.max(v);
+                }
+                for &(o_lo, o_hi, size) in &other_bounds {
+                    let (s, e) = if o_lo == usize::MAX {
+                        (c, c)
+                    } else {
+                        (o_lo.min(c), o_hi.max(c))
+                    };
+                    for slot in &mut live[s..=e] {
+                        *slot -= size;
+                    }
+                }
+                let score = (peak, area);
+                if score < best_score || (score == best_score && cand < best_lvl) {
+                    best_score = score;
+                    best_lvl = cand;
+                }
+            }
+
+            if best_lvl != level[cid] {
+                level[cid] = best_lvl;
+                moved = true;
+            }
+            let c = level[cid] as usize;
+            for &(o_lo, o_hi, size) in &other_bounds {
+                let (s, e) = if o_lo == usize::MAX {
+                    (c, c)
+                } else {
+                    (o_lo.min(c), o_hi.max(c))
+                };
+                for slot in &mut live[s..=e] {
+                    *slot += size;
+                }
+                total_area += u128::from(size) * (e - s + 1) as u128;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    let peak = live.iter().copied().max().unwrap_or(0);
+    (level, peak, total_area)
+}
+
+/// Start a new compute pass when a dispatch has a RAW, WAR, or WAW hazard with
+/// an earlier dispatch in the current group.
 fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
-    let mut dirty = HashSet::<u32>::new();
+    let mut dirty_writes = HashSet::<u32>::new();
+    let mut dirty_reads = HashSet::<u32>::new();
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+        let reads = dispatch.read_buffers();
+        let writes: Vec<BufferRef> = dispatch.write_buffers().collect();
+        let hazard = reads.iter().any(|b| dirty_writes.contains(&b.0))
+            || writes
+                .iter()
+                .any(|b| dirty_writes.contains(&b.0) || dirty_reads.contains(&b.0));
+        if hazard {
             groups.push(start..i);
             start = i;
-            dirty.clear();
+            dirty_writes.clear();
+            dirty_reads.clear();
         }
-        dirty.insert(dispatch.output_buffer.0);
-        for &extra in &dispatch.extra_outputs {
-            dirty.insert(extra.0);
+        for b in reads {
+            dirty_reads.insert(b.0);
+        }
+        for b in writes {
+            dirty_writes.insert(b.0);
         }
     }
     if !dispatches.is_empty() {
@@ -1096,7 +1522,7 @@ fn warn_on_hazards(dispatches: &[Dispatch], groups: &[std::ops::Range<usize>]) {
         let mut written = HashSet::<u32>::new();
         for i in group.clone() {
             let d = &dispatches[i];
-            for ib in &d.input_buffers {
+            for ib in d.read_buffers() {
                 if written.contains(&ib.0) {
                     log::warn!(
                         "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
@@ -1106,9 +1532,8 @@ fn warn_on_hazards(dispatches: &[Dispatch], groups: &[std::ops::Range<usize>]) {
                     );
                 }
             }
-            written.insert(d.output_buffer.0);
-            for &extra in &d.extra_outputs {
-                written.insert(extra.0);
+            for ob in d.write_buffers() {
+                written.insert(ob.0);
             }
         }
     }
@@ -1460,6 +1885,33 @@ impl Dispatch {
             Kernel::Reduction(ref mut kernel) => Some(kernel),
             _ => None,
         }
+    }
+
+    /// All buffers read by this dispatch, including fused prologue, epilogue,
+    /// folded GEMV-RMSNorm weights, and read-modify-write outputs.
+    pub(crate) fn read_buffers(&self) -> Vec<BufferRef> {
+        let mut reads = self.input_buffers.clone();
+        if let Some(ref epi) = self.matmul_epilogue {
+            reads.extend(epi.inputs.iter().map(|&(b, _)| b));
+        }
+        if let Some(ref pro) = self.matmul_prologue {
+            reads.extend(pro.factors.iter().map(|&(b, _)| b));
+        }
+        if let Some(ref rn) = self.gemv_rmsnorm {
+            reads.push(rn.weight);
+        }
+        if matches!(
+            self.shader,
+            ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic
+        ) {
+            reads.push(self.output_buffer);
+        }
+        reads
+    }
+
+    /// All buffers written by this dispatch.
+    pub(crate) fn write_buffers(&self) -> impl Iterator<Item = BufferRef> + '_ {
+        std::iter::once(self.output_buffer).chain(self.extra_outputs.iter().copied())
     }
 }
 
@@ -5634,5 +6086,185 @@ mod tests {
             p_const.dataflow_digest(),
             "Fill and bit-identical uniform Constant must produce the same dataflow digest"
         );
+    }
+
+    #[test]
+    fn memory_aware_schedule_delays_skip_branch_without_adding_barriers() {
+        // Input x (buf 0) feeds:
+        // - a 4-stage main branch: 0 -> 1 -> 2 -> 3 -> 4 (16 KiB each)
+        // - a 1-stage skip projection: 0 -> 5 (1 MiB!)
+        // - a final residual add: (4, 5) -> 6 (output)
+        // Pure ASAP runs the 1 MiB skip projection in group 0 and keeps it live
+        // across all 5 barrier groups alongside the main branch. Memory-aware
+        // scheduling delays it to group 3 (just before the add in group 4)
+        // without increasing the barrier-group count.
+        let make = |inputs: &[u32], output: u32| Dispatch {
+            input_buffers: inputs.iter().map(|&b| BufferRef(b)).collect(),
+            output_buffer: BufferRef(output),
+            ..Default::default()
+        };
+        let mut plan = ExecutionPlan {
+            buffers: vec![16_384, 16_384, 16_384, 16_384, 16_384, 1 << 20, 1 << 20],
+            input_buffers: vec![("x".into(), BufferRef(0))],
+            output_buffers: vec![BufferRef(6)],
+            dispatches: vec![
+                make(&[0], 5),    // skip projection (1 MiB)
+                make(&[0], 1),    // main 0
+                make(&[1], 2),    // main 1
+                make(&[2], 3),    // main 2
+                make(&[3], 4),    // main 3
+                make(&[4, 5], 6), // residual add
+            ],
+            ..compile(&Graph::new())
+        };
+        schedule_dispatches(&mut plan, false, false);
+        assert_eq!(plan.groups.len(), 5, "minimum barrier depth preserved");
+        let skip_group = plan
+            .groups
+            .iter()
+            .position(|r| {
+                r.clone()
+                    .any(|i| plan.dispatches[i].output_buffer == BufferRef(5))
+            })
+            .unwrap();
+        assert_eq!(
+            skip_group, 3,
+            "skip branch should be delayed right before the merge in group 4"
+        );
+    }
+
+    #[test]
+    fn memory_aware_schedule_keeps_eager_grad_weight_and_horizontal_qkv_fusion() {
+        // Horizontal Q/K/V matmuls sharing input 0 must stay in the same group
+        // and fuse, even though Q and K feed an extra RoPE step before attention
+        // while V goes straight to attention. Meanwhile a backward dW sink
+        // writing a pinned gradient must stay eager so its activation input dies.
+        let matmul = |a: u32, b: u32, c: u32| Dispatch {
+            shader: ShaderEntry::MatMul,
+            workgroups: [2, 2, 1],
+            input_buffers: vec![BufferRef(a), BufferRef(b)],
+            output_buffer: BufferRef(c),
+            params: vec![128, 128, 128, 0],
+            ..Default::default()
+        };
+        let unary = |a: u32, c: u32| Dispatch {
+            shader: ShaderEntry::RoPE,
+            input_buffers: vec![BufferRef(a)],
+            output_buffer: BufferRef(c),
+            ..Default::default()
+        };
+        let mut plan = ExecutionPlan {
+            buffers: vec![65_536; 13],
+            input_buffers: vec![("x".into(), BufferRef(0))],
+            param_buffers: vec![
+                ("wq".into(), BufferRef(1)),
+                ("wk".into(), BufferRef(2)),
+                ("wv".into(), BufferRef(3)),
+            ],
+            output_buffers: vec![BufferRef(11)],
+            param_grad_pairs: vec![(BufferRef(1), BufferRef(12))],
+            dispatches: vec![
+                matmul(0, 1, 4), // Q
+                matmul(0, 2, 5), // K
+                matmul(0, 3, 6), // V
+                unary(4, 7),     // RoPE(Q)
+                unary(5, 8),     // RoPE(K)
+                Dispatch {
+                    input_buffers: vec![BufferRef(7), BufferRef(8), BufferRef(6)],
+                    output_buffer: BufferRef(9),
+                    ..Default::default()
+                }, // Attn -> 9
+                unary(9, 10),    // post 1
+                unary(10, 11),   // output
+                Dispatch {
+                    input_buffers: vec![BufferRef(9), BufferRef(0)],
+                    output_buffer: BufferRef(12),
+                    ..Default::default()
+                }, // dW reading buf 9, writing pinned grad 12
+            ],
+            ..compile(&Graph::new())
+        };
+        schedule_dispatches(&mut plan, false, true);
+        assert!(
+            plan.dispatches.iter().any(|d| d.horizontal_batch == 3),
+            "Q/K/V siblings must remain grouped for 3-way horizontal fusion"
+        );
+        let dw_group = plan
+            .groups
+            .iter()
+            .position(|r| {
+                r.clone()
+                    .any(|i| plan.dispatches[i].output_buffer == BufferRef(12))
+            })
+            .unwrap();
+        let attn_group = plan
+            .groups
+            .iter()
+            .position(|r| {
+                r.clone()
+                    .any(|i| plan.dispatches[i].output_buffer == BufferRef(9))
+            })
+            .unwrap();
+        assert_eq!(
+            dw_group,
+            attn_group + 1,
+            "pinned gradient sink must stay eager right after its activation producer"
+        );
+    }
+
+    #[test]
+    fn schedule_respects_prologue_epilogue_and_rmw_hazards() {
+        let mut d_matmul = Dispatch {
+            shader: ShaderEntry::MatMul,
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(3),
+            matmul_prologue: Some(MatMulPrologue {
+                factors: vec![(BufferRef(2), PrologueLoadKind::PerRow)],
+            }),
+            ..Default::default()
+        };
+        let d_rsqrt = Dispatch {
+            shader: ShaderEntry::RmsNormRsqrt,
+            input_buffers: vec![BufferRef(0)],
+            output_buffer: BufferRef(2),
+            ..Default::default()
+        };
+        let d_scatter1 = Dispatch {
+            shader: ShaderEntry::ScatterAdd,
+            input_buffers: vec![BufferRef(0), BufferRef(3)],
+            output_buffer: BufferRef(4),
+            ..Default::default()
+        };
+        let d_scatter2 = Dispatch {
+            shader: ShaderEntry::ScatterAdd,
+            input_buffers: vec![BufferRef(0), BufferRef(3)],
+            output_buffer: BufferRef(4),
+            ..Default::default()
+        };
+        let mut plan = ExecutionPlan {
+            buffers: vec![4096; 5],
+            input_buffers: vec![("x".into(), BufferRef(0))],
+            param_buffers: vec![("w".into(), BufferRef(1))],
+            output_buffers: vec![BufferRef(4)],
+            dispatches: vec![d_rsqrt, d_matmul.clone(), d_scatter1, d_scatter2],
+            ..compile(&Graph::new())
+        };
+        schedule_dispatches(&mut plan, false, false);
+        assert_eq!(
+            plan.groups.len(),
+            4,
+            "prologue RAW and ScatterAdd WAW must each separate into distinct barrier groups"
+        );
+        // Verify read_buffers includes epilogue inputs too.
+        d_matmul.matmul_epilogue = Some(MatMulEpilogue {
+            dag: PointwiseDAG {
+                n_inputs: 2,
+                ops: vec![],
+                output: 0,
+            },
+            inputs: vec![(BufferRef(4), EpilogueLoadKind::PerElement)],
+        });
+        assert!(d_matmul.read_buffers().contains(&BufferRef(2)));
+        assert!(d_matmul.read_buffers().contains(&BufferRef(4)));
     }
 }

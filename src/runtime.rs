@@ -4337,8 +4337,8 @@ impl Session {
             }
             for (i, &phys) in alias.map.iter().enumerate() {
                 eprintln!(
-                    "buf {i:03} ({} B) -> phys {phys} ({} B)",
-                    plan.buffers[i], alias.sizes[phys]
+                    "buf {i:03} ({} B) -> phys {phys}+{} ({} B)",
+                    plan.buffers[i], alias.offsets[i], alias.sizes[phys]
                 );
             }
         }

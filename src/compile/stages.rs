@@ -45,7 +45,7 @@ pub(crate) fn schedule(
         }
         if let Some(&producer) = producers.get(&buffer) {
             early[producer] = true;
-            pending.extend(plan.dispatches[producer].input_buffers.iter().copied());
+            pending.extend(plan.dispatches[producer].read_buffers());
         }
     }
     let early_inputs = inputs.intersection(&ready).copied().collect();
@@ -60,9 +60,18 @@ pub(crate) fn schedule(
             suffix.push(dispatch);
         }
     }
-    let mut groups = super::schedule_sequence(&mut prefix, serial, fuse);
+    let base_pinned = super::non_aliasable_hint(plan);
+    let mut prefix_pinned = base_pinned.clone();
+    for &b in &ready {
+        if let Some(slot) = prefix_pinned.get_mut(b.0 as usize) {
+            *slot = true;
+        }
+    }
+    let mut groups =
+        super::schedule_sequence(&mut prefix, &plan.buffers, &prefix_pinned, serial, fuse);
     let prefix_groups = groups.len();
-    let suffix_groups = super::schedule_sequence(&mut suffix, serial, fuse);
+    let suffix_groups =
+        super::schedule_sequence(&mut suffix, &plan.buffers, &base_pinned, serial, fuse);
     let offset = prefix.len();
     groups.extend(
         suffix_groups

@@ -354,58 +354,135 @@ pub fn plan_buffer_aliasing(
         );
     }
 
-    // Greedy best-fit over live intervals [first_write, last_use].
+    // 2D interval slab sub-allocation over live intervals [first_write, last_use].
+    //
+    // Sorting intermediates by size descending places the largest tensors at
+    // offset 0 first, then packs concurrent smaller tensors into aligned gaps
+    // left behind by dead larger tensors within ARENA_CHUNK_BYTES (128 MiB)
+    // slabs. Every tenant offset is a multiple of ARENA_ALIGNMENT (256 B) and
+    // conflicting live intervals occupy strictly disjoint byte ranges.
+    let mut offsets = vec![0usize; n];
     let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i] && !dead[i]).collect();
     order.sort_by_key(|&i| {
         (
-            uses[i].first_write.unwrap(),
             std::cmp::Reverse(plan.buffers[i]),
+            uses[i].first_write.unwrap(),
+            i,
         )
     });
-    // Allocations open for reuse: (last group used, physical index).
-    let mut pool: Vec<(usize, usize)> = Vec::new();
+
+    struct SlabTenant {
+        start: usize,
+        end: usize,
+        offset: usize,
+        aligned_size: usize,
+    }
+    struct IntermediateSlab {
+        phys: usize,
+        size: usize,
+        tenants: Vec<SlabTenant>,
+    }
+
+    let find_slab_offset = |slab: &IntermediateSlab,
+                            start: usize,
+                            end: usize,
+                            need: usize,
+                            aligned_size: usize|
+     -> Option<(usize, usize)> {
+        let oversized = need > ARENA_CHUNK_BYTES;
+        if oversized != (slab.size > ARENA_CHUNK_BYTES) {
+            return None;
+        }
+        let mut busy: Vec<(usize, usize)> = slab
+            .tenants
+            .iter()
+            .filter(|t| t.start <= end && start <= t.end)
+            .map(|t| (t.offset, t.offset + t.aligned_size))
+            .collect();
+        if oversized {
+            return busy.is_empty().then_some((0, slab.size.max(need)));
+        }
+        busy.sort_unstable();
+        let mut cursor = 0usize;
+        let mut best_gap: Option<(usize, usize)> = None; // (gap_bytes, offset)
+        for (lo, hi) in busy {
+            if lo > cursor {
+                let gap = lo - cursor;
+                if gap >= aligned_size && best_gap.is_none_or(|(best_size, _)| gap < best_size) {
+                    best_gap = Some((gap, cursor));
+                }
+            }
+            cursor = cursor.max(hi);
+        }
+        if let Some((_, offset)) = best_gap {
+            return Some((offset, slab.size.max(offset + need)));
+        }
+        let end_offset = cursor.checked_add(need)?;
+        if end_offset <= ARENA_CHUNK_BYTES {
+            Some((cursor, slab.size.max(end_offset)))
+        } else {
+            None
+        }
+    };
+
+    let mut slabs: Vec<IntermediateSlab> = Vec::new();
     for i in order {
         let start = uses[i].first_write.unwrap();
         let end = uses[i].last_use.unwrap();
         let need = plan.buffers[i];
-        // Among allocations free strictly before `start`, prefer the
-        // smallest that already fits; otherwise the largest (grows least).
-        let mut best: Option<usize> = None; // index into pool
-        for (pi, &(free_after, phys)) in pool.iter().enumerate() {
-            if free_after >= start {
+        let aligned_size = need.max(16).next_multiple_of(ARENA_ALIGNMENT);
+
+        // Prefer a slab that fits with zero growth (smallest offset first);
+        // otherwise pick the slab with minimum growth within ARENA_CHUNK_BYTES.
+        let mut best: Option<(usize, usize, usize, usize)> = None; // (growth, new_size, offset, slab_idx)
+        for (si, slab) in slabs.iter().enumerate() {
+            let Some((offset, new_size)) = find_slab_offset(slab, start, end, need, aligned_size)
+            else {
                 continue;
+            };
+            let growth = new_size.saturating_sub(slab.size);
+            let candidate = (growth, new_size, offset, si);
+            if best.is_none_or(|cur| candidate < cur) {
+                best = Some(candidate);
             }
-            best = Some(match best {
-                None => pi,
-                Some(bi) => {
-                    let (bs, cs) = (sizes[pool[bi].1], sizes[phys]);
-                    let better = if bs >= need && cs >= need {
-                        cs < bs
-                    } else {
-                        cs > bs
-                    };
-                    if better { pi } else { bi }
-                }
-            });
         }
+
         match best {
-            Some(pi) => {
-                let phys = pool[pi].1;
-                sizes[phys] = sizes[phys].max(need);
-                pool[pi].0 = end;
-                map[i] = phys;
+            Some((_, new_size, offset, si)) => {
+                let slab = &mut slabs[si];
+                slab.size = new_size;
+                sizes[slab.phys] = new_size;
+                slab.tenants.push(SlabTenant {
+                    start,
+                    end,
+                    offset,
+                    aligned_size,
+                });
+                map[i] = slab.phys;
+                offsets[i] = offset;
             }
             None => {
-                map[i] = sizes.len();
+                let phys = sizes.len();
                 sizes.push(need);
                 device_local.push(true);
-                pool.push((end, map[i]));
+                slabs.push(IntermediateSlab {
+                    phys,
+                    size: need,
+                    tenants: vec![SlabTenant {
+                        start,
+                        end,
+                        offset: 0,
+                        aligned_size,
+                    }],
+                });
+                map[i] = phys;
+                offsets[i] = 0;
             }
         }
     }
 
     AliasPlan {
-        offsets: vec![0; map.len()],
+        offsets,
         map,
         sizes,
         device_local,
@@ -599,21 +676,10 @@ fn compute_pinned(
     let mut uses = vec![BufferUse::default(); n];
     for (i, d) in plan.dispatches.iter().enumerate() {
         let g = group_of[i];
-        for b in &d.input_buffers {
+        for b in d.read_buffers() {
             uses[b.0 as usize].read(g);
         }
-        if let Some(epi) = d.matmul_epilogue.as_ref() {
-            for &(b, _) in &epi.inputs {
-                uses[b.0 as usize].read(g);
-            }
-        }
-        if let Some(pro) = d.matmul_prologue.as_ref() {
-            for &(b, _) in &pro.factors {
-                uses[b.0 as usize].read(g);
-            }
-        }
-        uses[d.output_buffer.0 as usize].write(g);
-        for b in &d.extra_outputs {
+        for b in d.write_buffers() {
             uses[b.0 as usize].write(g);
         }
         match d.shader {
@@ -623,10 +689,6 @@ fn compute_pinned(
             // it: without gradients, no step changes the parameters.
             _ if d.parameter_invariant && plan.param_grad_pairs.is_empty() => {
                 pinned[d.output_buffer.0 as usize] = true;
-            }
-            // Read-modify-write accumulation into the output.
-            ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic => {
-                uses[d.output_buffer.0 as usize].read(g);
             }
             _ => {}
         }
@@ -732,8 +794,9 @@ mod tests {
         }
     }
 
-    /// Every pair of logical buffers sharing a physical allocation must
-    /// have strictly disjoint live intervals at group granularity.
+    /// Every pair of logical buffers with overlapping physical bytes must
+    /// have strictly disjoint live intervals at group granularity, and every
+    /// sub-allocation offset must respect ARENA_ALIGNMENT and slab bounds.
     fn check_disjoint(plan: &ExecutionPlan, groups: &[Range<usize>], alias: &AliasPlan) {
         let mut group_of = vec![0usize; plan.dispatches.len()];
         for (gi, r) in groups.iter().enumerate() {
@@ -749,21 +812,38 @@ mod tests {
                 iv.0 = iv.0.min(g);
                 iv.1 = iv.1.max(g);
             };
-            for b in &d.input_buffers {
+            for b in d.read_buffers() {
                 touch(b.0);
             }
-            touch(d.output_buffer.0);
+            for b in d.write_buffers() {
+                touch(b.0);
+            }
+        }
+        for i in 0..plan.buffers.len() {
+            assert_eq!(
+                alias.offsets[i] % ARENA_ALIGNMENT,
+                0,
+                "buffer {i} offset {} not aligned to {ARENA_ALIGNMENT}",
+                alias.offsets[i]
+            );
+            assert!(
+                alias.offsets[i] + plan.buffers[i] <= alias.sizes[alias.map[i]],
+                "buffer {i} [{}..{}] exceeds physical allocation {}",
+                alias.offsets[i],
+                alias.offsets[i] + plan.buffers[i],
+                alias.sizes[alias.map[i]]
+            );
         }
         for a in 0..plan.buffers.len() {
             for b in (a + 1)..plan.buffers.len() {
-                if alias.map[a] != alias.map[b] {
+                if !alias.overlap(&plan.buffers, a, b) {
                     continue;
                 }
                 let (sa, ea) = intervals[a];
                 let (sb, eb) = intervals[b];
                 assert!(
                     ea < sb || eb < sa,
-                    "buffers {a} [{sa},{ea}] and {b} [{sb},{eb}] share an allocation"
+                    "buffers {a} [{sa},{ea}] and {b} [{sb},{eb}] overlap in physical memory"
                 );
             }
         }
@@ -772,8 +852,8 @@ mod tests {
     #[test]
     fn chain_reuses_disjoint_intermediates() {
         // x -> t1 -> t2 -> t3 -> out, one dispatch per barrier group.
-        // t1 dies at group 1, t3 is born at group 2: they may share.
-        // t2 overlaps both ends: it may not.
+        // t1 dies at group 1, t3 is born at group 2: they may overlap in memory.
+        // t2 overlaps both ends: its byte range must stay disjoint from both.
         let mut p = plan(
             vec![16, 100, 16, 200, 16],
             vec![
@@ -788,12 +868,17 @@ mod tests {
         let groups: Vec<Range<usize>> = (0..4).map(|i| i..i + 1).collect();
         let alias = plan_buffer_aliasing(&p, &groups, None);
 
-        assert_eq!(alias.map[1], alias.map[3], "t1 and t3 should alias");
-        assert_ne!(alias.map[2], alias.map[1], "t2 overlaps t1");
+        assert!(
+            alias.overlap(&p.buffers, 1, 3),
+            "t1 and t3 should reuse memory"
+        );
+        assert!(!alias.overlap(&p.buffers, 2, 1), "t2 overlaps t1 in time");
+        assert!(!alias.overlap(&p.buffers, 2, 3), "t2 overlaps t3 in time");
         assert_ne!(alias.map[0], alias.map[1], "inputs are pinned");
         assert_ne!(alias.map[4], alias.map[3], "outputs are pinned");
-        // Shared allocation sized for the larger tenant.
-        assert_eq!(alias.sizes[alias.map[1]], 200);
+        // All three intermediates pack into one device-local slab.
+        assert_eq!(alias.map[1], alias.map[2]);
+        assert_eq!(alias.map[1], alias.map[3]);
         assert!(alias.physical_bytes() < alias.logical_bytes(&p.buffers));
         check_disjoint(&p, &groups, &alias);
         // Memory classes: intermediates device-local, pinned host-visible.
@@ -809,12 +894,12 @@ mod tests {
         );
         assert_eq!(alias.device_local.len(), alias.sizes.len());
 
-        // A split attention result may not reuse its query's allocation:
+        // A split attention result may not reuse its query's storage:
         // the tuner must be free to evaluate the same operation unsplit.
         p.dispatches[1].shader = ShaderEntry::CachedBlockAttentionSplit;
         p.dispatches[2].shader = ShaderEntry::CachedBlockAttentionCombine;
         let alias = plan_buffer_aliasing(&p, &groups, None);
-        assert_ne!(alias.map[1], alias.map[3]);
+        assert!(!alias.overlap(&p.buffers, 1, 3));
         check_disjoint(&p, &groups, &alias);
     }
 
@@ -911,7 +996,7 @@ mod tests {
     #[test]
     fn same_group_buffers_never_share() {
         // Two independent branches in one barrier group run concurrently;
-        // their outputs must not share even though dispatch indices differ.
+        // their byte ranges must not overlap even though they may share a slab.
         let mut p = plan(
             vec![16, 64, 64, 16],
             vec![dispatch(&[0], 1), dispatch(&[0], 2), dispatch(&[1, 2], 3)],
@@ -920,8 +1005,79 @@ mod tests {
         p.output_buffers.push(BufferRef(3));
         let groups = vec![0..2, 2..3];
         let alias = plan_buffer_aliasing(&p, &groups, None);
-        assert_ne!(alias.map[1], alias.map[2]);
+        assert!(!alias.overlap(&p.buffers, 1, 2));
         check_disjoint(&p, &groups, &alias);
+    }
+
+    #[test]
+    fn slab_suballocation_packs_concurrent_buffers_into_dead_region() {
+        // Phase 0: one 1 MiB intermediate `a` (buf 1) written & consumed by phase 1.
+        // Phase 2: two concurrent 512 KiB intermediates `b` (buf 2) and `c` (buf 3)
+        //          that are disjoint from `a` (`a` dies at group 1, `b`/`c` born at group 2).
+        // Whole-buffer reuse would need 1.5 MiB across 2 allocations; 2D slab
+        // sub-allocation places both `b` and `c` side-by-side inside `a`'s 1 MiB slab.
+        let mib = 1 << 20;
+        let half = 512 << 10;
+        let mut p = plan(
+            vec![16, mib, half, half, 16, 16],
+            vec![
+                dispatch(&[0], 1),    // group 0: write a (1 MiB)
+                dispatch(&[1], 4),    // group 1: consume a -> pinned out 4
+                dispatch(&[0], 2),    // group 2: write b (512 KiB)
+                dispatch(&[0], 3),    // group 2: write c (512 KiB)
+                dispatch(&[2, 3], 5), // group 3: consume b, c -> pinned out 5
+            ],
+        );
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.extend([BufferRef(4), BufferRef(5)]);
+        let groups = vec![0..1, 1..2, 2..4, 4..5];
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+
+        check_disjoint(&p, &groups, &alias);
+        assert_eq!(alias.map[1], alias.map[2]);
+        assert_eq!(alias.map[1], alias.map[3]);
+        assert!(!alias.overlap(&p.buffers, 2, 3));
+        assert_eq!(
+            alias.device_local_bytes(),
+            mib,
+            "two 512 KiB concurrent buffers should pack into the dead 1 MiB slab"
+        );
+    }
+
+    #[test]
+    fn slab_suballocation_respects_chunk_ceiling_and_oversized_buffers() {
+        // Two concurrent 80 MiB buffers cannot share a 128 MiB slab, while two
+        // disjoint 160 MiB oversized buffers still reuse one 160 MiB allocation.
+        let m80 = 80 << 20;
+        let m160 = 160 << 20;
+        let mut p = plan(
+            vec![16, m80, m80, m160, m160, 16],
+            vec![
+                dispatch(&[0], 1),    // group 0: write 80 MiB #1
+                dispatch(&[0], 2),    // group 0: write 80 MiB #2
+                dispatch(&[1, 2], 3), // group 1: consume both, write 160 MiB #1
+                dispatch(&[3], 5),    // group 2: consume 160 MiB #1
+                dispatch(&[0], 4),    // group 3: write 160 MiB #2 (disjoint from #1)
+                dispatch(&[4], 5),    // group 4: consume 160 MiB #2
+            ],
+        );
+        p.input_buffers.push(("x".into(), BufferRef(0)));
+        p.output_buffers.push(BufferRef(5));
+        let groups = vec![0..2, 2..3, 3..4, 4..5, 5..6];
+        let alias = plan_buffer_aliasing(&p, &groups, None);
+
+        check_disjoint(&p, &groups, &alias);
+        assert_ne!(
+            alias.map[1], alias.map[2],
+            "160 MiB exceeds 128 MiB slab ceiling"
+        );
+        assert!(alias.sizes[alias.map[1]] <= ARENA_CHUNK_BYTES);
+        assert!(alias.sizes[alias.map[2]] <= ARENA_CHUNK_BYTES);
+        assert_eq!(
+            alias.map[3], alias.map[4],
+            "disjoint oversized buffers still alias"
+        );
+        assert_eq!(alias.sizes[alias.map[3]], m160);
     }
 
     #[test]
