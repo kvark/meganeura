@@ -458,6 +458,16 @@ impl ScalarMatmulShape {
             && bn * k % 256 == 0
     }
 
+    /// Padded A and B tiles staged by the scalar kernel, in bytes.
+    pub(crate) fn shared_bytes(self) -> u32 {
+        let (m, n, k) = (self.rows(), self.cols(), self.k_stage);
+        if self.vector_fragments && !self.interleave_columns && m % 64 == 0 && n % 64 == 0 {
+            4 * k * (m + 4 + n + 4)
+        } else {
+            4 * (m * (k + 1) + k * (n + 1))
+        }
+    }
+
     pub fn geometry(self) -> MatMulTile {
         match (self.rows(), self.cols()) {
             (64, 64) => MatMulTile::Large,

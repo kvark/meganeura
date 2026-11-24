@@ -200,7 +200,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        super::super::fill_matrix_candidates(&mut p, dtype, false);
+        super::super::fill_matrix_candidates(&mut p, dtype, false, false, false);
         p
     }
 

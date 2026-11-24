@@ -1959,6 +1959,13 @@ impl Pipelines {
             vector_fragments: false,
         };
         if let Some(shape) = dispatch.scalar_matmul() {
+            let limit = gpu.capabilities().max_compute_shared_memory_size;
+            if limit != 0 && shape.shared_bytes() > limit {
+                return Err(format!(
+                    "scalar tile requires {} shared bytes, device limit is {limit}",
+                    shape.shared_bytes()
+                ));
+            }
             matmul_knobs.k_stage = shape.k_stage;
             matmul_knobs.interleave_columns = shape.interleave_columns;
             matmul_knobs.unroll_k = shape.unroll_k;
@@ -6071,21 +6078,24 @@ mod variant_tests {
             (64, 128, 32, false, false, true),
             (128, 128, 8, false, false, true),
         ] {
+            let shape = crate::codegen::ScalarMatmulShape {
+                tile_size,
+                tile_n,
+                k_stage,
+                interleave_columns,
+                unroll_k,
+                vector_fragments,
+            };
+            let limit = gpu.capabilities().max_compute_shared_memory_size;
+            if limit != 0 && shape.shared_bytes() > limit {
+                continue;
+            }
             let mut graph = crate::Graph::new();
             let x = graph.input("x", &[m, k]);
             let w = graph.parameter("w", &[k, n]);
             let product = graph.matmul(x, w);
-            graph.nodes_mut()[product as usize].matmul_impl = Some(crate::graph::MatmulImpl {
-                shape: crate::codegen::ScalarMatmulShape {
-                    tile_size,
-                    tile_n,
-                    k_stage,
-                    interleave_columns,
-                    unroll_k,
-                    vector_fragments,
-                },
-                splits: 1,
-            });
+            graph.nodes_mut()[product as usize].matmul_impl =
+                Some(crate::graph::MatmulImpl { shape, splits: 1 });
             let y = graph.relu(product);
             graph.set_outputs(vec![y]);
             let plan = crate::compile::compile(&graph);

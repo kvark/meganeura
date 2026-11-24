@@ -1073,19 +1073,23 @@ impl Implementations {
             }) {
                 winograd.push(Some(multiply));
             }
+            let subgroup_tiles = gathered(multiply, shape, caps.subgroup_size);
             if self.seeds.iter().any(|s| {
                 fill_matrix_candidates(
                     &mut s.plan.clone(),
                     multiply,
                     self.replace_extracted_matrices,
+                    false,
+                    subgroup_tiles,
                 ) > 0
             }) {
                 let mixed = self.seeds.iter().any(|seed| {
-                    let vector = fill_matrix_candidates_scoped(
+                    let vector = fill_matrix_candidates(
                         &mut seed.plan.clone(),
                         multiply,
                         self.replace_extracted_matrices,
                         true,
+                        subgroup_tiles,
                     );
                     vector > 0
                         && vector
@@ -1093,6 +1097,8 @@ impl Implementations {
                                 &mut seed.plan.clone(),
                                 multiply,
                                 self.replace_extracted_matrices,
+                                false,
+                                subgroup_tiles,
                             )
                 });
                 if mixed {
@@ -1106,6 +1112,8 @@ impl Implementations {
                             &mut plan,
                             multiply,
                             self.replace_extracted_matrices,
+                            false,
+                            subgroup_tiles,
                         );
                         storage::fill(&mut plan) != 0
                     })
@@ -1207,15 +1215,8 @@ fn fill_matrix_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
-) -> usize {
-    fill_matrix_candidates_scoped(plan, multiply, replace_extracted, false)
-}
-
-fn fill_matrix_candidates_scoped(
-    plan: &mut ExecutionPlan,
-    multiply: crate::DType,
-    replace_extracted: bool,
     vector_convolutions_only: bool,
+    subgroup_tiles: bool,
 ) -> usize {
     let mut count = 0;
     let mut splits_to_add = Vec::new();
@@ -1233,18 +1234,19 @@ fn fill_matrix_candidates_scoped(
             let Some(positions) = p[9].checked_mul(p[10]) else {
                 continue;
             };
-            let tile = crate::codegen::conv_product_tile(p[4], positions, p[0].max(1));
-            let mut grid = [
-                p[4].div_ceil(tile.rows),
-                positions.div_ceil(tile.columns),
-                p[0],
-            ];
+            let (rows, cols) = if subgroup_tiles {
+                let tile = crate::codegen::conv_product_tile(p[4], positions, p[0].max(1));
+                (tile.rows, tile.columns)
+            } else {
+                (32, 32)
+            };
+            let mut grid = [p[4].div_ceil(rows), positions.div_ceil(cols), p[0]];
             // Few workgroups over a long K (a 7×7 stage's 1×1 convs over 2048
             // channels) split K over workgroup Z: gathered forwards only.
             let stages = (p[1] * p[5] * p[6]).div_ceil(32);
             let workgroups = grid.iter().product::<u32>();
             let gathered =
-                p.len() >= 12 && !crate::kernels::conv::Params::from(&*d).vectorized_forward();
+                subgroup_tiles && !crate::kernels::conv::Params::from(&*d).vectorized_forward();
             let chunks = if gathered && workgroups < 192 && stages >= 32 {
                 384u32.div_ceil(workgroups).clamp(2, stages / 8)
             } else {
@@ -1347,7 +1349,7 @@ fn fill_conv_gradient_candidates(
             // Without whole vectors a gathered product runs where the device
             // has one, and the checked kernel on 32x32 tiles where not.
             let params = crate::kernels::conv::Params::from(&*dispatch);
-            let (rows, cols) = if params.vectorized_forward() || gathered {
+            let (rows, cols) = if gathered {
                 let tile =
                     crate::codegen::conv_tile(crate::codegen::ConvProduct::InputGradient, &params);
                 (tile.rows, tile.columns)
@@ -2134,11 +2136,13 @@ impl measure::Frontier for Implementations {
                 continue;
             }
             if let Some(multiply) = matrix_inputs {
-                if fill_matrix_candidates_scoped(
+                let (shape, subgroup) = self.matrix_shapes[&multiply];
+                if fill_matrix_candidates(
                     &mut plan,
                     multiply,
                     self.replace_extracted_matrices,
                     vector_convolutions_only,
+                    gathered(multiply, shape, subgroup),
                 ) == 0
                 {
                     continue;
@@ -2410,6 +2414,28 @@ mod tests {
     }
 
     #[test]
+    fn checked_convolution_launches_match_the_fallback_shader() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4 * 64 * 56 * 56]);
+        let w = g.parameter("w", &[256 * 64]);
+        let y = g.conv2d(x, w, 4, 64, 56, 56, 256, 1, 1, 1, 0);
+        g.set_outputs(vec![y]);
+        let mut plan = compile::compile(&g);
+        assert_eq!(
+            fill_matrix_candidates(&mut plan, crate::DType::F16, true, false, false),
+            1
+        );
+        assert_eq!(plan.dispatches[0].workgroups, [8, 98, 4]);
+
+        let mut dx = compile::compile(&pointwise_gradient_graph(256, 64, 56, 56, 4));
+        assert_eq!(
+            fill_conv_gradient_candidates(&mut dx, crate::DType::F16, true, false),
+            1
+        );
+        assert_eq!(dx.dispatches[0].workgroups, [8, 98, 4]);
+    }
+
+    #[test]
     fn pointwise_derivative_candidates_preserve_pins_and_exact_output_size() {
         let base = compile::compile(&pointwise_gradient_graph(256, 64, 14, 14, 4));
         for dtype in [crate::DType::F16, crate::DType::BF16] {
@@ -2431,6 +2457,16 @@ mod tests {
                 assert_eq!(candidate.dispatches[0].shader, base.dispatches[0].shader);
             }
         }
+    }
+
+    fn device_subgroup_tiles(gpu: &blade_graphics::Context, dtype: crate::DType) -> bool {
+        let caps = gpu.capabilities();
+        let shapes = match dtype {
+            crate::DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
+            _ => &caps.cooperative_matrix.f16_f32_shapes,
+        };
+        crate::codegen::checked_cooperative_shape(shapes)
+            .is_some_and(|shape| gathered(dtype, shape, caps.subgroup_size))
     }
 
     #[test]
@@ -2468,13 +2504,7 @@ mod tests {
                 let want = &values[id as usize];
                 let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
                 let mut plan = compile::compile(&g);
-                let caps = gpu.capabilities();
-                let shapes = match dtype {
-                    crate::DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
-                    _ => &caps.cooperative_matrix.f16_f32_shapes,
-                };
-                let gathered = gathered(dtype, [16, 16, 16], caps.subgroup_size)
-                    && shapes.contains(&[16, 16, 16]);
+                let gathered = device_subgroup_tiles(&gpu, dtype);
                 // Cases under the fill's workgroup floor take the kernel directly.
                 if fill_conv_gradient_candidates(&mut plan, dtype, true, gathered) == 0 {
                     let d = &mut plan.dispatches[0];
@@ -2492,8 +2522,8 @@ mod tests {
                         &crate::kernels::conv::Params::from(&*d),
                     );
                     d.workgroups = [
-                        ci.div_ceil(tile.rows),
-                        (h * w).div_ceil(tile.columns),
+                        ci.div_ceil(if gathered { tile.rows } else { 32 }),
+                        (h * w).div_ceil(if gathered { tile.columns } else { 32 }),
                         batch,
                     ];
                 }
@@ -2554,7 +2584,13 @@ mod tests {
                 let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
                 let mut plan = compile::compile(&g);
                 assert_eq!(
-                    fill_matrix_candidates_scoped(&mut plan, dtype, true, false),
+                    fill_matrix_candidates(
+                        &mut plan,
+                        dtype,
+                        true,
+                        false,
+                        device_subgroup_tiles(&gpu, dtype)
+                    ),
                     1,
                     "({ci},{co},{h},{w},{batch})"
                 );
@@ -2910,7 +2946,17 @@ mod tests {
                 let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
                 let case = format!("{dtype:?} ({ci},{co},{h},{w}) k{k} s{stride} p{pad} b{batch}");
                 let mut plan = compile::compile(&g);
-                assert_eq!(fill_matrix_candidates(&mut plan, dtype, true), 1, "{case}");
+                assert_eq!(
+                    fill_matrix_candidates(
+                        &mut plan,
+                        dtype,
+                        true,
+                        false,
+                        device_subgroup_tiles(&gpu, dtype)
+                    ),
+                    1,
+                    "{case}"
+                );
                 compile::schedule_dispatches(&mut plan, false, false);
                 let mut session = Session::with_context_opts(
                     plan,
@@ -3936,7 +3982,7 @@ mod tests {
         assert_eq!(dispatch.weight_format, WeightFormat::F16);
         let mut candidate = original.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut candidate, DType::F16, false),
+            fill_matrix_candidates(&mut candidate, DType::F16, false, false, false),
             1,
             "a legacy F16 weight must not hide a legal typed mixed-storage alternative"
         );
@@ -3951,7 +3997,7 @@ mod tests {
                     && types.multiply == DType::F16 && types.output == DType::F32));
         let mut bf16 = original.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut bf16, DType::BF16, false),
+            fill_matrix_candidates(&mut bf16, DType::BF16, false, false, false),
             0,
             "F16 storage cannot be reinterpreted as BF16"
         );
@@ -3965,7 +4011,10 @@ mod tests {
             .position(|d| d.mnk().is_some())
             .unwrap();
         plan.dispatches[index].kernel = compile::Kernel::Cooperative;
-        assert_eq!(fill_matrix_candidates(&mut plan, DType::BF16, false), 1);
+        assert_eq!(
+            fill_matrix_candidates(&mut plan, DType::BF16, false, false, false),
+            1
+        );
         assert!(matches!(plan.dispatches[index].kernel,
             compile::Kernel::CooperativeTyped { types, splits: 1, specialize: false }
                 if types.multiply == DType::BF16 && types.a == DType::F32
@@ -3992,12 +4041,12 @@ mod tests {
         plan.dispatches[0].schedule_locked = true;
         let original = plan.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::F16, false),
+            fill_matrix_candidates(&mut plan, crate::DType::F16, false, false, false),
             0
         );
         assert_eq!(plan, original);
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::F16, true),
+            fill_matrix_candidates(&mut plan, crate::DType::F16, true, false, false),
             1
         );
         assert!(matches!(
@@ -4022,7 +4071,7 @@ mod tests {
             }
             let before = plan.clone();
             assert_eq!(
-                fill_matrix_candidates(&mut plan, crate::DType::BF16, true),
+                fill_matrix_candidates(&mut plan, crate::DType::BF16, true, false, false),
                 0
             );
             assert_eq!(plan, before);
@@ -4049,7 +4098,7 @@ mod tests {
                 }
                 let original = plan.dispatches.clone();
                 assert_eq!(
-                    fill_matrix_candidates(&mut plan, crate::DType::BF16, false),
+                    fill_matrix_candidates(&mut plan, crate::DType::BF16, false, false, false),
                     usize::from(valid)
                 );
                 if !valid {
@@ -4067,7 +4116,7 @@ mod tests {
         dispatch.params = vec![1, 1, 1, 1, 32, 1, 1, 1, 0, u32::MAX, 2];
         let original = plan.dispatches.clone();
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::BF16, false),
+            fill_matrix_candidates(&mut plan, crate::DType::BF16, false, false, false),
             0
         );
         assert_eq!(plan.dispatches, original);
@@ -4151,7 +4200,7 @@ mod tests {
         graph.set_outputs(vec![y]);
         let mut plan = compile::compile(&graph);
         assert_eq!(
-            fill_matrix_candidates(&mut plan, crate::DType::BF16, false),
+            fill_matrix_candidates(&mut plan, crate::DType::BF16, false, false, false),
             1
         );
         let gpu = crate::reference::gpu::shared_context();
@@ -4267,7 +4316,13 @@ mod tests {
                 .collect();
                 let mut plan = compile::compile(&graph);
                 assert_eq!(
-                    fill_matrix_candidates_scoped(&mut plan, dtype, false, true),
+                    fill_matrix_candidates(
+                        &mut plan,
+                        dtype,
+                        false,
+                        true,
+                        device_subgroup_tiles(&gpu, dtype)
+                    ),
                     1
                 );
                 let mut session = Session::with_context(plan, gpu.clone());

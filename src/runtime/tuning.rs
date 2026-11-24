@@ -531,6 +531,7 @@ fn retain_tunable_classes(
     let shared_limit = capabilities.max_compute_shared_memory_size;
     for class in classes.iter_mut() {
         class.challengers.retain(|tile| match *tile {
+            MatmulTile::Scalar(shape) => shared_limit == 0 || shape.shared_bytes() <= shared_limit,
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
