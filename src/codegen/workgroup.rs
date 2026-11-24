@@ -610,7 +610,7 @@ pub(crate) fn generate_subgroup_pointwise_weight_grad(
                 a: "image * m * k".into(),
                 b: "image * n * k".into(),
                 c: "group.z * m * n".into(),
-                batch: Some(params.batch),
+                batch: Some(params.batch.max(1)),
             }),
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),

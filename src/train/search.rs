@@ -1218,7 +1218,9 @@ fn fill_matrix_candidates(
     vector_convolutions_only: bool,
     subgroup_tiles: bool,
 ) -> usize {
+    const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
+    let mut partial_bytes = 0usize;
     let mut splits_to_add = Vec::new();
     for (index, d) in plan.dispatches.iter_mut().enumerate() {
         if d.shader.is_conv2d_gemm()
@@ -1234,8 +1236,9 @@ fn fill_matrix_candidates(
             let Some(positions) = p[9].checked_mul(p[10]) else {
                 continue;
             };
+            let batch = p[0].max(1);
             let (rows, cols) = if subgroup_tiles {
-                let tile = crate::codegen::conv_product_tile(p[4], positions, p[0].max(1));
+                let tile = crate::codegen::conv_product_tile(p[4], positions, batch);
                 (tile.rows, tile.columns)
             } else {
                 (32, 32)
@@ -1243,18 +1246,49 @@ fn fill_matrix_candidates(
             let mut grid = [p[4].div_ceil(rows), positions.div_ceil(cols), p[0]];
             // Few workgroups over a long K (a 7×7 stage's 1×1 convs over 2048
             // channels) split K over workgroup Z: gathered forwards only.
-            let stages = (p[1] * p[5] * p[6]).div_ceil(32);
-            let workgroups = grid.iter().product::<u32>();
+            let stages = p[1]
+                .checked_mul(p[5])
+                .and_then(|v| v.checked_mul(p[6]))
+                .map_or(0, |taps| taps.div_ceil(32));
+            let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
             let gathered =
                 subgroup_tiles && !crate::kernels::conv::Params::from(&*d).vectorized_forward();
-            let chunks = if gathered && workgroups < 192 && stages >= 32 {
-                384u32.div_ceil(workgroups).clamp(2, stages / 8)
-            } else {
-                1
-            };
-            grid[2] = p[0].max(1) * chunks;
+            let mut chunks = 1;
+            let mut split_info = None;
+            if gathered && workgroups > 0 && workgroups < 192 && stages >= 32 {
+                let candidate_chunks = 384u32.div_ceil(workgroups).clamp(2, stages / 8);
+                let serial = candidate_chunks <= 16;
+                let total_cols = batch
+                    .checked_mul(p[4])
+                    .and_then(|v| v.checked_mul(positions));
+                let candidate_bytes = total_cols.and_then(|cols| {
+                    if cols.div_ceil(if serial { 256 } else { 32 }) > 65_535 {
+                        return None;
+                    }
+                    (cols as usize)
+                        .checked_mul(candidate_chunks as usize)?
+                        .checked_mul(4)
+                });
+                if let (Some(total_cols), Some(bytes), Some(z)) = (
+                    total_cols,
+                    candidate_bytes
+                        .filter(|&b| partial_bytes.saturating_add(b) <= MAX_SPLIT_PARTIAL_BYTES),
+                    batch.checked_mul(candidate_chunks),
+                ) {
+                    let split_grid = [grid[0], grid[1], z];
+                    if compile::workgroups_within_portable_limits(split_grid) {
+                        chunks = candidate_chunks;
+                        grid = split_grid;
+                        split_info = Some((total_cols, bytes));
+                    }
+                }
+            }
             if !compile::workgroups_within_portable_limits(grid) {
                 continue;
+            }
+            if let Some((total_cols, bytes)) = split_info {
+                partial_bytes += bytes;
+                splits_to_add.push((index, chunks, total_cols));
             }
             d.shader = compile::ShaderEntry::Conv2dGemmCoopGen(p[5], p[6], p[7]);
             d.kernel = compile::Kernel::CooperativeTyped {
@@ -1266,9 +1300,6 @@ fn fill_matrix_candidates(
                 splits: chunks,
             };
             d.workgroups = grid;
-            if chunks > 1 {
-                splits_to_add.push((index, chunks, p[0].max(1) * p[4] * positions));
-            }
             count += 1;
             continue;
         }
@@ -1282,8 +1313,9 @@ fn fill_matrix_candidates(
         let partial = compile::BufferRef(plan.buffers.len() as u32);
         plan.buffers.push(columns as usize * chunks as usize * 4);
         let output = plan.dispatches[index].output_buffer;
-        // A few chunks: one thread a column.
-        let reduction = plan.dispatches[index].partial_sum(partial, output, columns, chunks, true);
+        let serial = chunks <= 16;
+        let reduction =
+            plan.dispatches[index].partial_sum(partial, output, columns, chunks, serial);
         plan.dispatches[index].output_buffer = partial;
         plan.dispatches.insert(index + 1, reduction);
     }
@@ -1315,7 +1347,9 @@ fn fill_conv_gradient_candidates(
     replace_extracted: bool,
     gathered: bool,
 ) -> usize {
+    const MAX_SPLIT_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
+    let mut partial_bytes = 0usize;
     let mut splits_to_add = Vec::new();
     let mut transposes_to_add = Vec::new();
     for (index, dispatch) in plan.dispatches.iter_mut().enumerate() {
@@ -1342,10 +1376,12 @@ fn fill_conv_gradient_candidates(
             continue;
         }
         let mut chunks = 1;
+        let mut split_info = None;
         let grid = if pointwise {
             let Some(columns) = p[2].checked_mul(p[3]) else {
                 continue;
             };
+            let batch = p[0].max(1);
             // Without whole vectors a gathered product runs where the device
             // has one, and the checked kernel on 32x32 tiles where not.
             let params = crate::kernels::conv::Params::from(&*dispatch);
@@ -1360,10 +1396,37 @@ fn fill_conv_gradient_candidates(
             // A gathered one with few workgroups over a long K (a 7×7
             // stage's over 2048 channels) splits K over workgroup Z.
             let stages = p[4].div_ceil(32);
-            let workgroups = grid.iter().product::<u32>();
-            if gathered && !params.vectorized_forward() && workgroups < 192 && stages >= 32 {
-                chunks = 384u32.div_ceil(workgroups).clamp(2, stages / 8);
-                grid[2] = p[0].max(1) * chunks;
+            let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
+            if gathered
+                && !params.vectorized_forward()
+                && workgroups > 0
+                && workgroups < 192
+                && stages >= 32
+            {
+                let candidate_chunks = 384u32.div_ceil(workgroups).clamp(2, stages / 8);
+                let serial = candidate_chunks <= 16;
+                let total_cols = batch.checked_mul(p[1]).and_then(|v| v.checked_mul(columns));
+                let candidate_bytes = total_cols.and_then(|cols| {
+                    if cols.div_ceil(if serial { 256 } else { 32 }) > 65_535 {
+                        return None;
+                    }
+                    (cols as usize)
+                        .checked_mul(candidate_chunks as usize)?
+                        .checked_mul(4)
+                });
+                if let (Some(total_cols), Some(bytes), Some(z)) = (
+                    total_cols,
+                    candidate_bytes
+                        .filter(|&b| partial_bytes.saturating_add(b) <= MAX_SPLIT_PARTIAL_BYTES),
+                    batch.checked_mul(candidate_chunks),
+                ) {
+                    let split_grid = [grid[0], grid[1], z];
+                    if compile::workgroups_within_portable_limits(split_grid) {
+                        chunks = candidate_chunks;
+                        grid = split_grid;
+                        split_info = Some((total_cols, bytes));
+                    }
+                }
             }
             grid
         } else {
@@ -1388,15 +1451,22 @@ fn fill_conv_gradient_candidates(
         {
             continue;
         }
-        if chunks > 1 {
-            splits_to_add.push((index, chunks, p[0].max(1) * p[1] * p[2] * p[3]));
-        }
-        if !pointwise
+        let needs_transpose = !pointwise
             && crate::codegen::phased_transposed_weights(&crate::kernels::conv::Params::from(
                 &*dispatch,
-            ))
-        {
-            transposes_to_add.push(index);
+            ));
+        if needs_transpose {
+            let Some(k) = p[1].checked_mul(p[5]).and_then(|v| v.checked_mul(p[6])) else {
+                continue;
+            };
+            if !compile::workgroups_within_portable_limits([k.div_ceil(16), p[4].div_ceil(16), 1]) {
+                continue;
+            }
+            transposes_to_add.push((index, p[4], k));
+        }
+        if let Some((total_cols, bytes)) = split_info {
+            partial_bytes += bytes;
+            splits_to_add.push((index, chunks, total_cols));
         }
         dispatch.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(p[5], p[6], p[7]);
         dispatch.kernel = compile::Kernel::CooperativeTyped {
@@ -1415,16 +1485,17 @@ fn fill_conv_gradient_candidates(
         let partial = compile::BufferRef(plan.buffers.len() as u32);
         plan.buffers.push(columns as usize * chunks as usize * 4);
         let output = plan.dispatches[index].output_buffer;
-        let reduction = plan.dispatches[index].partial_sum(partial, output, columns, chunks, true);
+        let serial = chunks <= 16;
+        let reduction =
+            plan.dispatches[index].partial_sum(partial, output, columns, chunks, serial);
         plan.dispatches[index].output_buffer = partial;
         plan.dispatches.insert(index + 1, reduction);
     }
     // Phased input gradients read W[co, (ci, ky, kx)] transposed, from a
     // tiled Transpose just before them (after the reductions shifted them).
-    for &index in transposes_to_add.iter().rev() {
+    for &(index, co, k) in transposes_to_add.iter().rev() {
         let index = index + splits_to_add.iter().filter(|&&(i, _, _)| i < index).count();
         let d = &plan.dispatches[index];
-        let (co, k) = (d.params[4], d.params[1] * d.params[5] * d.params[6]);
         let transposed = compile::BufferRef(plan.buffers.len() as u32);
         let transpose = compile::Dispatch {
             shader: compile::ShaderEntry::Transpose,
@@ -1441,7 +1512,12 @@ fn fill_conv_gradient_candidates(
         plan.dispatches[index].input_buffers[1] = transposed;
         plan.dispatches.insert(index, transpose);
     }
-    count + fill_conv_weight_gradients(plan, multiply, replace_extracted)
+    count
+        + if gathered {
+            fill_conv_weight_gradients(plan, multiply, replace_extracted)
+        } else {
+            0
+        }
 }
 
 /// Convolution weight gradients as typed per-image BT products over K chunks
@@ -1492,36 +1568,57 @@ fn fill_conv_weight_gradients(
             index += 1;
             continue;
         }
-        let (m, n) = (
-            params.out_channels,
-            params.in_channels * params.kernel_h * params.kernel_w,
-        );
+        let Some(n) = params
+            .in_channels
+            .checked_mul(params.kernel_h)
+            .and_then(|v| v.checked_mul(params.kernel_w))
+        else {
+            index += 1;
+            continue;
+        };
+        let m = params.out_channels;
         let batch = params.batch.max(1);
         let tile = crate::codegen::conv_tile(crate::codegen::ConvProduct::WeightGradient, &params);
-        let tiles = m.div_ceil(tile.rows) * n.div_ceil(tile.columns);
+        let tiles = m
+            .div_ceil(tile.rows)
+            .saturating_mul(n.div_ceil(tile.columns));
+        if tiles == 0 {
+            index += 1;
+            continue;
+        }
         let partitions = if params.vectorized_forward() {
             // Per-image products, each split into chunks of its positions.
-            let k = params.out_h * params.out_w;
-            batch
-                * TARGET_WORKGROUPS
-                    .div_ceil(tiles * batch)
-                    .clamp(1, (k / MIN_CHUNK).max(1))
+            let k = params.out_h.saturating_mul(params.out_w);
+            batch.saturating_mul(
+                TARGET_WORKGROUPS
+                    .div_ceil(tiles.saturating_mul(batch))
+                    .clamp(1, (k / MIN_CHUNK).max(1)),
+            )
         } else {
             // One product over the batch's positions: chunks only where the
             // grid alone cannot occupy the device, and at least two when the
             // producer already feeds a reduction.
-            let k = batch * params.out_h * params.out_w;
+            let k = batch
+                .saturating_mul(params.out_h)
+                .saturating_mul(params.out_w);
             let chunks = TARGET_WORKGROUPS
                 .div_ceil(tiles)
                 .clamp(1, (k / MIN_CHUNK).max(1));
             if split { chunks.max(2) } else { chunks }
         };
-        let columns = (m * n) as usize;
-        let bytes = columns * 4 * partitions as usize;
+        let Some(bytes) = m
+            .checked_mul(n)
+            .and_then(|cols| usize::try_from(cols).ok())
+            .and_then(|cols| cols.checked_mul(4))
+            .and_then(|row| row.checked_mul(partitions as usize))
+        else {
+            index += 1;
+            continue;
+        };
         let grid = [m.div_ceil(tile.rows), n.div_ceil(tile.columns), partitions];
         if partitions > 65_535
             || !compile::workgroups_within_portable_limits(grid)
-            || (partitions > 1 && partial_bytes + bytes > MAX_PARTIAL_BYTES)
+            || (partitions > 1 && partial_bytes.saturating_add(bytes) > MAX_PARTIAL_BYTES)
         {
             index += 1;
             continue;
@@ -1530,7 +1627,10 @@ fn fill_conv_weight_gradients(
             // Re-count the SumRows that reads this producer's partials.
             let partial = d.output_buffer;
             let Some(reduction) = plan.dispatches.iter().position(|r| {
-                r.shader == E::SumRows && r.input_buffers == [partial] && r.params.len() == 4
+                r.shader == E::SumRows
+                    && r.input_buffers == [partial]
+                    && r.params.len() == 4
+                    && r.params[3] == 0
             }) else {
                 index += 1;
                 continue;
@@ -1539,13 +1639,17 @@ fn fill_conv_weight_gradients(
                 index += 1;
                 continue;
             }
-            plan.dispatches[reduction].params[0] = partitions;
-            // A few partials sum one thread a column.
+            let r = &mut plan.dispatches[reduction];
+            r.params[0] = partitions;
+            // A few partials sum one thread a column; wider splits use parallel rows when they fit.
             if partitions <= 16 {
-                let r = &mut plan.dispatches[reduction];
                 r.params[2] = 1;
                 r.params[3] = 0;
                 r.workgroups = [r.params[1].div_ceil(256), 1, 1];
+            } else if r.params[2] != 0 && r.params[1].div_ceil(32) <= 65_535 {
+                r.params[2] = 0;
+                r.params[3] = 0;
+                r.workgroups = [r.params[1].div_ceil(32), 1, 1];
             }
             let size = &mut plan.buffers[partial.0 as usize];
             *size = (*size).max(bytes);
@@ -2874,6 +2978,28 @@ mod tests {
             }
         }
         eprintln!("phased input gradients checked: {checked} cases");
+    }
+
+    #[test]
+    fn weight_gradients_require_gathered_subgroup_kernels() {
+        let mut g = Graph::new();
+        let dy = g.input("dy", &[4 * 64 * 28 * 28]);
+        let x = g.input("x", &[4 * 64 * 28 * 28]);
+        let dw = g.conv2d_grad_weight(dy, x, 64, 28, 28, 64, 1, 1, 1, 0, 0);
+        g.nodes_mut()[dw as usize].is_derivative = true;
+        g.set_outputs(vec![dw]);
+        let baseline = compile::compile(&g);
+        let mut without_gathered = baseline.clone();
+        assert_eq!(
+            fill_conv_gradient_candidates(&mut without_gathered, crate::DType::F16, true, false),
+            0
+        );
+        assert_eq!(without_gathered, baseline);
+        let mut with_gathered = baseline;
+        assert_eq!(
+            fill_conv_gradient_candidates(&mut with_gathered, crate::DType::F16, true, true),
+            1
+        );
     }
 
     #[test]

@@ -2060,24 +2060,16 @@ fn matmul_vars_tiled(
         && !interleave_columns
         && tm.is_multiple_of(4)
         && tn.is_multiple_of(4);
-    let vectored;
-    let (src, a_stage_body, b_stage_body, k_math) = if fragments {
+    let (shared_a_decl, shared_b_decl, a_stage_body, b_stage_body, k_math) = if fragments {
         let (bmp, bnp) = (bm + 4, bn + 4);
-        vectored = src
-            .replace(
-                "var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;",
-                &format!(
-                    "var<workgroup> shared_a: array<vec4<f32>, {}>;",
-                    k_tile * bmp / 4
-                ),
-            )
-            .replace(
-                "var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;",
-                &format!(
-                    "var<workgroup> shared_b: array<vec4<f32>, {}>;",
-                    k_tile * bnp / 4
-                ),
-            );
+        let shared_a = format!(
+            "var<workgroup> shared_a: array<vec4<f32>, {}>;",
+            k_tile * bmp / 4
+        );
+        let shared_b = format!(
+            "var<workgroup> shared_b: array<vec4<f32>, {}>;",
+            k_tile * bnp / 4
+        );
         let a_stage = r"
             for (var i = tid; i < $BM_U * $K_TILE_U / 4u; i += 256u) {
                 let k_local = i % $K_TILE_U;
@@ -2144,9 +2136,21 @@ fn matmul_vars_tiled(
         } else {
             body
         };
-        (vectored.as_str(), a_stage, b_stage.to_owned(), math)
+        (shared_a, shared_b, a_stage, b_stage.to_owned(), math)
     } else {
-        (src, a_stage_body, b_stage_body, k_math)
+        (
+            format!(
+                "var<workgroup> shared_a: array<f32, {}>;",
+                bm * (k_tile + 1)
+            ),
+            format!(
+                "var<workgroup> shared_b: array<f32, {}>;",
+                k_tile * (bn + 1)
+            ),
+            a_stage_body,
+            b_stage_body,
+            k_math,
+        )
     };
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
@@ -2187,8 +2191,8 @@ fn matmul_vars_tiled(
             ("$K_TILE_U", &format!("{k_tile}u")),
             ("$A_STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
             ("$B_STAGE_EPT_U", &format!("{}u", bn * k_tile / 256)),
-            ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
-            ("$SHARED_B_SIZE", &(k_tile * (bn + 1)).to_string()),
+            ("$SHARED_A_DECL", &shared_a_decl),
+            ("$SHARED_B_DECL", &shared_b_decl),
             ("$ACC_DECL", &acc_decl),
             ("$ACC_ARRAY", &acc_array),
         ],

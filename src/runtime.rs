@@ -2006,7 +2006,7 @@ impl Pipelines {
                 gpu.capabilities().subgroup_size,
                 params,
             )
-            .ok_or("pointwise weight gradients need 16x16 subgroup matrices")?,
+            .ok_or("subgroup-tiled weight gradients need 16x16 subgroup matrices")?,
             Variant::CoopConv(
                 ShaderEntry::Conv2dGradInputGemmCoopGen(_, _, stride),
                 types,

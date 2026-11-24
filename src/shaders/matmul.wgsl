@@ -29,8 +29,8 @@ var<storage> matrix_a: array<f32>;
 $MATRIX_BINDINGS
 $FUSED_ADD_DECL
 var<uniform> params: Params;
-var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;
-var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;
+$SHARED_A_DECL
+$SHARED_B_DECL
 $B_DEQUANT_FN
 
 // @section kernel
