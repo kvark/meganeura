@@ -3828,7 +3828,9 @@ mod coop_caps_tests {
 }
 
 mod attention;
+mod conv_coop;
 pub use attention::*;
+pub use conv_coop::{Conv2dCoopDirection, generate_conv2d_coop_module};
 
 #[cfg(test)]
 mod tests {

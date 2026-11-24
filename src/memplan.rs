@@ -684,6 +684,7 @@ mod tests {
     fn plan(buffers: Vec<usize>, dispatches: Vec<Dispatch>) -> ExecutionPlan {
         ExecutionPlan {
             buffers,
+            logical_buffers: Vec::new(),
             param_buffers: Vec::new(),
             param_types: Default::default(),
             input_buffers: Vec::new(),

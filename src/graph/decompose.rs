@@ -75,8 +75,10 @@ impl Graph {
                 }
                 id
             } else {
+                let mut op = node.op.clone();
+                op.remap_node_ids(|fwd| map[fwd as usize]);
                 let id = out.add_raw_node_with_flags(
-                    node.op.clone(),
+                    op,
                     inputs,
                     node.ty.clone(),
                     node.requires_full_precision,
@@ -2441,5 +2443,47 @@ mod tests {
                 "accepted zero-width axes {axes_dim:?}"
             );
         }
+    }
+
+    #[test]
+    fn expand_composites_remaps_attention_grad_fwd_node() {
+        let mut g = Graph::new();
+        let x = g.parameter("x", &[8, 16]);
+        // A composite before the attention node expands into multiple nodes,
+        // shifting the forward attention node's NodeId.
+        let q = g.silu(x);
+        let k = g.parameter("k", &[8, 16]);
+        let v = g.parameter("v", &[8, 16]);
+        let attn = g.causal_attention(q, k, v, 1, 1, 16);
+        let loss = g.sum_all(attn);
+        g.set_outputs(vec![loss]);
+
+        let diff = crate::autodiff::differentiate(&g);
+        let expanded = diff
+            .expand_composites(&|n: &Node| matches!(n.op, Op::Silu))
+            .expect("Silu should expand");
+        let mut checked = 0usize;
+        for node in expanded.nodes() {
+            let fwd = match node.op {
+                Op::MultiHeadAttnGradQ { fwd_node, .. }
+                | Op::MultiHeadAttnGradK { fwd_node, .. }
+                | Op::MultiHeadAttnGradV { fwd_node, .. } => fwd_node,
+                _ => continue,
+            };
+            assert!(
+                matches!(
+                    expanded.node(fwd).op,
+                    Op::CausalAttention { .. } | Op::MultiHeadAttn { .. }
+                ),
+                "remapped fwd_node {fwd} does not point to an attention op: {:?}",
+                expanded.node(fwd).op
+            );
+            assert!(
+                fwd > attn,
+                "expected expanded Silu to shift fwd_node past original id {attn}, got {fwd}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "expected attention gradient nodes");
     }
 }

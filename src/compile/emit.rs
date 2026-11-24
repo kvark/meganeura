@@ -110,6 +110,7 @@ impl<'a> Compiler<'a> {
             graph,
             plan: ExecutionPlan {
                 buffers: vec![],
+                logical_buffers: Vec::new(),
                 param_buffers: vec![],
                 param_types: HashMap::new(),
                 input_buffers: Vec::new(),

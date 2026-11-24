@@ -1,11 +1,14 @@
-use crate::kernels::conv::Params as Conv2dParams;
-mod workgroup;
+pub use crate::compile::CoopPolicy;
+#[cfg(test)]
+pub(crate) use crate::compile::lower::select_variants;
+use crate::compile::lower::tiled_coop_shared_bytes;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
     ExecutionPlan, RoPEParams, ShaderEntry, WinogradInputParams, WinogradOutputParams,
     WinogradWeightParams,
 };
 use crate::kernels::attention_grad::Part as AttentionGradPart;
+use crate::kernels::conv::Params as Conv2dParams;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -3041,347 +3044,9 @@ fn record_groups(
 }
 
 // ---- Session ----
-
-fn tiled_coop_shared_bytes(
-    dispatch: &Dispatch,
-    shape: crate::codegen::CooperativeMatmulShape,
-) -> u64 {
-    let row_factors = dispatch.matmul_prologue.as_ref().map_or(0, |p| {
-        p.factors
-            .iter()
-            .filter(|f| f.1 == crate::compile::PrologueLoadKind::PerRow)
-            .count()
-    });
-    u64::from(shape.shared_bytes()) + row_factors as u64 * 64 * 4
-}
-
-/// Honor [`CoopPolicy`] and explicit pins on scalar flash f16 tiles.
-///
-/// Compile requests f16 staging only through
-/// [`crate::CompileOptions::flash_f16_tiles`]. `NativeF32` and `Disabled`
-/// clear every request, `AllowF16` enables staging, and `Auto` preserves the
-/// compile request. A full-precision pin always clears the bit.
-pub(crate) fn apply_attention_precision(plan: &mut ExecutionPlan, coop: CoopPolicy) {
-    for dispatch in &mut plan.dispatches {
-        let flash = match dispatch.shader {
-            ShaderEntry::FlashAttention => true,
-            ShaderEntry::AttentionGrad(kernel) => {
-                kernel.path == crate::kernels::attention_grad::Path::Flash
-            }
-            _ => false,
-        };
-        if !flash || dispatch.requires_full_precision {
-            dispatch.attention_f16_tiles = false;
-            continue;
-        }
-        dispatch.attention_f16_tiles = match coop {
-            CoopPolicy::NativeF32 | CoopPolicy::Disabled => false,
-            CoopPolicy::AllowF16 => true,
-            CoopPolicy::Auto => dispatch.attention_f16_tiles,
-        };
-    }
-}
-
-/// A compiled, ready-to-execute GPU session.
-///
-/// Holds all blade-graphics resources: context, buffers, pipelines.
-/// Calling `step()` replays the pre-compiled dispatch sequence.
-/// Per-dispatch kernel-variant selection at session construction: each
-/// convolution and dense product takes the path its kernel family selects
-/// (cooperative tiles with their padding, or 32-wide tiles), then the
-/// RmsNorm→matmul prologue fusions that depend on cooperative paths run.
-/// Mutates the plan in place. Tuning may replace these initial choices by
-/// measurement, asking the same families what is legal.
-pub(crate) fn select_variants(
-    plan: &mut ExecutionPlan,
-    coop_config: Option<&crate::codegen::CoopConfig>,
-    fuse_prologues: bool,
-    allow_raw_f16: bool,
-) {
-    workgroup::reset(plan);
-    select_conv_paths(plan, coop_config, allow_raw_f16);
-    select_matmul_paths(plan, coop_config, allow_raw_f16);
-
-    plan.split_long_scalar_products();
-    plan.split_low_occupancy_scalar_products();
-
-    // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
-    // selection. A coop-capable device can still route small matmuls to a
-    // scalar pipeline, which has no prologue implementation. The fusion
-    // pass filters for kernels that support prologues and records factor
-    // buffers as inputs for scheduling and memory planning. Debug sessions skip it —
-    // dispatch-level fusion is numerics-neutral, and keeping the RmsNorm
-    // output materialized is the point of debug mode.
-    if fuse_prologues {
-        crate::compile::fuse_rmsnorm_prologues(plan);
-        crate::compile::fuse_rmsnorm_into_add(plan);
-        crate::compile::fuse_rmsnorm_into_gemv(plan);
-    }
-    // Aligned native-f32 products share 64-row tiles between four subgroups.
-    // Up to 16 K partitions of at least 128 each raise small outputs toward
-    // 512 workgroups; 128 columns are used when partitions can still reach
-    // that target, 64 otherwise. Ragged, pinned and fused-epilogue products
-    // keep their kernel; tuning can challenge unsplit choices.
-    if coop_config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input) {
-        for index in (0..plan.dispatches.len()).rev() {
-            let dispatch = &plan.dispatches[index];
-            let Some((m, n, k)) = dispatch.mnk() else {
-                continue;
-            };
-            let max_splits = 1u32 << (k / 128).clamp(1, 16).ilog2();
-            let groups = |columns: u32| u64::from(m / 64) * u64::from(n / columns);
-            let wide = n.is_multiple_of(128) && groups(128) * u64::from(max_splits) >= 512;
-            let shape = crate::codegen::CooperativeMatmulShape {
-                columns: if wide { 128 } else { 64 },
-                k_stage: 16,
-                prefetch: false,
-            };
-            if !shape.fits_dimensions(m, n, k)
-                || tiled_coop_shared_bytes(dispatch, shape) > 16 * 1024
-            {
-                continue;
-            }
-            let splits = 512u64
-                .div_ceil(groups(shape.columns))
-                .next_power_of_two()
-                .min(u64::from(max_splits)) as u32;
-            // Fused, pinned and aliased forms keep their kernel.
-            let _ = plan.tile_native_f32_matmul(index, shape, splits, 32 * 1024 * 1024);
-        }
-    }
-}
-
-/// Promote each 64-wide convolution its kernel family admits to a
-/// generated cooperative kernel, and size its workgroups and output.
-fn select_conv_paths(
-    plan: &mut ExecutionPlan,
-    coop_config: Option<&crate::codegen::CoopConfig>,
-    allow_raw_f16: bool,
-) {
-    use crate::kernels::conv;
-    let target = conv::Target {
-        cooperative: coop_config.copied(),
-        allow_raw_f16,
-    };
-    for index in 0..plan.dispatches.len() {
-        let Some(problem) = conv::Problem::of(&plan.dispatches[index]) else {
-            continue;
-        };
-        let target = conv::Target {
-            allow_raw_f16: target.allow_raw_f16 && !plan.dispatches[index].requires_full_precision,
-            ..target
-        };
-        if conv::select(&problem, &target) != conv::Path::Cooperative {
-            continue;
-        }
-        let config = coop_config.expect("cooperative paths need a configuration");
-        let geometry = conv::cooperative_geometry(&problem, config)
-            .expect("an admitted cooperative convolution is legal");
-        let dispatch = &mut plan.dispatches[index];
-        dispatch.kernel = crate::compile::Kernel::Cooperative;
-        dispatch.shader = problem.cooperative_entry();
-        dispatch.workgroups = geometry.grid;
-        // Direct cooperative stores cover complete sub-tiles.
-        pad_buffer(
-            &mut plan.buffers,
-            dispatch.output_buffer,
-            geometry.output_bytes,
-        );
-        if let Some(&extra) = dispatch.input_buffers.get(2) {
-            pad_buffer(&mut plan.buffers, extra, geometry.output_bytes);
-        }
-    }
-}
-
-/// Pick each dense product's path from its kernel family, and size its
-/// workgroups and buffers for it.
-fn select_matmul_paths(
-    plan: &mut ExecutionPlan,
-    coop_config: Option<&crate::codegen::CoopConfig>,
-    allow_raw_f16: bool,
-) {
-    use crate::kernels::matmul;
-    let target = matmul::Target {
-        cooperative: coop_config.copied(),
-        allow_raw_f16,
-    };
-    for index in 0..plan.dispatches.len() {
-        let Some(problem) = matmul::Problem::of(&plan.dispatches[index]) else {
-            continue;
-        };
-        let target = matmul::Target {
-            allow_raw_f16: target.allow_raw_f16 && !plan.dispatches[index].requires_full_precision,
-            ..target
-        };
-        match matmul::select(&problem, &target) {
-            matmul::Path::Cooperative => {
-                let config = coop_config.expect("cooperative paths need a configuration");
-                let geometry = matmul::cooperative_geometry(&problem, config)
-                    .expect("an admitted cooperative product is legal");
-                let dispatch = &mut plan.dispatches[index];
-                dispatch.kernel = crate::compile::Kernel::Cooperative;
-                dispatch.workgroups = geometry.grid;
-                pad_buffer(
-                    &mut plan.buffers,
-                    dispatch.output_buffer,
-                    geometry.output_bytes,
-                );
-                if geometry.pad_addend {
-                    let addend = dispatch.input_buffers[2];
-                    pad_buffer(&mut plan.buffers, addend, geometry.output_bytes);
-                }
-            }
-            matmul::Path::SmallTile => {
-                let dispatch = &mut plan.dispatches[index];
-                dispatch.kernel = crate::compile::Kernel::SmallTile;
-                dispatch.workgroups = matmul::tiled_workgroups(&problem, 32);
-            }
-            matmul::Path::WideTile => {
-                let dispatch = &mut plan.dispatches[index];
-                dispatch.kernel = crate::compile::Kernel::ScalarMatmul(matmul::WIDE_TILE);
-                dispatch.workgroups = matmul::wide_workgroups(&problem);
-            }
-            matmul::Path::Compiled => {}
-        }
-    }
-}
-
-/// Grow `buffer` to at least `bytes`.
-fn pad_buffer(buffers: &mut [usize], buffer: BufferRef, bytes: usize) {
-    let size = &mut buffers[buffer.0 as usize];
-    *size = (*size).max(bytes);
-}
-
-#[cfg(test)]
-mod block_matmul_variant_tests {
-    use super::select_variants;
-    use crate::{Graph, codegen::CoopConfig, compile};
-
-    #[test]
-    fn small_block_shapes_preserve_nvidia_scalar_geometry() {
-        let coop = CoopConfig {
-            tile_size: 16,
-            use_f16_input: true,
-        };
-        for rows in [6, 16] {
-            for (inner, columns) in [(1024, 256), (256, 768)] {
-                let mut serial = Graph::new();
-                let a = serial.input("a", &[rows, inner]);
-                let b = serial.parameter("b", &[inner, columns]);
-                let y = serial.matmul(a, b);
-                serial.set_outputs(vec![y]);
-                let mut serial = compile::compile(&serial);
-                select_variants(&mut serial, Some(&coop), false, false);
-
-                let mut grouped = Graph::new();
-                let a = grouped.input("a", &[rows, 8 * inner]);
-                let b = grouped.parameter("b", &[8, inner, columns]);
-                let y = grouped.block_matmul(a, b);
-                grouped.set_outputs(vec![y]);
-                let mut grouped = compile::compile(&grouped);
-                select_variants(&mut grouped, Some(&coop), false, false);
-                let serial = &serial.dispatches[0];
-                let grouped = &grouped.dispatches[0];
-                assert!(!serial.use_coop() && !grouped.use_coop());
-                // The serial product's grid is too small for the device, so
-                // it is split into K partitions of 32×32 tiles.
-                let compile::Kernel::SplitMatmul { shape, .. } = serial.kernel else {
-                    panic!("{rows}x{inner}x{columns} is not split: {:?}", serial.kernel);
-                };
-                assert_eq!(shape.tile_size == 32, grouped.use_small_tiles());
-                assert_eq!(serial.workgroups[..2], grouped.workgroups[..2]);
-                assert_eq!(grouped.workgroups[2], 8);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod attention_precision_tests {
-    use super::apply_attention_precision;
-    use crate::compile::{CompileOptions, ShaderEntry};
-    use crate::{CoopPolicy, Graph};
-
-    fn training_plan(full_precision: bool, backward_tiles: bool) -> crate::compile::ExecutionPlan {
-        let mut graph = Graph::new();
-        let q = graph.parameter("q", &[128, 64]);
-        let k = graph.parameter("k", &[128, 64]);
-        let v = graph.parameter("v", &[128, 64]);
-        if full_precision {
-            graph.begin_full_precision_region();
-        }
-        let y = graph.full_attention(q, k, v, 1, 1, 64);
-        let loss = graph.sum_all(y);
-        graph.set_outputs(vec![loss]);
-        let graph = crate::autodiff::differentiate(&graph);
-        let options = CompileOptions {
-            flash_f16_tiles: backward_tiles,
-            flash_forward_coop: false,
-            ..CompileOptions::default()
-        };
-        crate::compile::compile_with_caps(
-            &graph,
-            &options,
-            crate::codegen::CoopCaps::default(),
-            65_536,
-        )
-    }
-
-    fn tiles(plan: &crate::compile::ExecutionPlan, forward: bool) -> bool {
-        use crate::kernels::attention_grad::Path;
-        let flags: Vec<bool> = plan
-            .dispatches
-            .iter()
-            .filter(|dispatch| match dispatch.shader {
-                ShaderEntry::FlashAttention => forward,
-                ShaderEntry::AttentionGrad(kernel) => !forward && kernel.path == Path::Flash,
-                _ => false,
-            })
-            .map(|dispatch| dispatch.attention_f16_tiles)
-            .collect();
-        assert!(
-            !flags.is_empty(),
-            "missing flash dispatch, forward={forward}"
-        );
-        assert!(flags.iter().all(|tiles| *tiles == flags[0]));
-        flags[0]
-    }
-
-    #[test]
-    fn flash_f16_tiles_follow_the_session_policy() {
-        let ordinary = training_plan(false, false);
-        assert!(!tiles(&ordinary, true));
-        assert!(!tiles(&ordinary, false));
-        let requested = training_plan(false, true);
-        assert!(tiles(&requested, true));
-        assert!(tiles(&requested, false));
-
-        let mut native = requested.clone();
-        apply_attention_precision(&mut native, CoopPolicy::NativeF32);
-        assert!(!tiles(&native, true));
-        assert!(!tiles(&native, false));
-
-        let mut disabled = requested.clone();
-        apply_attention_precision(&mut disabled, CoopPolicy::Disabled);
-        assert!(!tiles(&disabled, true));
-        assert!(!tiles(&disabled, false));
-
-        let mut auto = requested.clone();
-        apply_attention_precision(&mut auto, CoopPolicy::Auto);
-        assert!(tiles(&auto, true));
-        assert!(tiles(&auto, false));
-
-        let mut allow = requested.clone();
-        apply_attention_precision(&mut allow, CoopPolicy::AllowF16);
-        assert!(tiles(&allow, true));
-        assert!(tiles(&allow, false));
-
-        let mut pinned = training_plan(true, true);
-        apply_attention_precision(&mut pinned, CoopPolicy::AllowF16);
-        assert!(!tiles(&pinned, true));
-        assert!(!tiles(&pinned, false));
-    }
-}
+// Target-aware plan lowering (variant selection, tile padding, split-K, late
+// RmsNorm fusions, workgroup cooperative selection, and scheduling) lives in
+// `crate::compile::lower`.
 
 #[cfg(test)]
 mod tiled_cooperative_policy_tests {
@@ -3637,58 +3302,6 @@ pub struct SessionOptions {
 }
 
 /// How cooperative-matrix hardware may be used for ordinary F32 graphs.
-///
-/// Explicit typed F16/BF16 products require their native implementation and
-/// are not widened or disabled by this policy. Native F32 accumulators do not
-/// promise scalar IEEE FMA semantics; see [`crate::reference::native_matrix`].
-/// To avoid native matrix arithmetic, use F32 operands with [`Self::Disabled`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CoopPolicy {
-    /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
-    /// work that permits reduced input precision; explicitly pinned and ordinary
-    /// derivative dispatches retain scalar f32 operands. Measured search may select
-    /// f16 staging for scalar flash attention: forward Q/K and backward Q/K/V, with
-    /// forward V, backward dO and dot arithmetic kept f32. Search also considers
-    /// device-qualified F16/BF16 forward products, mixed-precision cooperative
-    /// attention derivatives, AT/BT derivative products and pointwise convolution
-    /// input gradients, subject to the caller's whole-program accuracy and timing
-    /// gates. Explicit precision pins are never bypassed.
-    #[default]
-    Auto,
-    /// Allow only f32 cooperative operands and accumulators, without f16
-    /// staging or compensation. This is a precision policy, not a vendor
-    /// restriction. Devices with only reduced-input cooperative tiles retain
-    /// scalar f32 implementations.
-    NativeF32,
-    /// Disable cooperative selection for ordinary products, using scalar paths.
-    /// Explicit typed products still require native cooperative matrices.
-    Disabled,
-    /// Use f16 tiles without residual compensation, including for
-    /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
-    /// and can overflow or lose gradient range. Measured search also considers
-    /// device-qualified typed F16/BF16 candidates for eligible forward products,
-    /// AT/BT derivatives and pointwise convolution input gradients,
-    /// subject to the caller's whole-program accuracy and timing gates.
-    AllowF16,
-}
-
-impl CoopPolicy {
-    pub(crate) fn filter_caps(
-        self,
-        mut caps: crate::codegen::CoopCaps,
-    ) -> crate::codegen::CoopCaps {
-        match self {
-            Self::Disabled => caps = crate::codegen::CoopCaps::default(),
-            Self::NativeF32 => {
-                caps.f16_tile = 0;
-                caps.f16_attention_rows = 0;
-            }
-            Self::AllowF16 | Self::Auto => {}
-        }
-        caps
-    }
-}
-
 /// Why [`Session::read_node`] could not return a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadNodeError {
@@ -4388,49 +4001,16 @@ impl Session {
 
         let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
-
-        // Per-dispatch kernel-variant selection: one pass, one owner.
-        select_variants(
-            &mut plan,
-            coop_config.as_ref(),
-            !opts.debug,
-            opts.coop == CoopPolicy::AllowF16,
-        );
-        workgroup::select(&mut plan, &gpu.capabilities(), &opts);
-        if let Some(head_dim) = plan
-            .dispatches
-            .iter()
-            .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
-            .map(|dispatch| {
-                AttentionParams::from_words(&dispatch.params)
-                    .expect("invalid attention parameters")
-                    .head_dim
-            })
-            .max()
-        {
-            plan.knobs
-                .flash
-                .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
-        }
-
-        // Order the dispatches into barrier groups. The compiler owns this because
-        // horizontal fusion changes how many dispatches there are, so the
-        // groups cannot be computed independently of it.
-        if opts.serial_dispatch {
-            log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
-        }
-        let fuse = !opts.serial_dispatch && !opts.debug;
-        let preparation = if opts.prepare_outputs.is_empty() {
-            crate::compile::schedule_dispatches(&mut plan, opts.serial_dispatch, fuse);
-            None
-        } else {
-            Some(crate::compile::stages::schedule(
-                &mut plan,
-                &opts.prepare_outputs,
-                opts.serial_dispatch,
-                fuse,
-            ))
-        };
+        let capabilities = gpu.capabilities();
+        let preparation = plan.finalize_for_target(&crate::compile::lower::LowerTarget {
+            coop_config: coop_config.as_ref(),
+            capabilities: &capabilities,
+            coop_policy: opts.coop,
+            workgroup_matmul: opts.workgroup_matmul,
+            serial_dispatch: opts.serial_dispatch,
+            debug: opts.debug,
+            prepare_outputs: &opts.prepare_outputs,
+        });
         let groups = std::mem::take(&mut plan.groups);
         log::info!(
             "{} dispatches → {} barrier groups",
@@ -4768,7 +4348,6 @@ impl Session {
         }
         drop(buffer_alloc_span);
 
-        apply_attention_precision(&mut plan, opts.coop);
         let pipelines = {
             let _span = tracing::info_span!("pipeline_set").entered();
             Pipelines::new(

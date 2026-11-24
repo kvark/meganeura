@@ -51,18 +51,7 @@ impl Graph {
                 .map(|id| remap[id as usize])
                 .collect();
             // Explicit backward primitives may occur in diagnostic graphs.
-            match node.op {
-                Op::MultiHeadAttnGradQ {
-                    ref mut fwd_node, ..
-                }
-                | Op::MultiHeadAttnGradK {
-                    ref mut fwd_node, ..
-                }
-                | Op::MultiHeadAttnGradV {
-                    ref mut fwd_node, ..
-                } => *fwd_node = remap[*fwd_node as usize],
-                _ => (),
-            }
+            node.op.remap_node_ids(|fwd| remap[fwd as usize]);
             let cast = !node.full_precision()
                 && select(&node.op)
                 && node.ty.dtype == DType::F32

@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 42 adds ExecutionPlan::logical_buffers and full target fingerprinting.
 // Version 41 adds subgroup-tiled Winograd and convolution grids, WorkgroupMatmulShape
 // subgroup_rows/prefetch, and ScalarMatmulShape vector_fragments.
 // Version 40 splits MaxPool2dGrad into a winner-index pass and a gather pass.
@@ -56,7 +57,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 41;
+const CACHE_FORMAT_VERSION: u32 = 42;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -86,6 +87,10 @@ fn save_plan_impl(
     build_hash: u64,
     path: &Path,
 ) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+
     let cached = CachedPlan {
         format_version: CACHE_FORMAT_VERSION,
         graph_hash: hash_graph(forward_graph),
@@ -94,7 +99,30 @@ fn save_plan_impl(
     };
     let ron_str = ron::ser::to_string_pretty(&cached, ron::ser::PrettyConfig::default())
         .map_err(io::Error::other)?;
-    std::fs::write(path, ron_str)
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        NEXT_SAVE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let write_result = (|| -> io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(ron_str.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Load a previously cached execution plan from a RON file.
@@ -159,6 +187,17 @@ pub(crate) fn load_build_plan(
     load_plan_impl(forward_graph, build_hash, path)
 }
 
+/// Hardware and driver identity that governs cached plan reuse.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct BuildTargetFingerprint<'a> {
+    pub device_name: &'a str,
+    pub driver_name: &'a str,
+    pub driver_info: &'a str,
+    pub subgroup_size: u32,
+    pub coop_caps: CoopCaps,
+    pub shared_memory_bytes: u32,
+}
+
 /// Fingerprint every build input that can alter the execution plan.
 ///
 /// `mode_tag` is deliberately numeric to keep this module independent of the
@@ -168,8 +207,7 @@ pub(crate) fn hash_build_config(
     optimize: &OptimizeConfig,
     mode_tag: u8,
     skip_full_optimize: bool,
-    coop_caps: CoopCaps,
-    shared_memory_bytes: u32,
+    target: &BuildTargetFingerprint<'_>,
 ) -> u64 {
     #[derive(Serialize)]
     struct BuildFingerprint<'a> {
@@ -178,8 +216,7 @@ pub(crate) fn hash_build_config(
         optimize: &'a OptimizeConfig,
         mode_tag: u8,
         skip_full_optimize: bool,
-        coop_caps: CoopCaps,
-        shared_memory_bytes: u32,
+        target: &'a BuildTargetFingerprint<'a>,
     }
 
     let fingerprint = BuildFingerprint {
@@ -188,8 +225,7 @@ pub(crate) fn hash_build_config(
         optimize,
         mode_tag,
         skip_full_optimize,
-        coop_caps,
-        shared_memory_bytes,
+        target,
         // Flash coop flags and EPT caps live in `options`, hashed above.
     };
     hash_serializable(&fingerprint)
@@ -434,18 +470,74 @@ mod tests {
     fn test_build_hash_includes_mode_options_and_target() {
         let defaults = CompileOptions::default();
         let optimize = OptimizeConfig::default();
-        let base = hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default(), 49_152);
+        let base_target = BuildTargetFingerprint {
+            device_name: "TestGPU",
+            driver_name: "Mesa",
+            driver_info: "26.0",
+            subgroup_size: 32,
+            coop_caps: CoopCaps::default(),
+            shared_memory_bytes: 49_152,
+        };
+        let base = hash_build_config(&defaults, &optimize, 0, false, &base_target);
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 1, false, CoopCaps::default(), 49_152),
+            hash_build_config(&defaults, &optimize, 1, false, &base_target),
         );
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 0, true, CoopCaps::default(), 49_152),
+            hash_build_config(&defaults, &optimize, 0, true, &base_target),
         );
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default(), 65_536),
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    shared_memory_bytes: 65_536,
+                    ..base_target
+                },
+            ),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    device_name: "OtherGPU",
+                    ..base_target
+                },
+            ),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    driver_info: "26.1",
+                    ..base_target
+                },
+            ),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    subgroup_size: 64,
+                    ..base_target
+                },
+            ),
         );
         assert_ne!(
             base,
@@ -457,8 +549,7 @@ mod tests {
                 &optimize,
                 0,
                 false,
-                CoopCaps::default(),
-                49_152,
+                &base_target,
             ),
         );
         assert_ne!(
@@ -468,12 +559,14 @@ mod tests {
                 &optimize,
                 0,
                 false,
-                CoopCaps {
-                    f16_tile: 16,
-                    f32_tile: 0,
-                    f16_attention_rows: 0,
+                &BuildTargetFingerprint {
+                    coop_caps: CoopCaps {
+                        f16_tile: 16,
+                        f32_tile: 0,
+                        f16_attention_rows: 0,
+                    },
+                    ..base_target
                 },
-                49_152,
             ),
         );
     }
@@ -487,9 +580,11 @@ mod tests {
         graph.set_outputs(vec![x]);
         let options = CompileOptions::default();
         let defaults = OptimizeConfig::default();
-        let hash = |config: &OptimizeConfig| {
-            hash_build_config(&options, config, 1, false, CoopCaps::default(), 49_152)
+        let target = BuildTargetFingerprint {
+            shared_memory_bytes: 49_152,
+            ..BuildTargetFingerprint::default()
         };
+        let hash = |config: &OptimizeConfig| hash_build_config(&options, config, 1, false, &target);
         let plan = compile::compile(&graph);
         let path = std::env::temp_dir().join(format!(
             "meganeura_test_rewrite_cache_{}.ron",
