@@ -272,6 +272,18 @@ pub(crate) fn select_variants(
     reset_workgroup_matmuls(plan);
     select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
+    let wg = crate::schedule::GridShape::default().workgroup_size;
+    for dispatch in &mut plan.dispatches {
+        if let Some(dag) = dispatch.pointwise() {
+            let len = dispatch.params.first().copied().unwrap_or(0);
+            let work_items = if dag.can_vectorize(dispatch.pointwise_storage, len) {
+                len / 4
+            } else {
+                len
+            };
+            dispatch.workgroups = [work_items.div_ceil(wg), 1, 1];
+        }
+    }
 
     plan.split_long_scalar_products();
     plan.split_low_occupancy_scalar_products();

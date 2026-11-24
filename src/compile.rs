@@ -2225,12 +2225,10 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 {
                     continue;
                 }
-                // Arity cap: the runtime binds pointwise pipelines via
-                // UnaryData (n=1), BinaryData (n=2), or TernaryData (n=3).
-                // A higher-arity fused DAG would need a wider layout we
-                // don't plumb yet.
+                // Arity cap: dynamic pointwise binding supports up to
+                // `MAX_POINTWISE_INPUTS` streams (matching `PointwiseStorage::bf16_inputs`).
                 let new_arity = p.input_buffers.len() + c.input_buffers.len() - 1;
-                if new_arity > 3 {
+                if new_arity > crate::schedule::MAX_POINTWISE_INPUTS as usize {
                     continue;
                 }
                 candidate = Some((slot_idx as u8, pi));

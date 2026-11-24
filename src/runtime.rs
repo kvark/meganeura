@@ -970,11 +970,12 @@ enum Variant {
         crate::compile::WeightFormat,
         crate::codegen::ScalarMatmulShape,
     ),
-    /// Schedule-template kernels, keyed by kernel content hash. These are
-    /// generated from a DAG rather than a shader group, so no `ShaderEntry`
-    /// identifies them.
-    Reduction(u64),
-    Pointwise(u64),
+    /// Schedule-template kernels, keyed by kernel content hash plus codegen
+    /// flags (`(hash, use_subgroups, vec4)` for reductions; `(hash, vec4)` for
+    /// pointwise). These are generated from a DAG rather than a shader group,
+    /// so no `ShaderEntry` identifies them.
+    Reduction(u64, bool, bool),
+    Pointwise(u64, bool),
     /// Attention specialization includes the head width and the scalar
     /// backward EPT cap. Both can differ between dispatches in one plan.
     /// The last flag is permission to store flash Q and K tiles as f16.
@@ -1058,7 +1059,7 @@ impl Variant {
     /// schedule-template kernels, which have no entry of their own.
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
-            Variant::Reduction(_) | Variant::Pointwise(_) => None,
+            Variant::Reduction(..) | Variant::Pointwise(..) => None,
             Variant::StoredGate(ref e, _)
             | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
@@ -1129,8 +1130,15 @@ impl Variant {
             Variant::SpecializedConv(ref e, ref params, k_tile, interleave) => {
                 format!("{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-{params:?}")
             }
-            Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
-            Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
+            Variant::Reduction(hash, sg, vec4) => {
+                let sg = if sg { ":sg" } else { "" };
+                let v4 = if vec4 { ":v4" } else { "" };
+                format!("generated-reduction:{hash:016x}{sg}{v4}")
+            }
+            Variant::Pointwise(hash, vec4) => {
+                let v4 = if vec4 { ":v4" } else { "" };
+                format!("generated-pointwise:{hash:016x}{v4}")
+            }
             Variant::BlockAttention(ref e, p) => format!("{e:?}:block-{p:?}"),
             Variant::Attention(ref e, head_dim, ept, f16_tiles) => {
                 let tiles = if f16_tiles { ":f16-tiles" } else { "" };
@@ -2425,21 +2433,33 @@ impl Pipelines {
                 }
                 _ => unreachable!("non-parameterized attention group {group:?}"),
             },
-            Variant::Pointwise(_) => {
+            Variant::Pointwise(_, vec4) => {
                 let dag = dispatch.pointwise().expect("pointwise implementation");
                 layout = pointwise_data_layout(dag.n_inputs);
                 entry_point = crate::schedule::POINTWISE_ENTRY;
-                crate::schedule::lower_pointwise_storage(
-                    dag,
-                    crate::schedule::GridShape::default(),
-                    dispatch.pointwise_storage,
-                )
+                if vec4 {
+                    let len = dispatch.params.first().copied().unwrap_or(0);
+                    let kinds = dag
+                        .vec4_input_kinds(dispatch.pointwise_storage, len)
+                        .expect("vec4 pointwise inputs validated by key");
+                    crate::schedule::lower_pointwise_vec4(
+                        dag,
+                        crate::schedule::GridShape::default(),
+                        &kinds,
+                    )
+                } else {
+                    crate::schedule::lower_pointwise_storage(
+                        dag,
+                        crate::schedule::GridShape::default(),
+                        dispatch.pointwise_storage,
+                    )
+                }
             }
-            Variant::Reduction(_) => {
+            Variant::Reduction(_, use_subgroups, vec4) => {
                 let kernel = dispatch.reduction().expect("reduction implementation");
                 layout = reduction_data_layout(kernel);
                 entry_point = crate::schedule::REDUCTION_ENTRY;
-                kernel.lower_with_storage(dispatch.pointwise_storage)
+                kernel.lower_with_options(dispatch.pointwise_storage, use_subgroups, vec4)
             }
             Variant::Horizontal(_, count, kind) => {
                 let coop = match kind {
@@ -2633,24 +2653,31 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
+            let use_subgroups = caps.subgroup_size > 0
+                && kernel.rows_per_workgroup == 1
+                && kernel.workgroup_size > 1;
+            let inner = dispatch.params.get(1).copied().unwrap_or(0);
+            let vec4 = kernel.can_vectorize(dispatch.pointwise_storage, inner);
             if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
-                return Variant::Reduction(kernel.hash_key());
+                return Variant::Reduction(kernel.hash_key(), use_subgroups, vec4);
             }
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             kernel.hash(&mut hash);
             dispatch.pointwise_storage.hash(&mut hash);
-            return Variant::Reduction(hash.finish());
+            return Variant::Reduction(hash.finish(), use_subgroups, vec4);
         }
         if let Some(dag) = dispatch.pointwise() {
+            let len = dispatch.params.first().copied().unwrap_or(0);
+            let vec4 = dag.can_vectorize(dispatch.pointwise_storage, len);
             if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
-                return Variant::Pointwise(dag.hash_key());
+                return Variant::Pointwise(dag.hash_key(), vec4);
             }
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             dag.hash(&mut hash);
             dispatch.pointwise_storage.hash(&mut hash);
-            return Variant::Pointwise(hash.finish());
+            return Variant::Pointwise(hash.finish(), vec4);
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             if dispatch.kernel == crate::compile::Kernel::BlockAttention {
@@ -2904,6 +2931,9 @@ type HorizMatMulData = BufferListData<MatMulParams>;
 /// Gather-reduction bindings: one buffer per gathered stream, then `params`.
 type DynReductionData = BufferListData<ReductionParams>;
 
+/// Dynamic pointwise bindings: one buffer per DAG input stream, `dst`, then `params`.
+type DynPointwiseData = BufferListData<UnaryParams>;
+
 /// ShaderDataLayout for a schedule-template reduction pipeline, chosen
 /// by (n_per_elem, n_per_row, n_per_col), or built from
 /// [`reduction_input_binding_names`] when [`reduction_is_dynamic`]. Names
@@ -2939,17 +2969,22 @@ fn reduction_data_layout(
     }
 }
 
-/// ShaderDataLayout for a schedule-template pointwise pipeline, chosen by
-/// DAG input arity. Names align with the bindings emitted by
-/// `schedule::lower` for each arity.
+/// ShaderDataLayout for a schedule-template pointwise pipeline, built from
+/// `schedule::pointwise_input_binding_names(n_inputs)` plus `dst` and `params`.
 fn pointwise_data_layout(n_inputs: u8) -> blade_graphics::ShaderDataLayout {
-    use blade_graphics::ShaderData;
-    match n_inputs {
-        1 => UnaryData::layout(),
-        2 => BinaryData::layout(),
-        3 => TernaryData::layout(),
-        n => panic!("pointwise arity {} has no runtime data layout", n),
-    }
+    let mut bindings: Vec<(&'static str, blade_graphics::ShaderBinding)> =
+        crate::schedule::pointwise_input_binding_names(n_inputs)
+            .into_iter()
+            .map(|name| (name, blade_graphics::ShaderBinding::Buffer))
+            .collect();
+    bindings.push(("dst", blade_graphics::ShaderBinding::Buffer));
+    bindings.push((
+        "params",
+        blade_graphics::ShaderBinding::Plain {
+            size: std::mem::size_of::<UnaryParams>() as u32,
+        },
+    ));
+    blade_graphics::ShaderDataLayout { bindings }
 }
 
 /// Get the ShaderDataLayout for a coop matmul with an N-factor prologue.
