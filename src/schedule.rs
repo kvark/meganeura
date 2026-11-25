@@ -1562,7 +1562,12 @@ fn lower_reduction(
     }
     src.push_str("}\n");
 
-    ShaderModule::with_hint(src, "reduction")
+    let module = ShaderModule::with_hint(src, "reduction");
+    if use_subgroups {
+        module.with_subgroup(0, [wg, 1, 1])
+    } else {
+        module
+    }
 }
 
 /// Binding names for per-row broadcast inputs used by the reduction
