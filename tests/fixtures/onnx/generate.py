@@ -1,4 +1,5 @@
-"""Generate transformer-layer ONNX fixtures in the form PyTorch's exporter writes.
+"""Generate ONNX fixtures in the form PyTorch's exporter writes: transformer
+layers and a ResNet block.
 
 The models are authored here node by node with `onnx.helper`, not produced
 by `torch.onnx.export`: each follows the pattern the exporter emits for a
@@ -84,18 +85,18 @@ class Builder:
         gamma = self.const("gamma", 1.0 + self.rng.normal(0.0, 0.1, (HIDDEN,)))
         return self.op("Mul", gamma, normalized)
 
-    def finish(self, name, x_name, y, opset):
+    def finish(self, name, x_name, y, opset, x_shape=(1, SEQ, HIDDEN), y_shape=(1, SEQ, HIDDEN)):
         graph = helper.make_graph(
             self.nodes,
             name,
-            [helper.make_tensor_value_info(x_name, TensorProto.FLOAT, [1, SEQ, HIDDEN])],
-            [helper.make_tensor_value_info(y, TensorProto.FLOAT, [1, SEQ, HIDDEN])],
+            [helper.make_tensor_value_info(x_name, TensorProto.FLOAT, list(x_shape))],
+            [helper.make_tensor_value_info(y, TensorProto.FLOAT, list(y_shape))],
             self.inits,
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        x = self.rng.normal(0.0, 1.0, (1, SEQ, HIDDEN)).astype(np.float32)
+        x = self.rng.normal(0.0, 1.0, x_shape).astype(np.float32)
         (expected,) = ReferenceEvaluator(model).run(None, {x_name: x})
         onnx.save(model, os.path.join(HERE, f"{name}.onnx"))
         x.tofile(os.path.join(HERE, f"{name}.input.bin"))
@@ -207,7 +208,34 @@ def llama_gqa_dynamic_layer():
     b.finish("llama_gqa_dynamic_layer", x, b.op("Add", h, down), 17)
 
 
+def resnet_block():
+    """The ResNet-18 stem and a downsampling BasicBlock, then the classifier.
+    The stem keeps its BatchNormalization, as an export with
+    `training=TrainingMode.PRESERVE` does; the block's are folded into its
+    convolutions' bias, as the default export does."""
+    b = Builder(4)
+    x = "pixel_values"
+
+    def conv(t, n_in, n_out, k, stride, pad, bias=True):
+        inputs = [t, b.weight("weight", (n_out, n_in, k, k), (n_in * k * k) ** -0.5)]
+        if bias:
+            inputs.append(b.weight("bias", (n_out,), 0.1))
+        return b.op("Conv", *inputs, dilations=[1, 1], group=1, kernel_shape=[k, k], pads=[pad] * 4, strides=[stride] * 2)
+
+    stem = conv(x, 3, 8, 7, 2, 3, bias=False)
+    gamma, beta = b.const("gamma", 1.0 + b.rng.normal(0.0, 0.1, 8)), b.weight("beta", (8,), 0.1)
+    mean, var = b.weight("mean", (8,), 0.1), b.const("var", b.rng.uniform(0.5, 2.0, 8))
+    h = b.op("Relu", b.op("BatchNormalization", stem, gamma, beta, mean, var, epsilon=1e-5))
+    h = b.op("MaxPool", h, kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[2, 2])
+    y = conv(b.op("Relu", conv(h, 8, 16, 3, 2, 1)), 16, 16, 3, 1, 1)
+    h = b.op("Relu", b.op("Add", y, conv(h, 8, 16, 1, 2, 0)))
+    h = b.op("Flatten", b.op("GlobalAveragePool", h), axis=1)
+    logits = b.op("Gemm", h, b.weight("weight", (10, 16), 0.25), b.weight("bias", (10,), 0.1), transB=1)
+    b.finish("resnet_block", x, logits, 17, (1, 3, 16, 16), (1, 10))
+
+
 if __name__ == "__main__":
     bert_layer()
     llama_layer()
     llama_gqa_dynamic_layer()
+    resnet_block()

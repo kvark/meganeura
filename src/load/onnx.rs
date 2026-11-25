@@ -263,6 +263,15 @@ fn translate_node(
             let trans_b = attrs.i("transB", 0) != 0;
             let a_shape = get_shape(&node.inputs[0], shapes);
             let b_shape = get_shape(&node.inputs[1], shapes);
+            let (alpha, beta) = (attrs.f("alpha", 1.0), attrs.f("beta", 1.0));
+            if a_shape.len() != 2 || b_shape.len() != 2 || alpha != 1.0 || beta != 1.0 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Gemm of {a_shape:?} and {b_shape:?} scaled by {alpha} and {beta} \
+                     (supported: matrices, unscaled)"
+                )));
+            }
+            let a = view(graph, a, &a_shape)?;
+            let b = view(graph, b, &b_shape)?;
 
             let mm = match (trans_a, trans_b) {
                 (false, false) => graph.matmul(a, b),
@@ -291,6 +300,7 @@ fn translate_node(
             // Add bias if present
             let out = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
                 let c = resolve_input(&node.inputs[2], name_to_id, &node.name)?;
+                let c = view(graph, c, &[n])?;
                 graph.bias_add(mm, c)
             } else {
                 mm
@@ -612,95 +622,69 @@ fn translate_node(
         }
 
         // --- Conv (1D or 2D) ---
-        // Conv1d [N,C,L] is treated as Conv2d with H=1: [N,C,1,L]
         "Conv" => {
             let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let kernel = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let input_shape = get_shape(&node.inputs[0], shapes);
             let kernel_shape = get_shape(&node.inputs[1], shapes);
-
-            let (batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w) =
-                if input_shape.len() == 4 && kernel_shape.len() == 4 {
-                    // Standard Conv2d
-                    (
-                        input_shape[0] as u32,
-                        input_shape[1] as u32,
-                        input_shape[2] as u32,
-                        input_shape[3] as u32,
-                        kernel_shape[0] as u32,
-                        kernel_shape[2] as u32,
-                        kernel_shape[3] as u32,
-                    )
-                } else if input_shape.len() == 3 && kernel_shape.len() == 3 {
-                    // Conv1d: [N,C,L] → treat as [N,C,1,L]
-                    (
-                        input_shape[0] as u32,
-                        input_shape[1] as u32,
-                        1u32,
-                        input_shape[2] as u32,
-                        kernel_shape[0] as u32,
-                        1u32,
-                        kernel_shape[2] as u32,
-                    )
-                } else {
-                    return Err(OnnxError::UnsupportedOp(format!(
-                        "Conv: expected 3D or 4D input/kernel, got {}D and {}D",
-                        input_shape.len(),
-                        kernel_shape.len()
-                    )));
-                };
-
-            let strides = attrs.ints("strides");
-            let pads = attrs.ints("pads");
-            let stride = strides.first().copied().unwrap_or(1) as u32;
-            // For Conv2d pads=[pH_begin, pW_begin, pH_end, pW_end],
-            // for Conv1d pads=[p_begin, p_end] → padding_h=0, padding_w=p.
-            let (padding_h, padding_w) = if input_shape.len() == 3 {
-                // Conv1d: no height padding, width padding only
-                (0u32, pads.first().copied().unwrap_or(0) as u32)
-            } else {
-                let ph = pads.first().copied().unwrap_or(0) as u32;
-                let pw = if pads.len() >= 2 { pads[1] as u32 } else { ph };
-                (ph, pw)
+            let rank = input_shape.len();
+            if !(3..=4).contains(&rank) || kernel_shape.len() != rank {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Conv of {input_shape:?} by {kernel_shape:?} (supported: 1D and 2D)"
+                )));
+            }
+            let group = attrs.i("group", 1);
+            if group != 1 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Conv '{}' in {group} groups (supported: 1)",
+                    node.name
+                )));
+            }
+            let (stride, pads) = window(node, &input_shape[2..], &kernel_shape[2..])?;
+            // A 1D convolution is a 2D one over images a row high.
+            let plane = |s: &[usize], fill| match *s {
+                [w] => [fill, w],
+                [h, w] => [h, w],
+                _ => [fill; 2],
             };
-
+            let [in_h, in_w] = plane(&input_shape[2..], 1);
+            let [kernel_h, kernel_w] = plane(&kernel_shape[2..], 1);
+            let [padding_h, padding_w] = plane(&pads, 0);
+            let (batch, in_channels, out_channels) =
+                (input_shape[0], input_shape[1], kernel_shape[0]);
+            // The kernel reads both operands as flat NCHW.
+            let input = view(graph, input, &[batch * in_channels * in_h * in_w])?;
+            let kernel = view(
+                graph,
+                kernel,
+                &[out_channels * in_channels * kernel_h * kernel_w],
+            )?;
             let out = graph.conv2d_hw(
                 input,
                 kernel,
-                batch,
-                in_channels,
-                in_h,
-                in_w,
-                out_channels,
-                kernel_h,
-                kernel_w,
-                stride,
-                padding_h,
-                padding_w,
+                batch as u32,
+                in_channels as u32,
+                in_h as u32,
+                in_w as u32,
+                out_channels as u32,
+                kernel_h as u32,
+                kernel_w as u32,
+                stride as u32,
+                padding_h as u32,
+                padding_w as u32,
             );
-
             let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
             let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
-            let out_shape = if input_shape.len() == 3 {
-                // Conv1d output: [N, C_out, L_out]
-                vec![batch as usize, out_channels as usize, out_w as usize]
-            } else {
-                vec![
-                    batch as usize,
-                    out_channels as usize,
-                    out_h as usize,
-                    out_w as usize,
-                ]
+            let out = match node.inputs.get(2).filter(|name| !name.is_empty()) {
+                Some(name) => {
+                    let bias = resolve_input(name, name_to_id, &node.name)?;
+                    let bias = view(graph, bias, &[out_channels])?;
+                    graph.add_per_channel(out, bias, out_channels as u32, (out_h * out_w) as u32)
+                }
+                None => out,
             };
-
-            // Add bias if present
-            let out = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
-                let bias = resolve_input(&node.inputs[2], name_to_id, &node.name)?;
-                graph.bias_add(out, bias)
-            } else {
-                out
-            };
-
+            let mut out_shape = vec![batch, out_channels];
+            out_shape.extend_from_slice(&[out_h, out_w][4 - rank..]);
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
@@ -846,69 +830,42 @@ fn translate_node(
         }
 
         // --- BatchNormalization (inference mode) ---
-        // Decompose: output = scale * (x - mean) / sqrt(var + eps) + bias
-        // In inference mode, mean and var are running statistics (constants).
-        // We precompute: w = scale / sqrt(var + eps), b = bias - mean * w
-        // Then: output = x * w + b  (per-channel, broadcast over spatial dims)
+        // With running statistics it is `x * w + b` per channel, where
+        // w = scale / sqrt(var + eps) and b = bias - mean * w.
         "BatchNormalization" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let eps = attrs.f("epsilon", 1e-5);
-
-            if x_shape.len() != 4 {
-                return Err(OnnxError::UnsupportedOp(
-                    "BatchNormalization: only 4D (NCHW) supported".into(),
-                ));
+            if x_shape.len() < 2 || attrs.i("training_mode", 0) != 0 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "BatchNormalization of {x_shape:?} (supported: inference over [N, C, ...])"
+                )));
             }
-
-            // Get scale, bias, mean, var from weights (they're initializers)
-            let scale_data = weights
-                .get(&node.inputs[1])
-                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing scale".into()))?;
-            let bias_data = weights
-                .get(&node.inputs[2])
-                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing bias".into()))?;
-            let mean_data = weights
-                .get(&node.inputs[3])
-                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing mean".into()))?;
-            let var_data = weights
-                .get(&node.inputs[4])
-                .ok_or_else(|| OnnxError::ShapeError("BatchNorm: missing var".into()))?;
-
-            let c = scale_data.len();
-            // Precompute fused weight and bias per channel
-            let mut fused_w = vec![0.0f32; c];
-            let mut fused_b = vec![0.0f32; c];
-            for i in 0..c {
-                let inv_std = 1.0 / (var_data[i] + eps).sqrt();
-                fused_w[i] = scale_data[i] * inv_std;
-                fused_b[i] = bias_data[i] - mean_data[i] * fused_w[i];
-            }
-
-            // x * fused_w + fused_b (broadcast over spatial dims)
-            // For NCHW: fused_w/fused_b are [C], need to broadcast over [N,C,H,W]
-            // Expand to full spatial: tile [C] → [N*C*H*W]
-            let n = x_shape[0];
-            let h = x_shape[2];
-            let w = x_shape[3];
-            let spatial = h * w;
-            let full_size = n * c * spatial;
-            let mut w_expanded = vec![0.0f32; full_size];
-            let mut b_expanded = vec![0.0f32; full_size];
-            for batch in 0..n {
-                for ch in 0..c {
-                    for s in 0..spatial {
-                        let idx = (batch * c + ch) * spatial + s;
-                        w_expanded[idx] = fused_w[ch];
-                        b_expanded[idx] = fused_b[ch];
-                    }
-                }
-            }
-
-            let w_node = graph.constant(w_expanded, &[full_size]);
-            let b_node = graph.constant(b_expanded, &[full_size]);
-            let scaled = graph.mul(x, w_node);
-            let out = graph.add(scaled, b_node);
+            let (batch, channels) = (x_shape[0], x_shape[1]);
+            let spatial = x_shape[2..].iter().product::<usize>();
+            let stat = |slot: usize| {
+                let id = *name_to_id.get(node.inputs.get(slot)?)?;
+                constant_values(graph, id, weights).filter(|values| values.len() == channels)
+            };
+            let (Some(scale), Some(bias), Some(mean), Some(var)) =
+                (stat(1), stat(2), stat(3), stat(4))
+            else {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "BatchNormalization '{}': scale, bias, mean and variance must be \
+                     constants of {channels} values",
+                    node.name
+                )));
+            };
+            let w: Vec<f32> = (0..channels)
+                .map(|c| scale[c] / (var[c] + eps).sqrt())
+                .collect();
+            let b: Vec<f32> = (0..channels).map(|c| bias[c] - mean[c] * w[c]).collect();
+            // The scale kernel takes a value per image and channel.
+            let w = graph.constant(w.repeat(batch), &[batch * channels]);
+            let b = graph.constant(b, &[channels]);
+            let x = view(graph, x, &[batch * channels * spatial])?;
+            let scaled = graph.mul_per_channel(x, w, channels as u32, spatial as u32);
+            let out = graph.add_per_channel(scaled, b, channels as u32, spatial as u32);
             register_output(node, 0, out, &x_shape, name_to_id, shapes);
         }
 
@@ -916,35 +873,43 @@ fn translate_node(
         "MaxPool" => {
             let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let input_shape = get_shape(&node.inputs[0], shapes);
-            if input_shape.len() != 4 {
-                return Err(OnnxError::UnsupportedOp(
-                    "MaxPool: only 4D (NCHW) supported".into(),
-                ));
+            let kernel: Vec<usize> = attrs
+                .ints("kernel_shape")
+                .iter()
+                .map(|&k| k.max(0) as usize)
+                .collect();
+            if input_shape.len() != 4 || kernel.len() != 2 || attrs.i("ceil_mode", 0) != 0 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "MaxPool of {input_shape:?} by {kernel:?} (supported: 2D, rounding down)"
+                )));
             }
-
-            let channels = input_shape[1] as u32;
-            let in_h = input_shape[2] as u32;
-            let in_w = input_shape[3] as u32;
-            let batch = input_shape[0] as u32;
-
-            let kernel_shape = attrs.ints("kernel_shape");
-            let strides = attrs.ints("strides");
-            let pads = attrs.ints("pads");
-            let kh = kernel_shape.first().copied().unwrap_or(2) as u32;
-            let kw = kernel_shape.get(1).copied().unwrap_or(kh as i64) as u32;
-            let stride = strides.first().copied().unwrap_or(kh as i64) as u32;
-            let padding = pads.first().copied().unwrap_or(0) as u32;
-
-            let out =
-                graph.max_pool_2d(input, batch, channels, in_h, in_w, kh, kw, stride, padding);
-
-            let out_h = (in_h + 2 * padding - kh) / stride + 1;
-            let out_w = (in_w + 2 * padding - kw) / stride + 1;
+            let (stride, pads) = window(node, &input_shape[2..], &kernel)?;
+            if pads[0] != pads[1] {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "MaxPool '{}' padded by {pads:?} (supported: the same on every axis)",
+                    node.name
+                )));
+            }
+            let [batch, channels, in_h, in_w] = input_shape[..] else {
+                unreachable!()
+            };
+            let input = view(graph, input, &[batch * channels * in_h * in_w])?;
+            let out = graph.max_pool_2d(
+                input,
+                batch as u32,
+                channels as u32,
+                in_h as u32,
+                in_w as u32,
+                kernel[0] as u32,
+                kernel[1] as u32,
+                stride as u32,
+                pads[0] as u32,
+            );
             let out_shape = vec![
-                batch as usize,
-                channels as usize,
-                out_h as usize,
-                out_w as usize,
+                batch,
+                channels,
+                (in_h + 2 * pads[0] - kernel[0]) / stride + 1,
+                (in_w + 2 * pads[1] - kernel[1]) / stride + 1,
             ];
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
@@ -963,6 +928,7 @@ fn translate_node(
             let channels = input_shape[1] as u32;
             let spatial = (input_shape[2] * input_shape[3]) as u32;
 
+            let input = view(graph, input, &[input_shape.iter().product()])?;
             let out = graph.global_avg_pool(input, batch, channels, spatial);
             let out_shape = vec![input_shape[0], input_shape[1], 1, 1];
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
@@ -1309,6 +1275,77 @@ fn register_output(
             shapes.insert(name.clone(), shape.to_vec());
         }
     }
+}
+
+/// The stride and per-axis padding of a convolution or pooling `kernel`
+/// over `extents`, in the form the GPU kernels take: one stride for every
+/// axis, no dilation, and the same padding before and after each axis.
+fn window(
+    node: &proto::Node,
+    extents: &[usize],
+    kernel: &[usize],
+) -> Result<(usize, Vec<usize>), OnnxError> {
+    let attrs = &node.attrs;
+    let rank = extents.len();
+    let unsupported = |what: String| {
+        OnnxError::UnsupportedOp(format!("{} '{}': {what}", node.op_type, node.name))
+    };
+    let strides = match *attrs.ints("strides") {
+        [] => vec![1; rank],
+        ref strides => strides.to_vec(),
+    };
+    let stride = strides.first().copied().unwrap_or(1);
+    if strides.len() != rank
+        || !(1..=i64::from(u32::MAX)).contains(&stride)
+        || strides.iter().any(|&s| s != stride)
+    {
+        return Err(unsupported(format!(
+            "strides {strides:?} (supported: the same on every axis)"
+        )));
+    }
+    let stride = stride as usize;
+    if attrs.ints("dilations").iter().any(|&d| d != 1) {
+        return Err(unsupported("dilation (supported: none)".into()));
+    }
+    let pads: Vec<i64> = match attrs.s("auto_pad").unwrap_or("NOTSET") {
+        "NOTSET" => match *attrs.ints("pads") {
+            [] => vec![0; 2 * rank],
+            ref pads => pads.to_vec(),
+        },
+        "VALID" => vec![0; 2 * rank],
+        // Enough padding for `ceil(extent / stride)` outputs, split between
+        // the sides; an odd total puts the extra one on one side.
+        "SAME_UPPER" | "SAME_LOWER" => {
+            let total: Vec<i64> = extents
+                .iter()
+                .zip(kernel)
+                .map(|(&e, &k)| {
+                    let reach = ((e.div_ceil(stride).max(1) - 1) * stride).saturating_add(k);
+                    reach.saturating_sub(e) as i64
+                })
+                .collect();
+            let mut pads: Vec<i64> = total.iter().map(|&t| t / 2).collect();
+            pads.extend(total.iter().map(|&t| t - t / 2));
+            pads
+        }
+        other => return Err(unsupported(format!("auto_pad {other}"))),
+    };
+    if pads.len() != 2 * rank || (0..rank).any(|d| pads[d] < 0 || pads[d] != pads[rank + d]) {
+        return Err(unsupported(format!(
+            "pads {pads:?} (supported: the same on both sides of an axis)"
+        )));
+    }
+    let pads: Vec<usize> = pads[..rank].iter().map(|&p| p as usize).collect();
+    for ((&extent, &k), &pad) in extents.iter().zip(kernel).zip(&pads) {
+        let padded = extent.saturating_add(pad.saturating_mul(2));
+        if k == 0 || padded < k || padded > u32::MAX as usize {
+            return Err(OnnxError::ShapeError(format!(
+                "node '{}': window {kernel:?} over {extents:?} padded by {pads:?}",
+                node.name
+            )));
+        }
+    }
+    Ok((stride, pads))
 }
 
 /// `x` of `shape` broadcast to `out_shape` by one broadcast; the ranks

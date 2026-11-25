@@ -18,6 +18,15 @@
   imports as the exact form unless its `approximate` attribute is `tanh`;
   it was always the tanh form before.
 
+- ONNX convolutional networks import and run. Every ResNet export used to
+  panic in `Conv`, whose input and kernel kept their N-D shapes; `Conv`,
+  `MaxPool`, `BatchNormalization`, `GlobalAveragePool` and `Gemm` now view
+  their operands the way their kernels read them. A convolution's bias is
+  added per channel, `BatchNormalization` folds into per-channel constants,
+  and `MaxPool` strides default to 1 as the spec says. Windows honour
+  `auto_pad` and per-axis padding; grouped, dilated and asymmetrically
+  padded windows are refused with an error.
+
 - Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
 
 - `KernelMemo` revision moves to 19: decisions are now keyed by `(class, initial)`
