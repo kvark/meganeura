@@ -1801,6 +1801,7 @@ impl ExecutionPlan {
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
         for dispatch in &self.dispatches {
             visible.extend(dispatch.extra_outputs.iter().copied());
+            visible.extend(dispatch.control_deps.iter().copied());
         }
         visible
     }
@@ -1825,6 +1826,14 @@ impl ExecutionPlan {
     }
 }
 
+pub(crate) fn merge_control_deps(dst: &mut Vec<BufferRef>, src: &[BufferRef]) {
+    for &dep in src {
+        if !dst.contains(&dep) {
+            dst.push(dep);
+        }
+    }
+}
+
 /// Compile a differentiated graph into an ExecutionPlan.
 /// Topological sort of graph nodes (Kahn's algorithm).
 /// Returns node IDs in dependency order: producers before consumers.
@@ -1839,6 +1848,10 @@ fn topological_order(graph: &Graph) -> Vec<NodeId> {
         in_degree[node.id as usize] = node.inputs.len() as u32;
         for &input in &node.inputs {
             consumers[input as usize].push(node.id);
+        }
+        if let Some(fwd) = Graph::attn_fwd_node(&node.op) {
+            in_degree[node.id as usize] += 1;
+            consumers[fwd as usize].push(node.id);
         }
     }
 
@@ -2074,6 +2087,12 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
 
         let output = plan.dispatches[scatter_index].output_buffer;
         let total = plan.dispatches[scatter_index].params[0];
+        let merged_deps: Vec<BufferRef> = plan.dispatches[mul_index]
+            .control_deps
+            .iter()
+            .chain(&plan.dispatches[broadcast_index].control_deps)
+            .copied()
+            .collect();
         let scatter = &mut plan.dispatches[scatter_index];
         scatter.input_buffers = vec![indices, factors, row_scale, output];
         let small_row = scatter.params[2] <= 16;
@@ -2083,6 +2102,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         }
         scatter.kernel = Kernel::Default;
         scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
+        merge_control_deps(&mut scatter.control_deps, &merged_deps);
         // The zero entry point does not read `src`, but its shared binding
         // layout still requires a valid buffer. Stop it from retaining the
         // now-eliminated product buffer.
@@ -2276,6 +2296,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             consumer_d.input_buffers = new_inputs;
             consumer_d.kernel = Kernel::Pointwise(fused_dag);
             consumer_d.origin.extend(producer_d.origin.iter().copied());
+            merge_control_deps(&mut consumer_d.control_deps, &producer_d.control_deps);
             // Update the sentinel `shader` so legacy lookup paths resolve —
             // actual binding and pipeline layout come from `DynPointwiseData`
             // and the fused `PointwiseDAG` arity (up to `MAX_POINTWISE_INPUTS`).
@@ -2514,6 +2535,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 }
                 c.input_buffers = new_inputs;
                 c.origin.extend(producer_d.origin.iter().copied());
+                merge_control_deps(&mut c.control_deps, &producer_d.control_deps);
                 if read_count == 1 {
                     plan.dispatches.remove(pi);
                 }
@@ -2592,6 +2614,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let idx_buf = p.input_buffers[0]; // Embedding inputs[0] = indices
                 let table_buf = p.input_buffers[1]; // inputs[1] = table
                 let producer_origin = p.origin.clone();
+                let producer_control_deps = p.control_deps.clone();
                 // Gathered indices are clamped to the table's rows, one
                 // count per kernel: every gathered table must share it.
                 let table_rows = p.params[2];
@@ -2612,6 +2635,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 c.input_buffers[flat_pos] = table_buf;
                 c.input_buffers.insert(flat_pos + 1, idx_buf);
                 c.origin.extend(producer_origin);
+                merge_control_deps(&mut c.control_deps, &producer_control_deps);
                 // Drop the embedding dispatch if it's now unused.
                 if reads.get(&buf).copied().unwrap_or(0) == 1 {
                     plan.dispatches.remove(pi);
@@ -2683,12 +2707,19 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     .chain(&b.origin)
                     .copied()
                     .collect::<Vec<_>>();
+                let inherited_control_deps: Vec<BufferRef> = t
+                    .control_deps
+                    .iter()
+                    .chain(&b.control_deps)
+                    .copied()
+                    .collect();
                 let c = &mut plan.dispatches[ci];
                 let kernel = c.reduction_mut().expect("checked");
                 kernel.input_row_repeats.resize(per_elem, 1);
                 kernel.input_row_repeats[s] = repeats;
                 c.input_buffers[s] = input;
                 c.origin.extend(origin);
+                merge_control_deps(&mut c.control_deps, &inherited_control_deps);
                 if reads.get(&buf) == Some(&1) && !prot.contains(&buf) {
                     plan.dispatches.remove(ti);
                     if reads.get(&expanded) == Some(&1) && !prot.contains(&expanded) {
@@ -2798,7 +2829,7 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
     let external = plan.externally_visible_buffers();
 
     let mut drop_norm: Vec<usize> = Vec::new();
-    let mut rewrite: Vec<(usize, BufferRef, BufferRef, u32)> = Vec::new();
+    let mut rewrite: Vec<(usize, BufferRef, BufferRef, u32, Vec<BufferRef>)> = Vec::new();
     for (ni, norm) in plan.dispatches.iter().enumerate() {
         if !is_plain_rmsnorm(norm) {
             continue;
@@ -2838,7 +2869,7 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
             norm.params.get(2).copied().unwrap_or(0),
         );
         for &c in consumers {
-            rewrite.push((c, src, weight, eps_bits));
+            rewrite.push((c, src, weight, eps_bits, norm.control_deps.clone()));
         }
         drop_norm.push(ni);
     }
@@ -2846,10 +2877,11 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         return;
     }
 
-    for (idx, src, weight, eps_bits) in rewrite {
+    for (idx, src, weight, eps_bits, norm_deps) in rewrite {
         let d = &mut plan.dispatches[idx];
         d.input_buffers[0] = src;
         d.gemv_rmsnorm = Some(GemvRmsNorm { weight, eps_bits });
+        merge_control_deps(&mut d.control_deps, &norm_deps);
     }
     let dropped = drop_norm.len();
     drop_norm.sort_unstable();
@@ -2905,7 +2937,11 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         // absorbed a consumer (for example Gemma4's `(norm + embedding) /
         // sqrt(2)`) into its DAG, and RmsNormAdd has no pointwise epilogue,
         // so replacing that dispatch would silently drop the consumer.
-        if add.pointwise() != Some(&plain_add) || add.output_buffer == normed {
+        if add.pointwise() != Some(&plain_add)
+            || add.output_buffer == normed
+            || add.fusion_barrier
+            || !add.control_deps.is_empty()
+        {
             continue;
         }
         // The add's other input carries the residual.
@@ -3031,6 +3067,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         // provenance.
         let norm_origin = plan.dispatches[norm_idx].origin.clone();
         let norm_label = plan.dispatches[norm_idx].label.clone();
+        let norm_control_deps = plan.dispatches[norm_idx].control_deps.clone();
         plan.dispatches[norm_idx] = Dispatch {
             shader: ShaderEntry::RmsNormRsqrt,
             workgroups: [rows, 1, 1],
@@ -3041,6 +3078,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
 
             origin: norm_origin.clone(),
             label: norm_label,
+            control_deps: norm_control_deps,
             ..Default::default()
         };
 
@@ -3116,6 +3154,7 @@ fn fuse_winograd_add(plan: &mut ExecutionPlan) {
             fused.origin.extend_from_slice(&consumer.origin);
             fused.requires_full_precision |= consumer.requires_full_precision;
             fused.is_derivative |= consumer.is_derivative;
+            merge_control_deps(&mut fused.control_deps, &consumer.control_deps);
             plan.dispatches[ci] = fused;
             remove.push(pi);
             break;
@@ -3162,7 +3201,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         // Binary ops (BiasAdd, Add) would require extra buffer bindings in the
         // shader data layout, which is a larger change. TODO: extend shader data
         // layouts to support dynamic extra bindings for binary epilogues.
-        if d.input_buffers.len() != 1 {
+        if d.input_buffers.len() != 1 || d.fusion_barrier || !d.control_deps.is_empty() {
             continue;
         }
 
@@ -5654,6 +5693,100 @@ mod tests {
             p_fill.dataflow_digest(),
             p_const.dataflow_digest(),
             "Fill and bit-identical uniform Constant must produce the same dataflow digest"
+        );
+    }
+
+    #[test]
+    fn depend_token_producer_survives_pointwise_fusion_and_orders_consumer() {
+        // Regression for control_deps token erasure in fuse_pointwise_chains:
+        // `token = relu(a); first = tanh(token); second = tanh(depend(b, token))`
+        // Fusion must NOT fold `relu(a)` away because `second` carries a
+        // control dependency on `token`'s buffer, and the scheduler must place
+        // `second` strictly after `token`'s producer.
+        let mut g = Graph::new();
+        let a = g.input("a", &[128]);
+        let b = g.input("b", &[128]);
+        let token = g.relu(a);
+        let first = g.tanh(token);
+        let gated_b = g.depend(b, token);
+        let second = g.tanh(gated_b);
+        g.set_outputs(vec![first, second]);
+
+        let mut plan = compile(&g);
+        schedule_dispatches(&mut plan, false, false);
+
+        let second_out = plan.output_buffers[1];
+        let second_idx = plan
+            .dispatches
+            .iter()
+            .position(|d| d.output_buffer == second_out)
+            .expect("second output dispatch");
+        let second_d = &plan.dispatches[second_idx];
+        assert_eq!(
+            second_d.control_deps.len(),
+            1,
+            "second dispatch must keep its control dependency on token"
+        );
+        let tok_buf = second_d.control_deps[0];
+        let tok_idx = plan
+            .dispatches
+            .iter()
+            .position(|d| d.output_buffer == tok_buf)
+            .expect("token producer must survive fusion");
+        let group_of = |idx: usize| {
+            plan.groups
+                .iter()
+                .position(|r| r.contains(&idx))
+                .expect("dispatch in group")
+        };
+        assert!(
+            group_of(tok_idx) < group_of(second_idx),
+            "second dispatch (group {}) must run strictly after token producer (group {})",
+            group_of(second_idx),
+            group_of(tok_idx)
+        );
+    }
+
+    #[test]
+    fn fuse_epilogues_preserves_depend_ordering_on_unary_consumer() {
+        // `y = matmul(x, w); z = depend(y, tok); r = relu(z)`
+        // `fuse_epilogues` must NOT absorb `relu(z)` into `matmul` and drop
+        // its control dependency on `tok`.
+        let mut g = Graph::new();
+        let x = g.input("x", &[16, 16]);
+        let w = g.parameter("w", &[16, 16]);
+        let t = g.input("t", &[16, 16]);
+        let tok = g.tanh(t);
+        let y = g.matmul(x, w);
+        let z = g.depend(y, tok);
+        let r = g.relu(z);
+        g.set_outputs(vec![r, tok]);
+
+        let mut plan = compile(&g);
+        schedule_dispatches(&mut plan, false, false);
+
+        let r_out = plan.output_buffers[0];
+        let tok_out = plan.output_buffers[1];
+        let r_idx = plan
+            .dispatches
+            .iter()
+            .position(|d| d.output_buffer == r_out)
+            .expect("r dispatch");
+        let tok_idx = plan
+            .dispatches
+            .iter()
+            .position(|d| d.output_buffer == tok_out)
+            .expect("tok dispatch");
+        assert!(
+            plan.dispatches[r_idx].control_deps.contains(&tok_out),
+            "unary consumer must retain control_deps on tok instead of being absorbed into matmul"
+        );
+        let group_of = |idx: usize| plan.groups.iter().position(|r| r.contains(&idx)).unwrap();
+        assert!(
+            group_of(tok_idx) < group_of(r_idx),
+            "r (group {}) must run strictly after tok (group {})",
+            group_of(r_idx),
+            group_of(tok_idx)
         );
     }
 }

@@ -775,7 +775,6 @@ impl<'a> Compiler<'a> {
                 } else {
                     for d in &mut self.plan.dispatches[first_new..] {
                         d.control_deps = inherited_deps.clone();
-                        d.fusion_barrier = true;
                     }
                 }
             }

@@ -1060,6 +1060,19 @@ impl Graph {
     /// instead of cloned. This materially lowers construction peaks for large
     /// differentiated graphs while producing the same remapped IR.
     #[track_caller]
+    /// Return the forward attention node referenced by `MultiHeadAttnGrad*`,
+    /// if any. Attention gradients read the forward node's output and LSE
+    /// through this field rather than `node.inputs`, so liveness and
+    /// topological ordering must treat it as a real dependency edge.
+    pub(crate) fn attn_fwd_node(op: &Op) -> Option<NodeId> {
+        match *op {
+            Op::MultiHeadAttnGradQ { fwd_node, .. }
+            | Op::MultiHeadAttnGradK { fwd_node, .. }
+            | Op::MultiHeadAttnGradV { fwd_node, .. } => Some(fwd_node),
+            _ => None,
+        }
+    }
+
     pub(crate) fn into_toposort(self) -> Graph {
         let Graph {
             nodes,
@@ -1088,6 +1101,13 @@ impl Graph {
                 if !is_nop[inp] {
                     in_degree[i] += 1;
                     dependents[inp].push(i);
+                }
+            }
+            if let Some(fwd) = Self::attn_fwd_node(&node.op) {
+                let fwd = fwd as usize;
+                if !is_nop[fwd] {
+                    in_degree[i] += 1;
+                    dependents[fwd].push(i);
                 }
             }
         }

@@ -89,6 +89,17 @@ fn collect_checkpoint_instances(forward: &Graph) -> HashMap<usize, CheckpointIns
     }
     let nodes = forward.nodes();
     let outputs: std::collections::HashSet<NodeId> = forward.outputs().iter().copied().collect();
+    // Build consumer adjacency once so boundary checks are O(nodes + edges)
+    // rather than O(instances * nodes).
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (idx, n) in nodes.iter().enumerate() {
+        for &inp in &n.inputs {
+            consumers[inp as usize].push(idx);
+        }
+        if let Some(fwd) = Graph::attn_fwd_node(&n.op) {
+            consumers[fwd as usize].push(idx);
+        }
+    }
     let mut instances = HashMap::new();
     for region in regions {
         for m in 0..region.count {
@@ -97,44 +108,30 @@ fn collect_checkpoint_instances(forward: &Graph) -> HashMap<usize, CheckpointIns
             if end > nodes.len() {
                 continue;
             }
-            // Skip stateful KV-cache updates.
-            if nodes[start..end]
-                .iter()
-                .any(|n| matches!(n.op, Op::CacheWrite | Op::CacheWritePrefix))
-            {
+            // Skip stateful KV-cache updates and read-modify-write ScatterAdd
+            // blocks (duplicating a pinned RMW accumulator increases memory).
+            if nodes[start..end].iter().any(|n| {
+                matches!(
+                    n.op,
+                    Op::CacheWrite | Op::CacheWritePrefix | Op::ScatterAdd { .. }
+                )
+            }) {
                 continue;
             }
             // Any node in [start..end) read outside [start..end) or exposed as
             // a graph output is already kept live as a checkpoint boundary.
-            let mut boundary_out = vec![false; region.period];
-            for (idx, n) in nodes.iter().enumerate() {
-                if (start..end).contains(&idx) {
-                    continue;
-                }
-                for &inp in &n.inputs {
-                    let u = inp as usize;
-                    if (start..end).contains(&u) {
-                        boundary_out[u - start] = true;
-                    }
-                }
-                if let Op::MultiHeadAttnGradQ { fwd_node, .. }
-                | Op::MultiHeadAttnGradK { fwd_node, .. }
-                | Op::MultiHeadAttnGradV { fwd_node, .. } = n.op
-                {
-                    let u = fwd_node as usize;
-                    if (start..end).contains(&u) {
-                        boundary_out[u - start] = true;
-                    }
-                }
-            }
             let mut remat_nodes = Vec::new();
             for offset in 0..region.period {
-                let id = (start + offset) as NodeId;
-                if boundary_out[offset] || outputs.contains(&id) {
+                let idx = start + offset;
+                let id = idx as NodeId;
+                let escapes = consumers[idx]
+                    .iter()
+                    .any(|&reader| !(start..end).contains(&reader));
+                if escapes || outputs.contains(&id) {
                     continue;
                 }
                 if matches!(
-                    nodes[start + offset].op,
+                    nodes[idx].op,
                     Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. }
                 ) {
                     continue;
@@ -149,21 +146,21 @@ fn collect_checkpoint_instances(forward: &Graph) -> HashMap<usize, CheckpointIns
     instances
 }
 
-/// Clone `instance`'s internal forward nodes into `graph` right before its
-/// backward pass, anchoring every external input on `tokens` via [`Op::Depend`]
-/// so neither e-graph CSE nor ASAP scheduling pulls the recomputation back
-/// into the forward pass.
-fn rematerialize_instance(
+/// Clone the needed subset of an instance's internal forward nodes into `graph`,
+/// anchoring every external input on `tokens` via [`Op::Depend`] so neither
+/// e-graph CSE nor ASAP scheduling pulls the recomputation back into the
+/// forward pass.
+fn rematerialize_nodes(
     graph: &mut Graph,
     forward: &Graph,
-    instance: &CheckpointInstance,
+    needed_nodes: &[NodeId],
     tokens: &[NodeId],
 ) -> HashMap<NodeId, NodeId> {
     let prev_deriv = graph.set_derivative_region(false);
-    let mut remat_map = HashMap::with_capacity(instance.remat_nodes.len());
+    let mut remat_map = HashMap::with_capacity(needed_nodes.len());
     let mut gated_external: HashMap<NodeId, NodeId> = HashMap::new();
 
-    for &orig_id in &instance.remat_nodes {
+    for &orig_id in needed_nodes {
         let orig = forward.node(orig_id);
         let mut new_inputs = Vec::with_capacity(orig.inputs.len());
         let mut anchored = false;
@@ -210,18 +207,80 @@ fn rematerialize_instance(
     remat_map
 }
 
-/// Rewrite newly appended backward nodes to consume rematerialized forward
-/// activations (including `MultiHeadAttnGrad*`'s `fwd_node`) instead of the
-/// original forward nodes.
+/// Active checkpointed instance scope while differentiating `[start..end)`.
+struct ActiveRemat<'a> {
+    start: usize,
+    remat_nodes: &'a [NodeId],
+    tokens: Vec<NodeId>,
+    grad_start: usize,
+}
+
+/// Rematerialize only the internal forward nodes actually referenced by the
+/// instance's backward nodes (`graph.nodes()[grad_start..]`), plus their
+/// internal ancestors, then rewrite those backward nodes to use the clones.
+fn finalize_active_remat(
+    graph: &mut Graph,
+    forward: &Graph,
+    widened: &mut HashMap<NodeId, NodeId>,
+    scope: ActiveRemat<'_>,
+) -> bool {
+    let grad_end = graph.nodes().len();
+    if grad_end <= scope.grad_start {
+        return false;
+    }
+    let remat_set: std::collections::HashSet<NodeId> = scope.remat_nodes.iter().copied().collect();
+    let mut needed: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    let mut stack: Vec<NodeId> = Vec::new();
+    for node in &graph.nodes()[scope.grad_start..grad_end] {
+        for &inp in &node.inputs {
+            if remat_set.contains(&inp) && needed.insert(inp) {
+                stack.push(inp);
+            }
+        }
+        if let Some(fwd) = Graph::attn_fwd_node(&node.op)
+            && remat_set.contains(&fwd)
+            && needed.insert(fwd)
+        {
+            stack.push(fwd);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        for &inp in &forward.node(id).inputs {
+            if remat_set.contains(&inp) && needed.insert(inp) {
+                stack.push(inp);
+            }
+        }
+    }
+    if needed.is_empty() {
+        return false;
+    }
+    let ordered: Vec<NodeId> = scope
+        .remat_nodes
+        .iter()
+        .copied()
+        .filter(|id| needed.contains(id))
+        .collect();
+    let remat_map = rematerialize_nodes(graph, forward, &ordered, &scope.tokens);
+    for &orig_id in remat_map.keys() {
+        widened.remove(&orig_id);
+    }
+    rewrite_backward_to_remat(graph, scope.grad_start, grad_end, &remat_map);
+    true
+}
+
+/// Rewrite backward nodes in `gradient_start..gradient_end` to consume
+/// rematerialized forward activations (including `MultiHeadAttnGrad*`'s
+/// `fwd_node`) instead of the original forward nodes.
 fn rewrite_backward_to_remat(
     graph: &mut Graph,
     gradient_start: usize,
+    gradient_end: usize,
     remat_map: &HashMap<NodeId, NodeId>,
 ) {
     if remat_map.is_empty() {
         return;
     }
-    for node in &mut graph.nodes_mut()[gradient_start..] {
+    for node in &mut graph.nodes_mut()[gradient_start..gradient_end] {
         for inp in &mut node.inputs {
             if let Some(&mapped) = remat_map.get(inp) {
                 *inp = mapped;
@@ -291,8 +350,10 @@ fn differentiate_impl(forward: &Graph, options: AutodiffOptions) -> Graph {
     grads.insert(loss_node, one);
 
     // Active rematerialization scope when differentiating a checkpointed
-    // repeated block: `(instance_start, orig_id -> remat_id)`.
-    let mut active_remat: Option<(usize, HashMap<NodeId, NodeId>)> = None;
+    // repeated block. Rematerialization is finalized when leaving the block so
+    // only internal nodes actually read by the block's backward are cloned.
+    let mut active_remat: Option<ActiveRemat<'_>> = None;
+    let mut rematerialized_any = false;
 
     // Backward pass: iterate nodes in reverse topological order
     let num_forward = forward.nodes().len();
@@ -310,11 +371,12 @@ fn differentiate_impl(forward: &Graph, options: AutodiffOptions) -> Graph {
                 {
                     tokens.push(loss_node);
                 }
-                let remat_map = rematerialize_instance(&mut graph, forward, instance, &tokens);
-                for &orig_id in remat_map.keys() {
-                    widened.remove(&orig_id);
-                }
-                active_remat = Some((instance.start, remat_map));
+                active_remat = Some(ActiveRemat {
+                    start: instance.start,
+                    remat_nodes: &instance.remat_nodes,
+                    tokens,
+                    grad_start: graph.nodes().len(),
+                });
             }
         }
 
@@ -322,8 +384,10 @@ fn differentiate_impl(forward: &Graph, options: AutodiffOptions) -> Graph {
         let grad_output = match grads.get(&node.id) {
             Some(&g) => g,
             None => {
-                if active_remat.as_ref().is_some_and(|&(start, _)| i == start) {
-                    active_remat = None;
+                if active_remat.as_ref().is_some_and(|scope| scope.start == i) {
+                    let scope = active_remat.take().unwrap();
+                    rematerialized_any |=
+                        finalize_active_remat(&mut graph, forward, &mut widened, scope);
                 }
                 continue; // no gradient flows to this node
             }
@@ -1528,11 +1592,9 @@ fn differentiate_impl(forward: &Graph, options: AutodiffOptions) -> Graph {
                 }
             }
         }
-        if let Some((start, ref remat_map)) = active_remat {
-            rewrite_backward_to_remat(&mut graph, gradient_start, remat_map);
-            if i == start {
-                active_remat = None;
-            }
+        if active_remat.as_ref().is_some_and(|scope| scope.start == i) {
+            let scope = active_remat.take().unwrap();
+            rematerialized_any |= finalize_active_remat(&mut graph, forward, &mut widened, scope);
         }
     }
 
@@ -1557,7 +1619,11 @@ fn differentiate_impl(forward: &Graph, options: AutodiffOptions) -> Graph {
     }
     graph.append_param_grad_outputs(&grad_outputs);
 
-    graph
+    if rematerialized_any {
+        graph.into_toposort()
+    } else {
+        graph
+    }
 }
 
 /// Helper to implement sum_rows: reduce `[M, N]` → `[N]` by summing rows.
@@ -2005,5 +2071,103 @@ mod tests {
         let mut plan = crate::compile::compile(&diff);
         crate::compile::schedule_dispatches(&mut plan, false, true);
         let _alias = crate::memplan::plan_buffer_aliasing(&plan, &plan.groups, None);
+    }
+
+    #[test]
+    fn checkpointed_attention_with_residual_only_output_optimizes_and_orders_correctly() {
+        // Blocks where `causal_attention` feeds ONLY a residual `add(h, attn)`
+        // (no output projection): nothing in backward reads the recomputed
+        // attention through `node.inputs` — only `MultiHeadAttnGrad*.fwd_node`
+        // points to it. Full `optimize` (including `sweep_dead_nodes` and
+        // `into_toposort`) and `compile::topological_order` must keep the
+        // rematerialized attention alive and schedule it strictly before its
+        // row-dot and GradQ/GradKV dispatches.
+        let mut g = Graph::new();
+        let mut h = g.input("x", &[16, 32]);
+        for l in 0..4 {
+            let wq = g.parameter(&format!("l{l}.wq"), &[32, 32]);
+            let wk = g.parameter(&format!("l{l}.wk"), &[32, 32]);
+            let wv = g.parameter(&format!("l{l}.wv"), &[32, 32]);
+            let q = g.matmul(h, wq);
+            let k = g.matmul(h, wk);
+            let v = g.matmul(h, wv);
+            let attn = g.causal_attention(q, k, v, 2, 2, 16);
+            h = g.add(h, attn);
+        }
+        let loss = g.mean_all(h);
+        g.set_outputs(vec![loss]);
+
+        let diff = differentiate_checkpointed(&g);
+        let opt = crate::optimize::optimize(&diff);
+        let mut plan = crate::compile::compile(&opt);
+        crate::compile::schedule_dispatches(&mut plan, false, false);
+
+        // Every AttentionGrad dispatch must run strictly after the producer of
+        // its LSE buffer (which is written by the rematerialized forward
+        // attention) — and no LSE buffer may be live-in/unwritten.
+        let group_of = |idx: usize| plan.groups.iter().position(|r| r.contains(&idx)).unwrap();
+        let mut grad_count = 0usize;
+        for (gi, d) in plan.dispatches.iter().enumerate() {
+            if matches!(d.shader, crate::compile::ShaderEntry::AttentionGrad(_)) {
+                grad_count += 1;
+                let lse_buf = d.input_buffers[4];
+                let row_dot_buf = d.input_buffers[5];
+                let fwd_idx = plan
+                    .dispatches
+                    .iter()
+                    .position(|p| p.extra_outputs.contains(&lse_buf))
+                    .expect("forward attention producing LSE must survive optimization");
+                let row_dot_idx = plan
+                    .dispatches
+                    .iter()
+                    .position(|p| p.output_buffer == row_dot_buf)
+                    .expect("row-dot dispatch must exist");
+                assert!(
+                    group_of(fwd_idx) < group_of(row_dot_idx),
+                    "remat attention (group {}) must run before row-dot (group {})",
+                    group_of(fwd_idx),
+                    group_of(row_dot_idx)
+                );
+                assert!(
+                    group_of(fwd_idx) < group_of(gi),
+                    "remat attention (group {}) must run before AttentionGrad (group {})",
+                    group_of(fwd_idx),
+                    group_of(gi)
+                );
+            }
+        }
+        assert!(
+            grad_count >= 8,
+            "expected GradQ + GradKV dispatches across 4 layers (got {grad_count})"
+        );
+    }
+
+    #[test]
+    fn checkpointing_prunes_unread_remat_nodes_without_optimize() {
+        // In an MLP block `up = matmul(h, w1); act = silu(up); down = matmul(act, w2);
+        // h = add(h, down)`, backward never reads `down` (only `act`, `up`, `h`),
+        // so `down` should not be cloned even before `optimize` runs.
+        let mut g = Graph::new();
+        let mut h = g.input("x", &[16, 32]);
+        for l in 0..4 {
+            let w1 = g.parameter(&format!("l{l}.w1"), &[32, 64]);
+            let w2 = g.parameter(&format!("l{l}.w2"), &[64, 32]);
+            let up = g.matmul(h, w1);
+            let act = g.silu(up);
+            let down = g.matmul(act, w2);
+            g.nodes_mut()[down as usize].name = Some(format!("l{l}.down"));
+            h = g.add(h, down);
+        }
+        let loss = g.mean_all(h);
+        g.set_outputs(vec![loss]);
+
+        let diff = differentiate_checkpointed(&g);
+        assert!(
+            !diff.nodes().iter().any(|n| n
+                .name
+                .as_deref()
+                .is_some_and(|s| s.ends_with(".down.remat"))),
+            "unread internal `down` matmul should not be rematerialized"
+        );
     }
 }

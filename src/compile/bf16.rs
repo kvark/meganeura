@@ -35,11 +35,13 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                     }
                     let input = producer.input_buffers[0];
                     let origin = producer.origin.clone();
+                    let producer_deps = producer.control_deps.clone();
                     let consumer = &mut plan.dispatches[ci];
                     consumer.input_buffers[slot] = input;
                     consumer.pointwise_storage.bf16_inputs |= 1 << slot;
                     consumer.fusion_barrier = true;
                     consumer.origin.extend(origin);
+                    super::merge_control_deps(&mut consumer.control_deps, &producer_deps);
                     changed = true;
                     if !protected.contains(&buffer) && reads[&buffer] == 1 {
                         remove = Some(pi);
@@ -51,7 +53,10 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                 break;
             }
             let consumer = &plan.dispatches[ci];
-            if !matches!(consumer.shader, ShaderEntry::ToBF16) {
+            if !matches!(consumer.shader, ShaderEntry::ToBF16)
+                || consumer.fusion_barrier
+                || !consumer.control_deps.is_empty()
+            {
                 continue;
             }
             let buffer = consumer.input_buffers[0];

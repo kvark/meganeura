@@ -943,6 +943,12 @@ fn segment_roots(g: &Graph, seg: &Segment) -> Vec<usize> {
                         roots.insert(input - shift);
                     }
                 }
+                if let Some(fwd) = Graph::attn_fwd_node(&node.op) {
+                    let fwd = fwd as usize;
+                    if inst.contains(&fwd) {
+                        roots.insert(fwd - shift);
+                    }
+                }
             }
         }
         for &out in g.outputs() {
@@ -1711,7 +1717,11 @@ pub(crate) fn sweep_dead_nodes(g: &mut Graph) {
             continue;
         }
         live[id] = true;
-        stack.extend(g.nodes()[id].inputs.iter().map(|&i| i as usize));
+        let node = &g.nodes()[id];
+        stack.extend(node.inputs.iter().map(|&i| i as usize));
+        if let Some(fwd) = Graph::attn_fwd_node(&node.op) {
+            stack.push(fwd as usize);
+        }
     }
     for id in 0..n {
         let node = &mut g.nodes_mut()[id];
