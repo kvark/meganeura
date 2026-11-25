@@ -112,6 +112,9 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
+            # `%E` is the executable's path with `!` for `/`.
+            sudo sysctl -q -w kernel.core_pattern="$RUNNER_TEMP/core.%E.%p"
+            ulimit -c unlimited
             cargo llvm-cov clean --workspace
             cargo llvm-cov --tests --all-features --no-report -- --test-threads=4
           else
@@ -122,6 +125,31 @@ jobs:
           # lavapipe and on CI Metal runners (grad_k divergence on M-series).
           MEGANEURA_SKIP_BACKPROP: ${{ matrix.skip_backprop }}
           MEGANEURA_SKIP_BIT_EXACT: "1"
+
+      # A test binary that dies on a signal takes its remaining tests with
+      # it and reports only the signal. The stacks of its threads name the
+      # tests that were in flight, and show whether the fault was in the
+      # engine, in Mesa or in a compiled shader.
+      - name: Backtrace of a crashed test binary
+        if: failure() && runner.os == 'Linux'
+        env:
+          DEBUGINFOD_URLS: https://debuginfod.ubuntu.com
+        run: |
+          shopt -s nullglob
+          cores=("$RUNNER_TEMP"/core.*)
+          [ ${#cores[@]} -gt 0 ] || exit 0
+          sudo apt-get install -y gdb > /dev/null
+          for core in "${cores[@]}"; do
+            executable=${core##*/core.}
+            executable=${executable%.*}
+            executable=${executable//!//}
+            echo "::group::$executable"
+            gdb -batch -iex "set debuginfod enabled on" -iex "set auto-load safe-path /" \
+              -ex "print \$_siginfo._sifields._sigfault.si_addr" \
+              -ex "x/6i \$pc" -ex "info threads" -ex "thread apply all backtrace 40" \
+              "$executable" "$core" 2>&1 | grep -v '^\[New LWP\|^Downloading'
+            echo "::endgroup::"
+          done
 
       - name: Rust host coverage
         if: runner.os == 'Linux'
