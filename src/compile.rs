@@ -1102,9 +1102,11 @@ fn schedule_sequence(
     serial: bool,
     fuse_horizontal: bool,
 ) -> Vec<std::ops::Range<usize>> {
-    reorder_memory_aware(dispatches, buffer_sizes, pinned, fuse_horizontal);
+    let levels = reorder_memory_aware(dispatches, buffer_sizes, pinned, fuse_horizontal);
     let mut groups = if serial {
         (0..dispatches.len()).map(|i| i..i + 1).collect()
+    } else if let Some(levels) = levels {
+        compute_groups_at_levels(dispatches, &levels)
     } else {
         compute_groups(dispatches)
     };
@@ -1172,15 +1174,18 @@ fn dependency_dag(dispatches: &[Dispatch]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>)
 /// keeps horizontally-fusable same-A matmul siblings on the same level, while
 /// using each dispatch's `[ASAP, ALAP]` slack to minimize peak live
 /// intermediate bytes (and total byte-groups as a tie-breaker).
+/// Returns the per-dispatch chosen level when reordering ran, or `None` on
+/// zero-freedom fast paths (in which case `compute_groups` builds groups
+/// directly).
 fn reorder_memory_aware(
     dispatches: &mut Vec<Dispatch>,
     buffer_sizes: &[usize],
     pinned: &[bool],
     fuse_horizontal: bool,
-) {
+) -> Option<Vec<u32>> {
     let n = dispatches.len();
     if n <= 1 {
-        return;
+        return None;
     }
     let (preds, succs) = dependency_dag(dispatches);
     let mut asap = vec![0u32; n];
@@ -1192,7 +1197,7 @@ fn reorder_memory_aware(
     // where every edge increases the index so the input is already the unique
     // topological order with zero slack and no same-level siblings).
     if max_level == 0 || max_level as usize + 1 == n {
-        return;
+        return None;
     }
 
     // Group horizontally-fusable siblings at the same ASAP level so memory
@@ -1346,27 +1351,22 @@ fn reorder_memory_aware(
         }
     };
 
-    // Place cliques that depend on level `L - 1` first within each level `L`
-    // so `compute_groups` opens a new barrier group at the start of every level
-    // rather than pulling a slack-delayed dispatch back into level `L - 1`, and
-    // include `clique_of[i]` so horizontally-fusable siblings always stay
-    // contiguous.
-    let clique_has_prev_pred: Vec<bool> = (0..num_cliques)
-        .map(|c| {
-            let lvl = chosen_clique_levels[c];
-            lvl > 0
-                && c_preds[c]
-                    .iter()
-                    .any(|&p| chosen_clique_levels[p] + 1 == lvl)
-        })
-        .collect();
+    // Sort by chosen level, keeping each horizontal-fusion clique contiguous.
+    // `compute_groups_at_levels` then cuts barrier groups exactly at level
+    // boundaries so cliques are never split across groups and slack-delayed
+    // dispatches stay at their chosen memory-optimal level.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| {
         let c = clique_of[i];
-        (chosen_clique_levels[c], !clique_has_prev_pred[c], c)
+        (chosen_clique_levels[c], c)
     });
+    let reordered_levels: Vec<u32> = order
+        .iter()
+        .map(|&i| chosen_clique_levels[clique_of[i]])
+        .collect();
     let old = std::mem::take(dispatches);
     *dispatches = order.iter().map(|&i| old[i].clone()).collect();
+    Some(reordered_levels)
 }
 
 /// Coordinate descent on clique levels to minimize `(peak_live_bytes, total_byte_groups)`.
@@ -1538,6 +1538,44 @@ fn optimize_clique_levels(
     }
     let peak = live.iter().copied().max().unwrap_or(0);
     (level, peak, total_area)
+}
+
+/// Partition dispatches along chosen level boundaries (also breaking on any
+/// intra-level hazard as a defensive guard) so horizontal-fusion cliques stay
+/// atomic and slack-delayed dispatches remain at their chosen level.
+fn compute_groups_at_levels(
+    dispatches: &[Dispatch],
+    levels: &[u32],
+) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut dirty_writes = HashSet::<u32>::new();
+    let mut dirty_reads = HashSet::<u32>::new();
+    let mut start = 0;
+    for (i, dispatch) in dispatches.iter().enumerate() {
+        let reads = dispatch.read_buffers();
+        let writes: Vec<BufferRef> = dispatch.write_buffers().collect();
+        let level_change = i > start && levels[i] != levels[start];
+        let hazard = reads.iter().any(|b| dirty_writes.contains(&b.0))
+            || writes
+                .iter()
+                .any(|b| dirty_writes.contains(&b.0) || dirty_reads.contains(&b.0));
+        if level_change || hazard {
+            groups.push(start..i);
+            start = i;
+            dirty_writes.clear();
+            dirty_reads.clear();
+        }
+        for b in reads {
+            dirty_reads.insert(b.0);
+        }
+        for b in writes {
+            dirty_writes.insert(b.0);
+        }
+    }
+    if !dispatches.is_empty() {
+        groups.push(start..dispatches.len());
+    }
+    groups
 }
 
 /// Start a new compute pass when a dispatch has a RAW, WAR, or WAW hazard with
@@ -6346,5 +6384,70 @@ mod tests {
         assert!(pinned[1], "live-in buffer read before write must be pinned");
         assert!(!pinned[2], "normal intermediate should stay unpinned");
         assert!(pinned[3], "ScatterAdd RMW output must be pinned");
+    }
+
+    #[test]
+    fn memory_aware_schedule_keeps_clique_atomic_across_mixed_predecessor_levels() {
+        // Reproduces backward `dW = X^T * dY` siblings sharing matrix A (buf 0):
+        // sibling B reads `y` produced at level 0, while sibling A reads `x`
+        // whose producer is delayed to level 1 by memory pressure. Both
+        // siblings sit in the same clique at level 2 and must stay in one
+        // barrier group so `fuse_horizontal_matmuls` packs them (hb == 2).
+        let matmul = |a: u32, b: u32, c: u32| Dispatch {
+            shader: ShaderEntry::MatMul,
+            workgroups: [2, 2, 1],
+            input_buffers: vec![BufferRef(a), BufferRef(b)],
+            output_buffer: BufferRef(c),
+            params: vec![128, 128, 128, 0],
+            ..Default::default()
+        };
+        let op = |inputs: &[u32], out: u32| Dispatch {
+            input_buffers: inputs.iter().map(|&b| BufferRef(b)).collect(),
+            output_buffer: BufferRef(out),
+            ..Default::default()
+        };
+        // Buffers:
+        // 0: input in0 (pinned)
+        // 1: y (small, level 0)
+        // 2: x (4 MiB, delayed to level 1)
+        // 3: k0 -> 4: k1 -> 5: k2 -> 6: out (critical path of 4 levels: 0,1,2,3)
+        // 7: B_out (pinned output)
+        // 8: A_out (pinned output)
+        let mut plan = ExecutionPlan {
+            buffers: vec![
+                65_536,  // 0: in0
+                4_096,   // 1: y
+                4 << 20, // 2: x (large, wants to delay from level 0 to level 1)
+                65_536,  // 3: k0
+                65_536,  // 4: k1
+                65_536,  // 5: k2
+                65_536,  // 6: out
+                65_536,  // 7: B_out
+                65_536,  // 8: A_out
+            ],
+            input_buffers: vec![("in0".into(), BufferRef(0))],
+            output_buffers: vec![BufferRef(6), BufferRef(7), BufferRef(8)],
+            dispatches: vec![
+                op(&[0], 1),     // Y: asap 0
+                op(&[0], 2),     // X: asap 0 (slack allows level 1)
+                op(&[0], 3),     // K0: level 0
+                op(&[3], 4),     // K1: level 1
+                matmul(0, 1, 7), // B (first in clique, pred Y at level 0)
+                matmul(0, 2, 8), // A (second in clique, pred X at level 1)
+                op(&[4], 5),     // K2: level 2
+                op(&[5], 6),     // K3: level 3
+            ],
+            ..compile(&Graph::new())
+        };
+        schedule_dispatches(&mut plan, false, true);
+        assert!(
+            plan.dispatches.iter().any(|d| d.horizontal_batch == 2),
+            "same-A matmul clique must remain atomic in one barrier group and fuse (dispatches: {:?}, groups: {:?})",
+            plan.dispatches
+                .iter()
+                .map(|d| (d.shader.clone(), d.horizontal_batch, d.output_buffer))
+                .collect::<Vec<_>>(),
+            plan.groups
+        );
     }
 }

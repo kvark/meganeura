@@ -361,8 +361,9 @@ pub fn plan_buffer_aliasing(
     //
     // Sorting intermediates by size descending places the largest tensors at
     // offset 0 first, then packs concurrent smaller tensors into aligned gaps
-    // left behind by dead larger tensors within ARENA_CHUNK_BYTES (128 MiB)
-    // slabs. Every tenant offset is a multiple of ARENA_ALIGNMENT (256 B) and
+    // left behind by dead larger tensors (up to ARENA_CHUNK_BYTES for normal
+    // slabs, or up to the slab's existing size inside idle oversized slabs).
+    // Every tenant offset is a multiple of ARENA_ALIGNMENT (256 B) and
     // conflicting live intervals occupy strictly disjoint byte ranges.
     let mut offsets = vec![0usize; n];
     let mut order: Vec<usize> = (0..n).filter(|&i| !pinned[i] && !dead[i]).collect();
