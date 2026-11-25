@@ -702,20 +702,25 @@ pub fn load_nnef(path: &Path) -> Result<NnefModel, NnefError> {
                 let rank = x_shape.len();
                 // Output axis `d` is input axis `axes[d]`, and the axes past
                 // the list stay in place. Without a list the order reverses.
-                let perm: Vec<usize> = match stmt.named.get("axes").and_then(|v| v.as_int_array()) {
-                    Some(axes) => axes
-                        .iter()
-                        .map(|&axis| axis as usize)
-                        .chain(axes.len()..rank)
-                        .collect(),
+                let unsupported = |axes: &dyn std::fmt::Debug| {
+                    NnefError::UnsupportedOp(format!(
+                        "transpose of {x_shape:?} by {axes:?} (supported: a permutation of at most 4 axes)"
+                    ))
+                };
+                let perm: Vec<usize> = match stmt.named.get("axes") {
+                    Some(value) => {
+                        let axes = value.as_int_array().ok_or_else(|| unsupported(value))?;
+                        axes.iter()
+                            .map(|&axis| usize::try_from(axis).map_err(|_| unsupported(&axes)))
+                            .chain((axes.len()..rank).map(Ok))
+                            .collect::<Result<_, _>>()?
+                    }
                     None => (0..rank).rev().collect(),
                 };
                 let mut sorted = perm.clone();
                 sorted.sort_unstable();
                 if sorted != (0..rank).collect::<Vec<_>>() || rank > 4 {
-                    return Err(NnefError::UnsupportedOp(format!(
-                        "transpose of {x_shape:?} by {perm:?} (supported: a permutation of at most 4 axes)"
-                    )));
+                    return Err(unsupported(&perm));
                 }
                 let in_place = |axes: &[usize]| axes.iter().enumerate().all(|(d, &axis)| d == axis);
                 let out = if in_place(&perm) {
@@ -953,7 +958,8 @@ graph G( x ) -> ( out )
             );
             let digits = |text: &str| text.replace(|c: char| !c.is_ascii_digit(), "");
             let tmp = std::env::temp_dir().join(format!(
-                "nnef_test_transpose_{}_{}",
+                "nnef_test_transpose_{}_{}_{}",
+                std::process::id(),
                 digits(shape),
                 digits(axes)
             ));
@@ -991,6 +997,8 @@ graph G( x ) -> ( out )
         );
         for (shape, axes) in [
             ("[2, 3, 2]", "[0, 0, 1]"),
+            ("[2, 3, 2]", "[0, -1, 1]"),
+            ("[2, 3, 2]", "1"),
             ("[1, 2, 1, 2, 1]", "[4, 3, 2, 1, 0]"),
         ] {
             assert!(matches!(

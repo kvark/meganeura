@@ -10,6 +10,7 @@
   compile and names `Graph::materialize`: the replaced cache as a graph
   output, a node that reads it and also depends on the result, or a second
   write to it.
+
 - Three entry points now do what they say. `Eager::eval` keys its cached
   session on the graph's contents; it used to key on the node count, so a
   second graph of the same size got the first one's answers. The NNEF
