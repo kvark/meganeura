@@ -1,5 +1,7 @@
 # Unreleased
 
+- Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
+
 - `KernelMemo` revision moves to 19: decisions are now keyed by `(class, initial)`
   with an order-independent set of decided challengers (retaining separate entries
   when distinct challenger subsets disallow a prior winner) rather than by the

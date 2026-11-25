@@ -602,6 +602,7 @@ pub fn generate_flash_grad_f16_module(
         &[
             ("$M", &native_rows.to_string()),
             ("$SCALE", include_str!("../shaders/attention_scale.wgsl")),
+            ("$SCALE_GROUPS", "32"),
         ],
     );
     generate_coop_attention(&source, head_dim, "flash_grad_scaled_f16", 128)
@@ -868,6 +869,139 @@ pub fn generate_flash_grad_module(
     }
 }
 
+pub(crate) fn block_attention(
+    entry: &crate::compile::ShaderEntry,
+    p: crate::compile::AttentionParams,
+) -> ShaderModule {
+    use crate::{compile::ShaderEntry, kernels::attention_grad::Part};
+    let hd = p.head_dim;
+    let cols = format!("{}u", hd / 4);
+    match *entry {
+        ShaderEntry::FlashAttentionCoop | ShaderEntry::FlashAttentionProducts => {
+            let products = *entry == ShaderEntry::FlashAttentionProducts;
+            let source = include_str!("../shaders/flash_attention_block.wgsl");
+            // Cooperative matrix values must be named individually in WGSL.
+            let fragments = |name| unroll_elements(template_section(source, name), hd / 16, 4);
+            let scalar = |fragment| if products { "" } else { fragment };
+            attention_module(
+                preprocess(
+                    template_section(source, "main"),
+                    &[
+                        ("$COLS", &cols),
+                        (
+                            "$PV",
+                            template_section(
+                                source,
+                                if products { "matrix_pv" } else { "scalar_pv" },
+                            ),
+                        ),
+                        (
+                            "$VALUE_STORAGE",
+                            if products {
+                                ""
+                            } else {
+                                "var<workgroup> values: array<vec4<f32>, 32u * (HD4 + 1u)>;"
+                            },
+                        ),
+                        (
+                            "$STORE_VALUE",
+                            if products {
+                                "qk[(32u + r) * QK_STRIDE + col] = vec4<f16>(bias[source]);"
+                            } else {
+                                "values[r * (HD4 + 1u) + col] = bias[source];"
+                            },
+                        ),
+                        (
+                            "$SCALAR_OUTPUT",
+                            scalar("var output: array<vec4<f32>, HD4 / 2u>;"),
+                        ),
+                        (
+                            "$SCALAR_STORE",
+                            scalar(template_section(source, "scalar_store")),
+                        ),
+                        (
+                            "$PROB_STORAGE",
+                            if products {
+                                "var<workgroup> probs: array<vec4<f16>, 512>;\nvar<workgroup> flags: array<u32, 4>;"
+                            } else {
+                                ""
+                            },
+                        ),
+                        (
+                            "$FINISH_PV",
+                            &if products {
+                                fragments("finish_pv")
+                            } else {
+                                String::new()
+                            },
+                        ),
+                        (
+                            "$ACCUM_INIT",
+                            &if products {
+                                fragments("accum_init")
+                            } else {
+                                String::new()
+                            },
+                        ),
+                        ("$RESCALE_PV", &fragments("rescale_pv")),
+                        ("$ACCUM_PV", &fragments("accum_pv")),
+                        ("$SLACK", if products { "8.0" } else { "0.0" }),
+                        ("$LOAD_Q", &fragments("load_q")),
+                        ("$QK", &fragments("qk")),
+                        ("$HEADS", &format!("{}u", p.packed_heads >> 16)),
+                        ("$KV_HEADS", &format!("{}u", p.packed_heads & 65535)),
+                        ("$Q_SEQ", &format!("{}u", p.q_seq)),
+                        ("$KV_SEQ", &format!("{}u", p.kv_seq)),
+                        ("$CAUSAL_ROWS", &format!("{}u", p.causal_rows)),
+                        ("$WINDOW", &format!("{}u", p.window_size)),
+                    ],
+                ),
+                "flash_attention_block",
+            ).with_subgroup(32, [128, 1, 1])
+        }
+        ShaderEntry::AttentionGrad(k)
+            if matches!(k.path, crate::kernels::attention_grad::Path::Cooperative(_)) =>
+        {
+            super::attention_block_grad::coop_grad(k.part == Part::KV, p)
+                .with_subgroup(32, [128, 1, 1])
+        }
+        ShaderEntry::AttentionGrad(k) => {
+            let kv = k.part == Part::KV;
+            let kv_only = |fragment| if kv { fragment } else { "" };
+            attention_module(
+                preprocess(
+                    include_str!("../shaders/flash_grad_block.wgsl"),
+                    &[
+                        ("$PARAMS", ATTENTION_PARAMS_WGSL),
+                        ("$COLS", &cols),
+                        ("$KV", if kv { "true" } else { "false" }),
+                        ("$STATS_ROWS", if kv { "COLS" } else { "ROWS" }),
+                        (
+                            "$SECOND_OUTPUT",
+                            kv_only("var<storage, read_write> dst2: array<vec4<f32>>;"),
+                        ),
+                        (
+                            "$PROB_STORAGE",
+                            kv_only("var<workgroup> p_tile: array<vec4<f32>, THREADS>;"),
+                        ),
+                        (
+                            "$STORE_PROB",
+                            kv_only("p_tile[col * (ROWS / 4u) + row4] = prob;"),
+                        ),
+                        (
+                            "$ACCUM_V",
+                            kv_only("grad_v[j] = fma(vec4<f32>(p_tile[at][j]), b, grad_v[j]);"),
+                        ),
+                        ("$STORE_V", kv_only("dst2[out] = grad_v[j];")),
+                    ],
+                ),
+                "flash_grad_block",
+            )
+        }
+        _ => unreachable!("block attention requires an admitted entry"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -875,6 +1009,56 @@ pub fn generate_flash_grad_module(
 #[cfg(test)]
 mod product_tests {
     use super::*;
+
+    #[test]
+    fn register_block_attention_shaders_validate() {
+        use crate::{
+            compile::ShaderEntry,
+            kernels::attention_grad::{AttentionGrad, Operands, Part, Path},
+        };
+        for entry in [
+            ShaderEntry::FlashAttentionCoop,
+            ShaderEntry::FlashAttentionProducts,
+            ShaderEntry::AttentionGrad(AttentionGrad::new(Part::Q, Path::Flash)),
+            ShaderEntry::AttentionGrad(AttentionGrad::new(Part::KV, Path::Flash)),
+            ShaderEntry::AttentionGrad(AttentionGrad::new(
+                Part::Q,
+                Path::Cooperative(Operands::F16),
+            )),
+            ShaderEntry::AttentionGrad(AttentionGrad::new(
+                Part::KV,
+                Path::Cooperative(Operands::F16),
+            )),
+        ] {
+            for hd in [16, 32, 64, 128] {
+                let mut shader = block_attention(
+                    &entry,
+                    crate::compile::AttentionParams {
+                        q_seq: 133,
+                        kv_seq: 137,
+                        packed_heads: (2 << 16) | 1,
+                        head_dim: hd,
+                        window_size: 0,
+                        causal_rows: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                    },
+                );
+                let scalar =
+                    matches!(entry, ShaderEntry::AttentionGrad(k) if k.path == Path::Flash);
+                assert_eq!(
+                    shader.subgroup.map(|s| (s.size, s.workgroup_size)),
+                    (!scalar).then_some((32, [128, 1, 1]))
+                );
+                crate::codegen::validate_shader_for_test(
+                    &mut shader.module,
+                    naga::valid::Capabilities::all(),
+                    (1, 3),
+                )
+                .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn products_validate_with_rectangular_tiles_and_padded_heads() {

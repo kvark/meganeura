@@ -22,7 +22,7 @@ pub(crate) trait DispatchParams: bytemuck::Pod {
 // silently leave it out of the Rust/WGSL layout test.
 macro_rules! params {
     ($name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
+        #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, bytemuck::Zeroable, bytemuck::Pod)]
         #[repr(C)]
         pub(crate) struct $name {
             $(pub $field: $ty,)*

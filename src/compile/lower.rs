@@ -160,7 +160,7 @@ pub(crate) fn apply_attention_precision(plan: &mut ExecutionPlan, coop: CoopPoli
             }
             _ => false,
         };
-        if !flash || dispatch.requires_full_precision {
+        if !flash || dispatch.requires_full_precision || dispatch.kernel == Kernel::BlockAttention {
             dispatch.attention_f16_tiles = false;
             continue;
         }
@@ -570,6 +570,16 @@ mod tests {
             assert_eq!(tiles(&plan, true), want);
             assert_eq!(tiles(&plan, false), want);
         }
+
+        let mut blocked = requested.clone();
+        for d in &mut blocked.dispatches {
+            if matches!(d.shader, ShaderEntry::AttentionGrad(_)) {
+                d.kernel = Kernel::BlockAttention;
+            }
+        }
+        apply_attention_precision(&mut blocked, CoopPolicy::AllowF16);
+        assert!(!tiles(&blocked, false));
+        assert!(tiles(&blocked, true));
 
         let mut pinned = training_plan(true, true);
         apply_attention_precision(&mut pinned, CoopPolicy::AllowF16);
