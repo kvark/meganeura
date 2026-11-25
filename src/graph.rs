@@ -3239,6 +3239,12 @@ impl Graph {
 
     /// Write `new_kv` [1, dim] into row `kv_pos` of `cache` [max_seq, dim].
     /// Returns a node representing the updated cache buffer.
+    ///
+    /// The write replaces `cache` in place. Other nodes may still read
+    /// `cache`, and run before the write. What cannot be ordered is refused
+    /// when the graph compiles: `cache` as a graph output, a node that reads
+    /// it and also depends on the result, and a second write to it. Read the
+    /// old value through [`Self::materialize`] in those cases.
     #[track_caller]
     pub fn cache_write(&mut self, new_kv: NodeId, cache: NodeId, kv_pos: NodeId) -> NodeId {
         let nk_shape = &self.node(new_kv).ty.shape;
@@ -3252,7 +3258,8 @@ impl Graph {
     }
 
     /// Write the first `valid_len` rows of a fixed-size block into a cache,
-    /// starting at the dynamic `kv_pos` offset.
+    /// starting at the dynamic `kv_pos` offset. The write is in place, with
+    /// the limits [`Self::cache_write`] describes.
     #[track_caller]
     pub fn cache_write_prefix(
         &mut self,

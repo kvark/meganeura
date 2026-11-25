@@ -92,10 +92,8 @@ fn smollm2() {
         [vec![logits], k, v].concat()
     });
     assert_parity("smollm2 prefill", &prefill, INFERENCE);
-    let decode = graph_with(|g| {
-        let (logits, k, v) = smollm2::build_decode_graph(g, &config, 16);
-        [vec![logits], k, v].concat()
-    });
+    // The step overwrites the cache parameters, so they are not outputs.
+    let decode = graph_with(|g| vec![smollm2::build_decode_graph(g, &config, 16).0]);
     assert_parity("smollm2 decode", &decode, INFERENCE);
     // 64-wide heads over eight layers: the shapes the GPU-side check of
     // this decomposition used to run.
@@ -258,10 +256,7 @@ fn recomposition_keeps_models_as_written() {
         ),
         (
             "smollm2 decode",
-            graph_with(|g| {
-                let (logits, k, v) = smollm2::build_decode_graph(g, &config, 16);
-                [vec![logits], k, v].concat()
-            }),
+            graph_with(|g| vec![smollm2::build_decode_graph(g, &config, 16).0]),
         ),
         ("smolvla", smolvla::build_action_expert_training(&vla, 4, 6)),
         (

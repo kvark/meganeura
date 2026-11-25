@@ -412,6 +412,69 @@ impl<'a> Compiler<'a> {
         self.node_buffers[&node]
     }
 
+    /// Pairs `(reader, write)`: `write` is a cache write, and `reader` is
+    /// another node that takes the value it replaces.
+    ///
+    /// A cache write shares its cache's buffer, so every other reader of
+    /// that cache has to be emitted first. Scheduling and fusion then keep
+    /// a read ahead of any later write of the same buffer. Two uses that no
+    /// order satisfies are refused here, a second write to the cache and
+    /// the replaced value as a graph output. The sort refuses the third, a
+    /// reader that also depends on the write.
+    fn cache_write_order(&self) -> Vec<(NodeId, NodeId)> {
+        // The node whose value `id` holds: itself, or the source that a
+        // zero-cost alias forwards.
+        let value = |mut id: NodeId| {
+            loop {
+                let node = self.graph.node(id);
+                let forwarded = match node.op {
+                    Op::Identity | Op::StopGradient => node.inputs.first().copied(),
+                    _ => None,
+                };
+                match forwarded {
+                    Some(input) if self.get_buffer(input) == self.get_buffer(id) => id = input,
+                    _ => return id,
+                }
+            }
+        };
+        // Replaced value → the write that replaces it.
+        let mut writes = HashMap::new();
+        for node in self.graph.nodes() {
+            if matches!(node.op, Op::CacheWrite | Op::CacheWritePrefix) {
+                let replaced = value(node.inputs[1]);
+                if let Some(other) = writes.insert(replaced, node.id) {
+                    panic!(
+                        "cache writes %{other} and %{} both replace the value of %{replaced}; \
+                         a cache has one successor, so chain the second write onto the first",
+                        node.id,
+                    );
+                }
+            }
+        }
+        for (index, &output) in self.graph.outputs().iter().enumerate() {
+            if let Some(write) = writes.get(&value(output)) {
+                panic!(
+                    "output {index} returns the value of %{output}, which cache write %{write} \
+                     replaces in place; return `Graph::materialize` of it",
+                );
+            }
+        }
+        let mut order = Vec::new();
+        for node in self.graph.nodes() {
+            // An alias forwards the value. Its own readers are the ones that count.
+            if value(node.id) != node.id {
+                continue;
+            }
+            for &input in &node.inputs {
+                match writes.get(&value(input)) {
+                    Some(&write) if write != node.id => order.push((node.id, write)),
+                    _ => {}
+                }
+            }
+        }
+        order
+    }
+
     pub(super) fn is_f32_unit_constant(&self, node: NodeId) -> bool {
         let node = self.graph.node(node);
         node.ty.dtype == DType::F32
@@ -737,7 +800,7 @@ impl<'a> Compiler<'a> {
         // by existing nodes at lower IDs (e.g. SwiGLU concat fusion creates
         // a new MatMul at the end, referenced by the original SwiGLU node).
         // Processing in ID order would dispatch consumers before producers.
-        let topo = topological_order(self.graph);
+        let topo = topological_order(self.graph, &self.cache_write_order());
         for &node_id in &topo {
             let first_new = self.plan.dispatches.len();
             self.compile_node(&self.graph.nodes()[node_id as usize]);
