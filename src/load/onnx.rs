@@ -7,10 +7,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use oxionnx_core::{Graph as OnnxGraph, Node as OnnxNode, OpKind};
-use oxionnx_proto::model;
-
 use crate::graph::{Graph, NodeId, Op};
+
+mod proto;
 
 /// Result of loading an ONNX model.
 pub struct OnnxModel {
@@ -53,395 +52,21 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
 /// Load an ONNX model from raw bytes.
 /// If `path` is provided, external data files are resolved relative to its parent directory.
 pub fn load_onnx_bytes(bytes: &[u8], path: Option<&Path>) -> Result<OnnxModel, OnnxError> {
-    // oxionnx-proto can panic on overflowing lengths; contain dependency panics.
-    let (onnx_graph, onnx_weights) = std::panic::catch_unwind(|| {
-        if let Some(p) = path.and_then(|p| p.parent()) {
-            model::load_with_path(bytes, p)
-        } else {
-            model::load(bytes)
-        }
-    })
-    .map_err(|_| OnnxError::ParseError("malformed model: protobuf reader panicked".into()))?
-    .map_err(OnnxError::ParseError)?;
-
-    // Convert oxionnx Tensor weights to Vec<f32>
-    let weights: HashMap<String, Vec<f32>> = onnx_weights
-        .into_iter()
-        .map(|(name, tensor)| (name, tensor.data))
+    let dir = path.map(|p| p.parent().unwrap_or(Path::new("")));
+    let mut onnx = proto::parse_model(bytes, dir).map_err(OnnxError::ParseError)?;
+    let weights: HashMap<String, Vec<f32>> = onnx
+        .initializers
+        .iter_mut()
+        .map(|t| (t.name.clone(), std::mem::take(&mut t.data)))
         .collect();
-
-    // Extract shapes from the raw protobuf (initializer dims + input ValueInfoProto shapes)
-    let all_shapes = extract_shapes_from_proto(bytes)?;
-
-    let graph = translate_graph(&onnx_graph, &weights, &all_shapes)?;
-
+    let graph = translate_graph(&onnx, &weights)?;
     Ok(OnnxModel { graph, weights })
 }
 
-/// Extract tensor shapes from the ONNX protobuf: both initializer dims and
-/// input/output ValueInfoProto type shapes.
-///
-/// oxionnx-proto only extracts names from ValueInfoProto, not shapes.
-/// We parse the raw protobuf to recover them.
-fn extract_shapes_from_proto(bytes: &[u8]) -> Result<HashMap<String, Vec<usize>>, OnnxError> {
-    let proto_model = oxionnx_proto::parser::parse_model(bytes).map_err(OnnxError::ParseError)?;
-    let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
-
-    // 1. Initializer shapes (from TensorProto.dims)
-    for init in &proto_model.graph.initializers {
-        let shape: Vec<usize> = init.dims.iter().map(|&d| d as usize).collect();
-        shapes.insert(init.name.clone(), shape);
-    }
-
-    // 2. Input shapes from ValueInfoProto (re-parse the graph to get type info)
-    //    We need to parse the raw graph protobuf to extract shapes that oxionnx-proto discards.
-    let graph_bytes = extract_graph_bytes(bytes)?;
-    let input_shapes = parse_value_info_shapes(&graph_bytes, 11)?; // field 11 = input
-    let output_shapes = parse_value_info_shapes(&graph_bytes, 12)?; // field 12 = output
-    for (name, shape) in input_shapes.into_iter().chain(output_shapes) {
-        shapes.entry(name).or_insert(shape);
-    }
-
-    Ok(shapes)
-}
-
-/// Extract the raw bytes of the GraphProto (field 7) from a ModelProto.
-fn extract_graph_bytes(model_bytes: &[u8]) -> Result<Vec<u8>, OnnxError> {
-    let mut pos = 0;
-    while pos < model_bytes.len() {
-        let (tag, next_pos) = read_proto_varint(model_bytes, pos).map_err(OnnxError::ParseError)?;
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                // varint — skip
-                let (_, p) = read_proto_varint(model_bytes, pos).map_err(OnnxError::ParseError)?;
-                pos = p;
-            }
-            1 => pos += 8, // fixed64
-            5 => pos += 4, // fixed32
-            2 => {
-                let (len, p) =
-                    read_proto_varint(model_bytes, pos).map_err(OnnxError::ParseError)?;
-                let (field, end) = delimited(model_bytes, len, p).ok_or_else(truncated)?;
-                if field_no == 7 {
-                    return Ok(field.to_vec());
-                }
-                pos = end;
-            }
-            _ => {
-                return Err(OnnxError::ParseError(format!(
-                    "unknown wire type {wire_type}"
-                )));
-            }
-        }
-    }
-    Ok(Vec::new())
-}
-
-/// Parse ValueInfoProto entries at a given field number within a GraphProto,
-/// extracting (name, shape) pairs.
-fn parse_value_info_shapes(
-    graph_bytes: &[u8],
-    target_field: u32,
-) -> Result<Vec<(String, Vec<usize>)>, OnnxError> {
-    let mut results = Vec::new();
-    let mut pos = 0;
-
-    while pos < graph_bytes.len() {
-        let (tag, next_pos) = read_proto_varint(graph_bytes, pos).map_err(OnnxError::ParseError)?;
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                let (_, p) = read_proto_varint(graph_bytes, pos).map_err(OnnxError::ParseError)?;
-                pos = p;
-            }
-            1 => pos = pos.checked_add(8).ok_or_else(truncated)?,
-            5 => pos = pos.checked_add(4).ok_or_else(truncated)?,
-            2 => {
-                let (len, p) =
-                    read_proto_varint(graph_bytes, pos).map_err(OnnxError::ParseError)?;
-                let (field, end) = delimited(graph_bytes, len, p).ok_or_else(truncated)?;
-                if field_no == target_field {
-                    // This is a ValueInfoProto — parse name and shape from it
-                    if let Some((name, shape)) = parse_single_value_info(field) {
-                        results.push((name, shape));
-                    }
-                }
-                pos = end;
-            }
-            _ => {
-                return Err(OnnxError::ParseError(format!(
-                    "unknown wire type {wire_type}"
-                )));
-            }
-        }
-    }
-
-    Ok(results)
-}
-
-/// Parse a single ValueInfoProto message to extract (name, shape).
-/// ValueInfoProto: field 1 = name, field 2 = TypeProto
-/// TypeProto: field 1 = tensor_type (TypeProto.Tensor)
-/// TypeProto.Tensor: field 2 = shape (TensorShapeProto)
-/// TensorShapeProto: field 1 = dim (Dimension, repeated)
-/// Dimension: field 1 = dim_value (int64)
-fn parse_single_value_info(buf: &[u8]) -> Option<(String, Vec<usize>)> {
-    let mut name = String::new();
-    let mut type_bytes = None;
-    let mut pos = 0;
-
-    while pos < buf.len() {
-        let (tag, next_pos) = read_proto_varint(buf, pos).ok()?;
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                let (_, p) = read_proto_varint(buf, pos).ok()?;
-                pos = p;
-            }
-            1 => match pos.checked_add(8) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            5 => match pos.checked_add(4) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            2 => {
-                let (len, p) = read_proto_varint(buf, pos).ok()?;
-                let (field, end) = delimited(buf, len, p)?;
-                match field_no {
-                    1 => name = String::from_utf8_lossy(field).into_owned(),
-                    2 => type_bytes = Some(field),
-                    _ => {}
-                }
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-
-    let shape = type_bytes.and_then(parse_type_proto_shape)?;
-    Some((name, shape))
-}
-
-/// Extract shape dims from a TypeProto message.
-fn parse_type_proto_shape(buf: &[u8]) -> Option<Vec<usize>> {
-    // TypeProto: field 1 = tensor_type (TypeProto.Tensor)
-    let mut pos = 0;
-    while pos < buf.len() {
-        let (tag, next_pos) = read_proto_varint(buf, pos).ok()?;
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                let (_, p) = read_proto_varint(buf, pos).ok()?;
-                pos = p;
-            }
-            1 => match pos.checked_add(8) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            5 => match pos.checked_add(4) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            2 => {
-                let (len, p) = read_proto_varint(buf, pos).ok()?;
-                let (field, end) = delimited(buf, len, p)?;
-                if field_no == 1 {
-                    // tensor_type = TypeProto.Tensor
-                    return parse_tensor_type_shape(field);
-                }
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
-/// Extract shape dims from TypeProto.Tensor: field 2 = shape (TensorShapeProto).
-fn parse_tensor_type_shape(buf: &[u8]) -> Option<Vec<usize>> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        let (tag, next_pos) = read_proto_varint(buf, pos).ok()?;
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                let (_, p) = read_proto_varint(buf, pos).ok()?;
-                pos = p;
-            }
-            1 => match pos.checked_add(8) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            5 => match pos.checked_add(4) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            2 => {
-                let (len, p) = read_proto_varint(buf, pos).ok()?;
-                let (field, end) = delimited(buf, len, p)?;
-                if field_no == 2 {
-                    // shape = TensorShapeProto
-                    return Some(parse_tensor_shape_dims(field));
-                }
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
-/// Parse TensorShapeProto: field 1 = dim (repeated Dimension).
-/// Dimension: field 1 = dim_value (int64), field 2 = dim_param (string).
-fn parse_tensor_shape_dims(buf: &[u8]) -> Vec<usize> {
-    let mut dims = Vec::new();
-    let mut pos = 0;
-
-    while pos < buf.len() {
-        let Ok((tag, next_pos)) = read_proto_varint(buf, pos) else {
-            break;
-        };
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                let Ok((_, p)) = read_proto_varint(buf, pos) else {
-                    break;
-                };
-                pos = p;
-            }
-            1 => match pos.checked_add(8) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            5 => match pos.checked_add(4) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            2 => {
-                let Ok((len, p)) = read_proto_varint(buf, pos) else {
-                    break;
-                };
-                let Some((field, end)) = delimited(buf, len, p) else {
-                    break;
-                };
-                if field_no == 1 {
-                    // Dimension message
-                    dims.push(parse_dimension(field));
-                }
-                pos = end;
-            }
-            _ => break,
-        }
-    }
-
-    dims
-}
-
-/// Parse a Dimension message: field 1 = dim_value (int64).
-/// Dynamic dims (dim_param) are treated as 0 (unknown).
-fn parse_dimension(buf: &[u8]) -> usize {
-    let mut pos = 0;
-    while pos < buf.len() {
-        let Ok((tag, next_pos)) = read_proto_varint(buf, pos) else {
-            break;
-        };
-        let field_no = (tag >> 3) as u32;
-        let wire_type = (tag & 0x7) as u8;
-        pos = next_pos;
-
-        match wire_type {
-            0 => {
-                let Ok((val, p)) = read_proto_varint(buf, pos) else {
-                    break;
-                };
-                pos = p;
-                if field_no == 1 {
-                    return val as usize;
-                }
-            }
-            1 => match pos.checked_add(8) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            5 => match pos.checked_add(4) {
-                Some(next) => pos = next,
-                None => break,
-            },
-            2 => {
-                let Ok((len, p)) = read_proto_varint(buf, pos) else {
-                    break;
-                };
-                let Some((_, end)) = delimited(buf, len, p) else {
-                    break;
-                };
-                pos = end;
-            }
-            _ => break,
-        }
-    }
-    0 // dynamic/unknown dimension
-}
-
-/// Read a protobuf varint from a byte slice at the given position.
-fn read_proto_varint(buf: &[u8], mut pos: usize) -> Result<(u64, usize), String> {
-    let mut result = 0u64;
-    let mut shift = 0u32;
-    loop {
-        if pos >= buf.len() {
-            return Err("varint: unexpected EOF".into());
-        }
-        let byte = buf[pos];
-        pos += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err("varint: overflow".into());
-        }
-    }
-    Ok((result, pos))
-}
-
-/// A field claimed more bytes than the buffer holds.
-fn truncated() -> OnnxError {
-    OnnxError::ParseError("a field length runs past the end of the message".into())
-}
-
-/// Resolve a length-delimited payload and its end offset without wrapping.
-fn delimited(buf: &[u8], len: u64, start: usize) -> Option<(&[u8], usize)> {
-    let len = usize::try_from(len).ok()?;
-    let end = start.checked_add(len)?;
-    Some((buf.get(start..end)?, end))
-}
-
-/// Translate an oxionnx Graph into a Meganeura Graph.
+/// Translate a decoded ONNX graph into a Meganeura Graph.
 fn translate_graph(
-    onnx: &OnnxGraph,
+    onnx: &proto::Graph,
     weights: &HashMap<String, Vec<f32>>,
-    proto_shapes: &HashMap<String, Vec<usize>>,
 ) -> Result<Graph, OnnxError> {
     let mut graph = Graph::new();
     // Map ONNX tensor names -> Meganeura NodeId
@@ -450,33 +75,23 @@ fn translate_graph(
     let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
 
     // 1. Create parameter nodes for initializers (weights)
-    for (name, data) in weights {
-        let shape = proto_shapes
-            .get(name.as_str())
-            .cloned()
-            .unwrap_or_else(|| vec![data.len()]);
-        let id = graph.parameter(name, &shape);
-        name_to_id.insert(name.clone(), id);
-        shapes.insert(name.clone(), shape);
+    for init in &onnx.initializers {
+        let id = graph.parameter(&init.name, &init.shape);
+        name_to_id.insert(init.name.clone(), id);
+        shapes.insert(init.name.clone(), init.shape.clone());
     }
 
     // 2. Create input nodes for graph inputs that aren't initializers
-    for input_name in &onnx.input_names {
-        if !weights.contains_key(input_name) {
-            // Get shape from ValueInfoProto (parsed from raw protobuf)
-            let shape = proto_shapes
-                .get(input_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| {
-                    log::warn!("ONNX input '{}': shape unknown, using [1]", input_name);
-                    vec![1]
-                });
-            // Flatten to 2D for our IR: [batch, ..., features] -> [batch*..., features]
-            let flat_shape = flatten_to_2d(&shape);
-            let id = graph.input(input_name, &flat_shape);
-            name_to_id.insert(input_name.clone(), id);
-            shapes.insert(input_name.clone(), shape);
-        }
+    for input in &onnx.inputs {
+        let shape = input.shape.clone().unwrap_or_else(|| {
+            log::warn!("ONNX input '{}': shape unknown, using [1]", input.name);
+            vec![1]
+        });
+        // Flatten to 2D for our IR: [batch, ..., features] -> [batch*..., features]
+        let flat_shape = flatten_to_2d(&shape);
+        let id = graph.input(&input.name, &flat_shape);
+        name_to_id.insert(input.name.clone(), id);
+        shapes.insert(input.name.clone(), shape);
     }
 
     // 3. Topological sort for correct processing order
@@ -491,9 +106,9 @@ fn translate_graph(
 
     // 5. Set outputs
     let output_ids: Vec<NodeId> = onnx
-        .output_names
+        .outputs
         .iter()
-        .filter_map(|name| name_to_id.get(name).copied())
+        .filter_map(|output| name_to_id.get(&output.name).copied())
         .collect();
     graph.set_outputs(output_ids);
 
@@ -533,32 +148,31 @@ fn flatten_to_2d(shape: &[usize]) -> Vec<usize> {
 /// Translate a single ONNX node into Meganeura graph nodes.
 fn translate_node(
     graph: &mut Graph,
-    node: &OnnxNode,
+    node: &proto::Node,
     name_to_id: &mut HashMap<String, NodeId>,
     shapes: &mut HashMap<String, Vec<usize>>,
     weights: &HashMap<String, Vec<f32>>,
 ) -> Result<(), OnnxError> {
     let attrs = &node.attrs;
-    let op = &node.op;
 
-    match *op {
+    match node.op_type.as_str() {
         // --- Element-wise unary ---
-        OpKind::Relu => unary_op(graph, node, name_to_id, shapes, Op::Relu)?,
-        OpKind::Sigmoid => unary_op(graph, node, name_to_id, shapes, Op::Sigmoid)?,
-        OpKind::Neg => unary_op(graph, node, name_to_id, shapes, Op::Neg)?,
-        OpKind::Abs => unary_op(graph, node, name_to_id, shapes, Op::Abs)?,
-        OpKind::Log => unary_op(graph, node, name_to_id, shapes, Op::Log)?,
-        OpKind::Reciprocal => unary_op(graph, node, name_to_id, shapes, Op::Recip)?,
-        OpKind::Gelu => unary_op(graph, node, name_to_id, shapes, Op::Gelu)?,
-        OpKind::SiLU => unary_op(graph, node, name_to_id, shapes, Op::Silu)?,
+        "Relu" => unary_op(graph, node, name_to_id, shapes, Op::Relu)?,
+        "Sigmoid" => unary_op(graph, node, name_to_id, shapes, Op::Sigmoid)?,
+        "Neg" => unary_op(graph, node, name_to_id, shapes, Op::Neg)?,
+        "Abs" => unary_op(graph, node, name_to_id, shapes, Op::Abs)?,
+        "Log" => unary_op(graph, node, name_to_id, shapes, Op::Log)?,
+        "Reciprocal" => unary_op(graph, node, name_to_id, shapes, Op::Recip)?,
+        "Gelu" => unary_op(graph, node, name_to_id, shapes, Op::Gelu)?,
+        "Silu" | "SiLU" => unary_op(graph, node, name_to_id, shapes, Op::Silu)?,
 
         // Elementary math, as exporters write decomposed norms and
         // activations. These map onto primitives, and the optimizer folds
         // recognized decompositions back into fused kernels.
-        OpKind::Sqrt => unary_op(graph, node, name_to_id, shapes, Op::Sqrt)?,
-        OpKind::Exp => unary_op(graph, node, name_to_id, shapes, Op::Exp)?,
-        OpKind::Tanh => unary_op(graph, node, name_to_id, shapes, Op::Tanh)?,
-        OpKind::Pow => {
+        "Sqrt" => unary_op(graph, node, name_to_id, shapes, Op::Sqrt)?,
+        "Exp" => unary_op(graph, node, name_to_id, shapes, Op::Exp)?,
+        "Tanh" => unary_op(graph, node, name_to_id, shapes, Op::Tanh)?,
+        "Pow" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let exponent = node
                 .inputs
@@ -584,13 +198,13 @@ fn translate_node(
             let x_shape = get_shape(&node.inputs[0], shapes);
             register_output(node, 0, out, &x_shape, name_to_id, shapes);
         }
-        OpKind::ReduceMean | OpKind::ReduceSum | OpKind::ReduceMax => {
+        "ReduceMean" | "ReduceSum" | "ReduceMax" => {
             reduce_op(graph, node, name_to_id, shapes, weights)?;
         }
-        OpKind::Erf => unary_op(graph, node, name_to_id, shapes, Op::Erf)?,
+        "Erf" => unary_op(graph, node, name_to_id, shapes, Op::Erf)?,
 
         // Cast: passthrough (we only support f32)
-        OpKind::Cast => {
+        "Cast" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             if !node.outputs.is_empty() {
@@ -600,7 +214,7 @@ fn translate_node(
         }
 
         // Shape: produces a 1D constant of the input's static shape
-        OpKind::Shape => {
+        "Shape" => {
             let x_shape = get_shape(&node.inputs[0], shapes);
             let data: Vec<f32> = x_shape.iter().map(|&d| d as f32).collect();
             let len = data.len();
@@ -612,13 +226,13 @@ fn translate_node(
         }
 
         // --- Element-wise binary ---
-        OpKind::Add => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Add)?,
-        OpKind::Sub => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Sub)?,
-        OpKind::Mul => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Mul)?,
-        OpKind::Div => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Div)?,
+        "Add" => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Add)?,
+        "Sub" => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Sub)?,
+        "Mul" => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Mul)?,
+        "Div" => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Div)?,
 
         // --- MatMul ---
-        OpKind::MatMul => {
+        "MatMul" => {
             let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let a_shape = get_shape(&node.inputs[0], shapes);
@@ -635,7 +249,7 @@ fn translate_node(
 
         // Gemm: C = alpha * A' @ B' + beta * C_bias
         // Where A' = transpose(A) if transA, B' = transpose(B) if transB
-        OpKind::Gemm => {
+        "Gemm" => {
             let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let trans_a = attrs.i("transA", 0) != 0;
@@ -679,7 +293,7 @@ fn translate_node(
         }
 
         // --- Softmax ---
-        OpKind::Softmax | OpKind::LogSoftmax => {
+        "Softmax" | "LogSoftmax" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let rank = x_shape.len() as i64;
@@ -690,11 +304,11 @@ fn translate_node(
             if axis != -1 && axis != rank - 1 {
                 return Err(OnnxError::UnsupportedOp(format!(
                     "{} along axis {axis} of {x_shape:?} (supported: the last axis)",
-                    node.op.as_str()
+                    node.op_type
                 )));
             }
             let x = as_matrix(graph, x, &x_shape)?;
-            let out = if matches!(node.op, OpKind::Softmax) {
+            let out = if node.op_type == "Softmax" {
                 graph.softmax(x)
             } else {
                 graph.log_softmax(x)
@@ -703,7 +317,7 @@ fn translate_node(
         }
 
         // --- Normalization ---
-        OpKind::LayerNorm => {
+        "LayerNormalization" | "LayerNorm" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let scale = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -724,7 +338,7 @@ fn translate_node(
             register_output(node, 0, out, &x_shape, name_to_id, shapes);
         }
 
-        OpKind::RMSNorm => {
+        "RMSNorm" | "SimplifiedLayerNormalization" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let scale = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let eps = attrs.f("epsilon", 1e-5);
@@ -736,7 +350,7 @@ fn translate_node(
         }
 
         // --- Embedding (Gather with axis=0) ---
-        OpKind::Gather => {
+        "Gather" => {
             let data = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let indices = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let data_shape = get_shape(&node.inputs[0], shapes);
@@ -803,7 +417,7 @@ fn translate_node(
         }
 
         // --- Transpose ---
-        OpKind::Transpose => {
+        "Transpose" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let rank = x_shape.len();
@@ -837,7 +451,7 @@ fn translate_node(
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
-        OpKind::Reshape => {
+        "Reshape" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let total = x_shape.iter().product::<usize>().max(1);
@@ -867,7 +481,7 @@ fn translate_node(
             }
         }
 
-        OpKind::Flatten => {
+        "Flatten" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let axis = attrs.i("axis", 1) as usize;
@@ -879,7 +493,7 @@ fn translate_node(
             }
         }
 
-        OpKind::Squeeze | OpKind::Unsqueeze => {
+        "Squeeze" | "Unsqueeze" => {
             // Shape-only: the tensor keeps its data under the new shape.
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
@@ -891,7 +505,7 @@ fn translate_node(
             {
                 axes = values.iter().map(|&v| v as i64).collect();
             }
-            let new_shape = if matches!(node.op, OpKind::Squeeze) {
+            let new_shape = if node.op_type == "Squeeze" {
                 let rank = x_shape.len() as i64;
                 let squeezed: Vec<usize> = axes
                     .iter()
@@ -925,7 +539,7 @@ fn translate_node(
             }
         }
 
-        OpKind::Expand => {
+        "Expand" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let target: Option<Vec<usize>> = node
@@ -968,7 +582,7 @@ fn translate_node(
         }
 
         // --- Identity / Dropout (inference mode) ---
-        OpKind::Identity | OpKind::Dropout => {
+        "Identity" | "Dropout" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             if !node.outputs.is_empty() {
@@ -978,8 +592,8 @@ fn translate_node(
         }
 
         // --- Constant ---
-        OpKind::Constant => {
-            if let Some(tensor) = attrs.tensors.get("value") {
+        "Constant" => {
+            if let Some(tensor) = attrs.tensor("value") {
                 let data = tensor.data.clone();
                 let shape = tensor.shape.clone();
                 let id = graph.constant(data, &shape);
@@ -992,7 +606,7 @@ fn translate_node(
 
         // --- Conv (1D or 2D) ---
         // Conv1d [N,C,L] is treated as Conv2d with H=1: [N,C,1,L]
-        OpKind::Conv => {
+        "Conv" => {
             let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let kernel = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let input_shape = get_shape(&node.inputs[0], shapes);
@@ -1084,7 +698,7 @@ fn translate_node(
         }
 
         // --- Concat ---
-        OpKind::Concat => {
+        "Concat" => {
             let mut inputs = node.inputs.iter().filter(|name| !name.is_empty());
             let first = inputs.next().ok_or_else(|| {
                 OnnxError::ShapeError(format!("node '{}': empty Concat", node.name))
@@ -1147,7 +761,7 @@ fn translate_node(
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
-        OpKind::Slice => {
+        "Slice" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let ints = |slot: usize| -> Option<Vec<i64>> {
@@ -1202,7 +816,7 @@ fn translate_node(
         }
 
         // --- GroupNorm ---
-        OpKind::GroupNorm => {
+        "GroupNormalization" | "GroupNorm" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let scale = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let bias = resolve_input(&node.inputs[2], name_to_id, &node.name)?;
@@ -1229,7 +843,7 @@ fn translate_node(
         // In inference mode, mean and var are running statistics (constants).
         // We precompute: w = scale / sqrt(var + eps), b = bias - mean * w
         // Then: output = x * w + b  (per-channel, broadcast over spatial dims)
-        OpKind::BatchNorm => {
+        "BatchNormalization" => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let eps = attrs.f("epsilon", 1e-5);
@@ -1292,7 +906,7 @@ fn translate_node(
         }
 
         // --- MaxPool ---
-        OpKind::MaxPool => {
+        "MaxPool" => {
             let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let input_shape = get_shape(&node.inputs[0], shapes);
             if input_shape.len() != 4 {
@@ -1329,7 +943,7 @@ fn translate_node(
         }
 
         // --- GlobalAveragePool ---
-        OpKind::GlobalAveragePool => {
+        "GlobalAveragePool" => {
             let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let input_shape = get_shape(&node.inputs[0], shapes);
             if input_shape.len() != 4 {
@@ -1348,8 +962,8 @@ fn translate_node(
         }
 
         // --- Unsupported ops produce a clear error ---
-        ref other => {
-            return Err(OnnxError::UnsupportedOp(other.as_str().to_string()));
+        other => {
+            return Err(OnnxError::UnsupportedOp(other.to_string()));
         }
     }
 
@@ -1368,7 +982,7 @@ enum BinaryKind {
 
 fn binary_op(
     graph: &mut Graph,
-    node: &OnnxNode,
+    node: &proto::Node,
     name_to_id: &mut HashMap<String, NodeId>,
     shapes: &mut HashMap<String, Vec<usize>>,
     weights: &HashMap<String, Vec<f32>>,
@@ -1618,7 +1232,7 @@ fn scalar_constant(graph: &Graph, id: NodeId, weights: &HashMap<String, Vec<f32>
 /// it: the per-row reductions norms and softmax are written with.
 fn reduce_op(
     graph: &mut Graph,
-    node: &OnnxNode,
+    node: &proto::Node,
     name_to_id: &mut HashMap<String, NodeId>,
     shapes: &mut HashMap<String, Vec<usize>>,
     weights: &HashMap<String, Vec<f32>>,
@@ -1640,13 +1254,13 @@ fn reduce_op(
         return Err(OnnxError::UnsupportedOp(format!(
             "{}: axes {axes:?} of {x_shape:?} with keepdims={keepdims} \
              (supported: the last axis, kept)",
-            node.op.as_str()
+            node.op_type
         )));
     }
     let x = as_matrix(graph, x, &x_shape)?;
-    let out = match node.op {
-        OpKind::ReduceMean => graph.mean_inner(x),
-        OpKind::ReduceSum => graph.sum_inner(x),
+    let out = match node.op_type.as_str() {
+        "ReduceMean" => graph.mean_inner(x),
+        "ReduceSum" => graph.sum_inner(x),
         _ => graph.max_inner(x),
     };
     let mut out_shape = x_shape;
@@ -1659,7 +1273,7 @@ fn reduce_op(
 
 fn unary_op(
     graph: &mut Graph,
-    node: &OnnxNode,
+    node: &proto::Node,
     name_to_id: &mut HashMap<String, NodeId>,
     shapes: &mut HashMap<String, Vec<usize>>,
     op: Op,
@@ -1675,7 +1289,7 @@ fn unary_op(
 }
 
 fn register_output(
-    node: &OnnxNode,
+    node: &proto::Node,
     output_idx: usize,
     id: NodeId,
     shape: &[usize],
@@ -1979,11 +1593,13 @@ mod tests {
 
         let model_bytes = build_onnx_model(&[matmul_node], &[weight_init], &[x_vi, w_vi], &[y_vi]);
 
-        // Test shape extraction
-        let shapes = extract_shapes_from_proto(&model_bytes).unwrap();
-        assert_eq!(shapes.get("x"), Some(&vec![2, 10]));
-        assert_eq!(shapes.get("w"), Some(&vec![10, 5]));
-        assert_eq!(shapes.get("y"), Some(&vec![2, 5]));
+        let graph = proto::parse_model(&model_bytes, None).unwrap();
+        // `w` is an initializer, so it is not a graph input.
+        assert_eq!(graph.inputs.len(), 1);
+        assert_eq!(graph.inputs[0].name, "x");
+        assert_eq!(graph.inputs[0].shape, Some(vec![2, 10]));
+        assert_eq!(graph.initializers[0].shape, vec![10, 5]);
+        assert_eq!(graph.outputs[0].shape, Some(vec![2, 5]));
     }
 
     #[test]
@@ -2305,48 +1921,5 @@ mod tests {
             load_onnx_bytes(&bytes, None),
             Err(OnnxError::UnsupportedOp(_))
         ));
-    }
-}
-
-#[cfg(test)]
-mod length_tests {
-    use super::{delimited, parse_single_value_info, parse_tensor_shape_dims};
-
-    #[test]
-    fn a_length_past_the_end_is_rejected_not_sliced() {
-        let buf = [0u8; 4];
-        assert!(delimited(&buf, 1000, 0).is_none());
-        assert_eq!(
-            delimited(&buf, 4, 0).map(|(f, e)| (f.len(), e)),
-            Some((4, 4))
-        );
-        assert!(delimited(&buf, 0, 5).is_none());
-        assert!(delimited(&buf, usize::MAX as u64, 1).is_none());
-    }
-
-    #[test]
-    fn a_value_info_with_an_oversized_field_does_not_panic() {
-        let buf = [0x12, 0x7E, 0x02, 0x03];
-        assert!(parse_single_value_info(&buf).is_none());
-    }
-
-    #[test]
-    fn a_truncated_tensor_shape_does_not_panic() {
-        let buf = [0x12, 0xC8, 0x01, 0x08, 0x01];
-        let dims = parse_tensor_shape_dims(&buf);
-        assert!(
-            dims.is_empty(),
-            "a truncated field must not yield dimensions, got {dims:?}"
-        );
-    }
-
-    #[test]
-    fn no_length_panics() {
-        let buf: Vec<u8> = (0..64u8).collect();
-        for start in 0..buf.len() + 2 {
-            for len in [0u64, 1, 7, 63, 64, 65, 1 << 20, u64::MAX, u64::MAX - 1] {
-                let _ = delimited(&buf, len, start);
-            }
-        }
     }
 }
