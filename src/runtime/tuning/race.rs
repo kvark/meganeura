@@ -296,17 +296,22 @@ impl Session {
         // Compile every missing pipeline in one parallel batch.
         let compile = Instant::now();
         let mut wanted: Vec<(Variant, &Dispatch, Option<crate::codegen::CoopConfig>)> = Vec::new();
+        // The dispatches that race on a pipeline compiled from another one.
+        #[cfg(debug_assertions)]
+        let mut reused = Vec::new();
         for (sequence, &tile) in sequences.iter().zip(tiles) {
             for (position, dispatch) in sequence.iter().enumerate() {
                 let key = Pipelines::key(dispatch, &capabilities);
-                if self.pipelines.map.contains_key(&key) || wanted.iter().any(|w| w.0 == key) {
-                    continue;
-                }
                 let coop = if position == 0 {
                     tile.coop_config()
                 } else {
                     None
                 };
+                if self.pipelines.map.contains_key(&key) || wanted.iter().any(|w| w.0 == key) {
+                    #[cfg(debug_assertions)]
+                    reused.push((key, dispatch, coop));
+                    continue;
+                }
                 wanted.push((key, dispatch, coop));
             }
         }
@@ -335,6 +340,20 @@ impl Session {
             }
         }
         race.compile_time = compile.elapsed();
+        #[cfg(debug_assertions)]
+        for (key, dispatch, coop) in reused {
+            if let Some(mapped) = self.pipelines.map.get(&key) {
+                let knobs = self.pipelines.knobs;
+                Pipelines::assert_key_determines_code(
+                    &self.gpu,
+                    knobs,
+                    dispatch,
+                    &key,
+                    coop.as_ref(),
+                    mapped,
+                );
+            }
+        }
         if interrupted {
             fail_remaining(outcomes, TuneDecision::TimeBudget);
             return None;

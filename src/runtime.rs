@@ -1188,6 +1188,10 @@ impl Variant {
 struct SharedPipeline {
     gpu: Arc<Gpu>,
     raw: blade_graphics::ComputePipeline,
+    /// The code it was compiled from and the cooperative configuration that
+    /// generated it, for [`Pipelines::assert_key_determines_code`].
+    #[cfg(debug_assertions)]
+    generated: (SharedPipelineKey, Option<crate::codegen::CoopConfig>),
 }
 
 impl Drop for SharedPipeline {
@@ -1199,12 +1203,71 @@ impl Drop for SharedPipeline {
 /// Exactly what compilation consumes, so a shared pipeline is the one
 /// compiling this module would create. A live pipeline holds its context,
 /// so the context address cannot be reused while an entry can upgrade.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct SharedPipelineKey {
     context: usize,
     entry_point: &'static str,
     layout: String,
     source: String,
+}
+
+impl SharedPipelineKey {
+    /// The code `module` compiles to on `gpu` when it is entered at
+    /// `entry_point`, bound through `layout` and held to
+    /// `full_subgroup_size`.
+    fn new(
+        gpu: &Gpu,
+        module: &crate::codegen::ShaderModule,
+        layout: &blade_graphics::ShaderDataLayout,
+        entry_point: &'static str,
+        full_subgroup_size: Option<u32>,
+    ) -> Self {
+        Self {
+            context: std::ptr::from_ref(gpu) as usize,
+            entry_point,
+            layout: format!("{:?}:sg={:?}", layout.bindings, full_subgroup_size),
+            source: module.source.clone(),
+        }
+    }
+
+    /// Where `other` first departs from this code, or `None` when a pipeline
+    /// compiled from one runs the other.
+    #[cfg(debug_assertions)]
+    fn difference(&self, other: &Self) -> Option<String> {
+        if self.context != other.context {
+            return Some("they belong to different contexts".into());
+        }
+        if self.entry_point != other.entry_point {
+            return Some(format!(
+                "entry point `{}` became `{}`",
+                self.entry_point, other.entry_point
+            ));
+        }
+        if self.layout != other.layout {
+            return Some(format!(
+                "binding layout\n  {}\nbecame\n  {}",
+                self.layout, other.layout
+            ));
+        }
+        if self.source == other.source {
+            return None;
+        }
+        let (mut mapped, mut reusing) = (self.source.lines(), other.source.lines());
+        for line in 1.. {
+            match (mapped.next(), reusing.next()) {
+                (None, None) => break,
+                (mapped, reusing) if mapped == reusing => {}
+                (mapped, reusing) => {
+                    return Some(format!(
+                        "source line {line}\n  {}\nbecame\n  {}",
+                        mapped.unwrap_or("<end of source>"),
+                        reusing.unwrap_or("<end of source>"),
+                    ));
+                }
+            }
+        }
+        Some("the source differs only in its line breaks".into())
+    }
 }
 
 /// Live pipelines by generated code. Candidate sessions in a measured search
@@ -1245,6 +1308,10 @@ struct Pipelines {
     knobs: crate::compile::TuningKnobs,
     /// Where to write every WGSL the pipeline layer compiles — [`SessionOptions::wgsl_dump_dir`].
     dump_dir: Option<String>,
+    /// The dispatches behind `selected`, as [`Pipelines::select`] last
+    /// checked them against their pipelines.
+    #[cfg(debug_assertions)]
+    checked: Vec<Dispatch>,
 }
 
 /// Types of checked dense and convolution kernels, including explicit BF16
@@ -1917,6 +1984,8 @@ impl Pipelines {
             selected: Vec::new(),
             knobs: plan.knobs,
             dump_dir: wgsl_dump_dir.map(str::to_string),
+            #[cfg(debug_assertions)]
+            checked: Vec::new(),
         };
         let optimizer: Vec<Dispatch> = if plan.param_grad_pairs.is_empty() {
             Vec::new()
@@ -2032,6 +2101,15 @@ impl Pipelines {
     ) -> Result<(), String> {
         let key = Self::key(dispatch, &gpu.capabilities());
         if self.map.contains_key(&key) {
+            #[cfg(debug_assertions)]
+            Self::assert_key_determines_code(
+                gpu,
+                self.knobs,
+                dispatch,
+                &key,
+                coop_config,
+                &self.map[&key],
+            );
             return Ok(());
         }
         let pipeline = Self::compile(
@@ -2056,6 +2134,52 @@ impl Pipelines {
         key: &Variant,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Result<Arc<SharedPipeline>, String> {
+        let (module, layout, entry_point) = Self::generate(gpu, knobs, dispatch, key, coop_config)?;
+        // Every module a session compiles — the standard, coop, weighted,
+        // epilogue-fused and scheduled forms alike — passes through here, so
+        // the dump sees exactly what a plan would run, shared or not.
+        if let Some(dir) = dump_dir {
+            module.dump(dir);
+        }
+        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
+        let shared_key =
+            SharedPipelineKey::new(gpu, &module, &layout, entry_point, full_subgroup_size);
+        if let Some(pipeline) = SharedPipelines::get(&shared_key) {
+            return Ok(pipeline);
+        }
+        let shader = create_gen_shader(gpu, module)?;
+        let pipeline = Arc::new(SharedPipeline {
+            gpu: Arc::clone(gpu),
+            raw: create_profiled_pipeline_with_subgroup(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(entry_point),
+                full_subgroup_size,
+            ),
+            #[cfg(debug_assertions)]
+            generated: (shared_key.clone(), coop_config.copied()),
+        });
+        SharedPipelines::insert(shared_key, &pipeline);
+        Ok(pipeline)
+    }
+
+    /// The module of `dispatch`'s implementation `key`, with the entry point
+    /// and the layout it is bound through.
+    fn generate(
+        gpu: &Gpu,
+        knobs: crate::compile::TuningKnobs,
+        dispatch: &Dispatch,
+        key: &Variant,
+        coop_config: Option<&crate::codegen::CoopConfig>,
+    ) -> Result<
+        (
+            crate::codegen::ShaderModule,
+            blade_graphics::ShaderDataLayout,
+            &'static str,
+        ),
+        String,
+    > {
         use crate::codegen::ShaderGroup;
         let mut matmul_knobs = crate::codegen::MatmulKnobs {
             k_stage: knobs.matmul_k_stage,
@@ -2485,35 +2609,38 @@ impl Pipelines {
                 crate::codegen::generate_horizontal_matmul(group, count, coop.as_ref())
             }
         };
-        // Every module a session compiles — the standard, coop, weighted,
-        // epilogue-fused and scheduled forms alike — passes through here, so
-        // the dump sees exactly what a plan would run, shared or not.
-        if let Some(dir) = dump_dir {
-            module.dump(dir);
-        }
+        Ok((module, layout, entry_point))
+    }
+
+    /// Hold [`Pipelines::key`] to its contract in debug builds. `dispatch` is
+    /// about to run `mapped`, which may have been compiled from another
+    /// dispatch with the same `key`, so generating its own module has to give
+    /// the code `mapped` was compiled from. [`Pipelines::generate`] reads the
+    /// dispatch as well as the key. A field it reads that the key leaves out
+    /// would hand this dispatch a shader built for another geometry or
+    /// arithmetic, and nothing else would say so.
+    #[cfg(debug_assertions)]
+    fn assert_key_determines_code(
+        gpu: &Gpu,
+        knobs: crate::compile::TuningKnobs,
+        dispatch: &Dispatch,
+        key: &Variant,
+        coop_config: Option<&crate::codegen::CoopConfig>,
+        mapped: &SharedPipeline,
+    ) {
+        let (module, layout, entry_point) = Self::generate(gpu, knobs, dispatch, key, coop_config)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "pipeline key {key:?} is compiled, yet {dispatch:?} cannot generate it: {error}"
+                )
+            });
         let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
-        let shared_key = SharedPipelineKey {
-            context: Arc::as_ptr(gpu) as usize,
-            entry_point,
-            layout: format!("{:?}:sg={:?}", layout.bindings, full_subgroup_size),
-            source: module.source.clone(),
-        };
-        if let Some(pipeline) = SharedPipelines::get(&shared_key) {
-            return Ok(pipeline);
+        let code = SharedPipelineKey::new(gpu, &module, &layout, entry_point, full_subgroup_size);
+        if let Some(difference) = mapped.generated.0.difference(&code) {
+            panic!(
+                "pipeline key {key:?} does not determine its code: {difference}\nfor {dispatch:?}"
+            );
         }
-        let shader = create_gen_shader(gpu, module)?;
-        let pipeline = Arc::new(SharedPipeline {
-            gpu: Arc::clone(gpu),
-            raw: create_profiled_pipeline_with_subgroup(
-                gpu,
-                key.label(),
-                &layout,
-                shader.at(entry_point),
-                full_subgroup_size,
-            ),
-        });
-        SharedPipelines::insert(shared_key, &pipeline);
-        Ok(pipeline)
     }
 
     fn attention_head_dim(dispatch: &Dispatch) -> Option<u32> {
@@ -2755,7 +2882,7 @@ impl Pipelines {
 
     fn select(&mut self, dispatches: &[Dispatch], gpu: &Gpu) {
         let capabilities = gpu.capabilities();
-        self.selected = dispatches
+        let selected: Vec<_> = dispatches
             .iter()
             .map(|dispatch| {
                 let key = Self::key(dispatch, &capabilities);
@@ -2767,6 +2894,28 @@ impl Pipelines {
                 (key, pipeline)
             })
             .collect();
+        // A tuned class compiles its winner from one member and installs it
+        // on all of them, so this is where most dispatches meet a pipeline
+        // another one was compiled from.
+        #[cfg(debug_assertions)]
+        {
+            for (index, (dispatch, entry)) in dispatches.iter().zip(&selected).enumerate() {
+                let (ref key, ref pipeline) = *entry;
+                let passed_before = self.checked.get(index) == Some(dispatch)
+                    && self
+                        .selected
+                        .get(index)
+                        .is_some_and(|old| old.0 == *key && Arc::ptr_eq(&old.1, pipeline));
+                if !passed_before {
+                    let coop = pipeline.generated.1.as_ref();
+                    Self::assert_key_determines_code(
+                        gpu, self.knobs, dispatch, key, coop, pipeline,
+                    );
+                }
+            }
+            self.checked = dispatches.to_vec();
+        }
+        self.selected = selected;
     }
 
     fn get(&self, dispatch_index: usize) -> &blade_graphics::ComputePipeline {
@@ -5962,6 +6111,41 @@ mod variant_tests {
         assert_eq!(
             coop,
             Variant::Horizontal(ShaderEntry::MatMul, 3, HorizMatMulKind::Coop)
+        );
+    }
+
+    /// A key that leaves out something the generated code depends on gives a
+    /// second dispatch the first one's pipeline. Handing a negation the key
+    /// and the pipeline of a ReLU stands in for such a key here, and the
+    /// debug check on reused pipelines has to name the difference.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_key_that_omits_what_the_code_reads_is_caught() {
+        use crate::schedule::{PointwiseDAG, Pw};
+        let gpu = crate::reference::gpu::shared_context();
+        let knobs = crate::compile::TuningKnobs::default();
+        let unary = |op: fn(u16) -> Pw| Dispatch {
+            shader: ShaderEntry::Generated,
+            params: vec![16, 0, 0, 0],
+            kernel: crate::compile::Kernel::Pointwise(PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0), op(0)],
+                output: 1,
+            }),
+            ..Default::default()
+        };
+        let (relu, negation) = (unary(Pw::Relu), unary(Pw::Neg));
+        let key = Pipelines::key(&relu, &gpu.capabilities());
+        let mapped = Pipelines::compile(&gpu, knobs, None, &relu, &key, None).unwrap();
+        // The dispatch the pipeline was compiled from agrees with it.
+        Pipelines::assert_key_determines_code(&gpu, knobs, &relu, &key, None, &mapped);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Pipelines::assert_key_determines_code(&gpu, knobs, &negation, &key, None, &mapped);
+        }));
+        let message = *caught.unwrap_err().downcast::<String>().unwrap();
+        assert!(
+            message.contains("does not determine its code: source line"),
+            "{message}"
         );
     }
 }
