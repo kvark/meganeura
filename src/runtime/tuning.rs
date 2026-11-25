@@ -158,14 +158,22 @@ impl KernelMemo {
             })
     }
 
-    /// Record or merge progress for `key` without overwriting a sibling entry
-    /// whose winner was inadmissible for this program's challenger subset.
+    /// Record or merge progress for `key` while keeping one entry per distinct
+    /// winner so superset programs never overwrite a subset program's winner.
     fn record_progress(&mut self, key: MemoKey, mut updated: KernelProgress) {
         let entries = self.progress.entry(key).or_default();
-        if let Some(existing) = entries
-            .iter_mut()
-            .find(|p| p.selected == updated.selected || updated.decided.contains(&p.selected))
-        {
+        // Copy transitive coverage from any beaten sibling winners without
+        // deleting their entries (smaller challenger subsets still need them).
+        let mut extra = Vec::new();
+        for p in entries.iter() {
+            if p.selected != updated.selected && updated.decided.contains(&p.selected) {
+                extra.extend_from_slice(&p.decided);
+            }
+        }
+        for tile in extra {
+            record_decided(&mut updated.decided, tile);
+        }
+        if let Some(existing) = entries.iter_mut().find(|p| p.selected == updated.selected) {
             for &tile in &existing.decided {
                 record_decided(&mut updated.decided, tile);
             }
@@ -2930,6 +2938,64 @@ mod memo_tests {
             }
         });
         assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn superset_winner_preserves_subset_program_entry() {
+        let mut memo = KernelMemo::default();
+        let tile_a = MatmulTile::Tile32;
+        let tile_b = MatmulTile::CooperativeF16 { tile_size: 16 };
+        let tile_c = MatmulTile::CooperativeF32 { tile_size: 16 };
+        let key = MemoKey(0, false, TuneClass::default(), MatmulTile::Tile64, 1);
+
+        let p1 = SearchClass {
+            key: TuneClass::default(),
+            initial: MatmulTile::Tile64,
+            members: vec![0],
+            reductions: vec![],
+            challengers: vec![tile_a, tile_b],
+            input_b_copies: 1,
+        };
+        let p3 = SearchClass {
+            challengers: vec![tile_a, tile_b, tile_c],
+            ..SearchClass {
+                key: TuneClass::default(),
+                initial: MatmulTile::Tile64,
+                members: vec![0],
+                reductions: vec![],
+                challengers: vec![],
+                input_b_copies: 1,
+            }
+        };
+
+        // P1 records winner A over [A, B].
+        memo.record_progress(
+            key.clone(),
+            KernelProgress {
+                selected: tile_a,
+                decided: vec![tile_a, tile_b],
+            },
+        );
+        // P3 beats A with C over [A, B, C]; P1's entry for A must survive.
+        memo.record_progress(
+            key.clone(),
+            KernelProgress {
+                selected: tile_c,
+                decided: vec![tile_a, tile_c],
+            },
+        );
+
+        let found_p1 = memo
+            .find_progress(&key, &p1)
+            .expect("P1 must still find its admissible winner A");
+        assert_eq!(found_p1.selected, tile_a);
+        assert!(found_p1.is_complete(&p1));
+
+        let found_p3 = memo
+            .find_progress(&key, &p3)
+            .expect("P3 must find its winner C with transitive coverage");
+        assert_eq!(found_p3.selected, tile_c);
+        assert!(found_p3.is_complete(&p3));
     }
 }
 
