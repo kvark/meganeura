@@ -143,7 +143,9 @@ or unrepresentative inputs can still select a slower deployment program.
 Held-out inference and minimal-shape measurements must check the selected plan;
 training improvements do not compensate for inference regressions.
 
-Private kernel decisions are keyed by complete class and candidate list, so
+Private kernel decisions are keyed by class and initial tile with an
+order-independent set of decided challengers (retaining separate entries when
+distinct challenger subsets disallow a prior winner), so
 `BuildSearchOptions::kernel_memo` can carry them into later searches on the same
 engine version, device, driver and decision policy; `KernelMemo::save` and `load`
 carry them into later processes. The memo revision must also be bumped when

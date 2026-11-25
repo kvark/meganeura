@@ -23,9 +23,11 @@ pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
 
 /// Qualified private-scratch kernel comparisons, resumable by later tuning.
 ///
-/// Each decision covers one complete class key and candidate list, measured
-/// in private scratch, including its modeled weight reuse. A different reuse count cannot
-/// inherit the decision.
+/// Each decision is keyed by class key, initial tile, and modeled weight reuse,
+/// and records the selected winner plus the set of challengers already decided
+/// against it. A different reuse count cannot inherit the decision, while
+/// adding, removing, or reordering challengers reuses prior decisions and
+/// probes only undecided challengers.
 /// Later searches on the same engine, device, driver and decision policy install
 /// the recorded winner and probe only the challengers it has not decided.
 /// [`crate::train::build_measured`] still requires whole-program qualification
@@ -38,12 +40,12 @@ pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
 #[derive(Default)]
 pub struct KernelMemo {
     scope: Option<MemoScope>,
-    progress: HashMap<MemoKey, KernelProgress>,
+    progress: HashMap<MemoKey, Vec<KernelProgress>>,
 }
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 18;
+const KERNEL_MEMO_REVISION: u32 = 19;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -96,10 +98,15 @@ impl MemoScope {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct MemoHeader {
+    scope: Option<MemoScope>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MemoFile {
     scope: Option<MemoScope>,
-    progress: Vec<(MemoKey, KernelProgress)>,
+    progress: Vec<(MemoKey, Vec<KernelProgress>)>,
 }
 
 impl KernelMemo {
@@ -134,9 +141,69 @@ impl KernelMemo {
         self.progress.is_empty()
     }
 
-    /// Read a memo written by [`Self::save`]. Its scope is checked on use.
+    /// Best recorded progress entry whose winner is still admissible for `class`.
+    fn find_progress(&self, key: &MemoKey, class: &SearchClass) -> Option<&KernelProgress> {
+        self.progress
+            .get(key)?
+            .iter()
+            .filter(|progress| progress.applies_to(class))
+            .max_by_key(|progress| {
+                let complete = progress.is_complete(class);
+                let covered = class
+                    .challengers
+                    .iter()
+                    .filter(|tile| **tile == progress.selected || progress.decided.contains(tile))
+                    .count();
+                (complete, covered)
+            })
+    }
+
+    /// Record or merge progress for `key` while keeping one entry per distinct
+    /// winner so superset programs never overwrite a subset program's winner.
+    fn record_progress(&mut self, key: MemoKey, mut updated: KernelProgress) {
+        let entries = self.progress.entry(key).or_default();
+        // Copy transitive coverage from any beaten sibling winners without
+        // deleting their entries (smaller challenger subsets still need them).
+        let mut extra = Vec::new();
+        for p in entries.iter() {
+            if p.selected != updated.selected && updated.decided.contains(&p.selected) {
+                extra.extend_from_slice(&p.decided);
+            }
+        }
+        for tile in extra {
+            record_decided(&mut updated.decided, tile);
+        }
+        if let Some(existing) = entries.iter_mut().find(|p| p.selected == updated.selected) {
+            for &tile in &existing.decided {
+                record_decided(&mut updated.decided, tile);
+            }
+            *existing = updated;
+        } else {
+            entries.push(updated);
+        }
+    }
+
+    /// Read a memo written by [`Self::save`]. Incompatible revisions are
+    /// discarded before decoding version-specific entries; corrupt files of the
+    /// current revision still return `Err(InvalidData)`.
     pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let file: MemoFile = serde_json::from_slice(&std::fs::read(path)?)?;
+        let bytes = std::fs::read(path)?;
+        let header: MemoHeader = serde_json::from_slice(&bytes)?;
+        if header
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.revision != KERNEL_MEMO_REVISION)
+        {
+            log::info!(
+                "kernel memo: discarding decisions from incompatible revision {} (expected {KERNEL_MEMO_REVISION})",
+                header.scope.as_ref().unwrap().revision
+            );
+            return Ok(Self {
+                scope: header.scope,
+                progress: HashMap::new(),
+            });
+        }
+        let file: MemoFile = serde_json::from_slice(&bytes)?;
         Ok(Self {
             scope: file.scope,
             progress: file.progress.into_iter().collect(),
@@ -156,7 +223,7 @@ impl KernelMemo {
             progress: self
                 .progress
                 .iter()
-                .map(|(key, &progress)| (key.clone(), progress))
+                .map(|(key, progress)| (key.clone(), progress.clone()))
                 .collect(),
         };
         let contents = serde_json::to_vec(&file)?;
@@ -196,17 +263,44 @@ impl KernelMemo {
     }
 }
 
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct KernelProgress {
     selected: MatmulTile,
-    next_candidate: usize,
+    /// Challengers already decided against `selected`, stored as a set-like
+    /// list so reordering or extending a class's candidate list preserves prior
+    /// decisions and probes only newly added challengers.
+    decided: Vec<MatmulTile>,
 }
 
 impl KernelProgress {
-    /// Progress recorded under this class's complete candidate list.
+    /// Whether the recorded winner is still an admissible tile for `class`.
     fn applies_to(&self, class: &SearchClass) -> bool {
-        self.next_candidate <= class.challengers.len()
-            && (self.selected == class.initial || class.challengers.contains(&self.selected))
+        self.selected == class.initial || class.challengers.contains(&self.selected)
+    }
+
+    /// Challengers of `class` that have not yet been decided against `selected`.
+    fn undecided(&self, class: &SearchClass) -> Vec<MatmulTile> {
+        class
+            .challengers
+            .iter()
+            .copied()
+            .filter(|tile| *tile != self.selected && !self.decided.contains(tile))
+            .collect()
+    }
+
+    /// Every challenger of `class` is already decided under an admissible winner.
+    fn is_complete(&self, class: &SearchClass) -> bool {
+        self.applies_to(class)
+            && class
+                .challengers
+                .iter()
+                .all(|tile| *tile == self.selected || self.decided.contains(tile))
+    }
+}
+
+fn record_decided(decided: &mut Vec<MatmulTile>, tile: MatmulTile) {
+    if !decided.contains(&tile) {
+        decided.push(tile);
     }
 }
 
@@ -215,7 +309,7 @@ struct MemoKey(
     u32,
     bool,
     TuneClass,
-    Vec<MatmulTile>,
+    MatmulTile,
     #[serde(default = "one_copy")] u32,
 );
 
@@ -228,9 +322,7 @@ fn memo_key(plan: &crate::compile::ExecutionPlan, class: &SearchClass) -> MemoKe
         plan.knobs.matmul_k_stage,
         plan.knobs.matmul_interleave_columns,
         class.key.clone(),
-        std::iter::once(class.initial)
-            .chain(class.challengers.iter().copied())
-            .collect(),
+        class.initial,
         class.input_b_copies,
     )
 }
@@ -241,10 +333,8 @@ fn decided(
     plan: &crate::compile::ExecutionPlan,
     class: &SearchClass,
 ) -> bool {
-    memo.and_then(|memo| memo.progress.get(&memo_key(plan, class)))
-        .is_some_and(|progress| {
-            progress.applies_to(class) && progress.next_candidate >= class.challengers.len()
-        })
+    memo.and_then(|memo| memo.find_progress(&memo_key(plan, class), class))
+        .is_some_and(|progress| progress.is_complete(class))
 }
 
 /// Predicted milliseconds of all of `class`'s dispatches with their initial tile.
@@ -969,11 +1059,11 @@ impl Session {
         let mut pending = Vec::new();
         for (index, class) in classes.iter().enumerate() {
             let mut incumbent = class.initial;
-            let mut next_candidate = 0;
-            if let Some(&progress) = memo
+            let mut decided_tiles: Vec<MatmulTile> = Vec::new();
+            let mut undecided = class.challengers.clone();
+            if let Some(progress) = memo
                     .as_ref()
-                    .and_then(|m| m.progress.get(&memo_key(&self.plan, class)))
-                && progress.applies_to(class)
+                    .and_then(|m| m.find_progress(&memo_key(&self.plan, class), class))
                 // A pipeline already held by this session needs neither a
                 // probe budget nor compilation to restore its recorded tile.
                 && (self.pipelines.map.contains_key(&tile_variant(
@@ -995,12 +1085,13 @@ impl Session {
                     .reused_classes
                     .push((class.key.clone(), progress.selected));
                 incumbent = progress.selected;
-                next_candidate = progress.next_candidate;
+                decided_tiles = progress.decided.clone();
+                undecided = progress.undecided(class);
             }
-            if next_candidate >= class.challengers.len() {
+            if undecided.is_empty() {
                 report.visited_classes += 1;
             } else {
-                pending.push((index, incumbent, next_candidate));
+                pending.push((index, incumbent, decided_tiles, undecided));
             }
         }
         let mut profile = self.search_profile(&options);
@@ -1055,7 +1146,7 @@ impl Session {
             } else {
                 0
             };
-            let (index, mut incumbent, mut next_candidate) = pending.remove(position);
+            let (index, mut incumbent, mut decided_tiles, undecided) = pending.remove(position);
             let class = &classes[index];
             let memo_key = memo_key(&self.plan, class);
             if let (Some(plan_ms), Some(profile)) = (report.predicted_plan_ms, profile.as_ref()) {
@@ -1082,6 +1173,7 @@ impl Session {
                     let result = self.race_class(
                         class,
                         incumbent,
+                        &undecided,
                         &options,
                         start,
                         &mut staging,
@@ -1108,12 +1200,18 @@ impl Session {
                     if result.race.complete
                         && let Some(ref mut memo) = memo
                     {
-                        // Every challenger is decided, failures included.
-                        memo.progress.insert(
+                        // Every raced challenger is decided, failures included.
+                        if result.selected != incumbent && incumbent != class.initial {
+                            record_decided(&mut decided_tiles, incumbent);
+                        }
+                        for &tile in &undecided {
+                            record_decided(&mut decided_tiles, tile);
+                        }
+                        memo.record_progress(
                             memo_key,
                             KernelProgress {
                                 selected: result.selected,
-                                next_candidate: class.challengers.len(),
+                                decided: decided_tiles,
                             },
                         );
                     }
@@ -1124,9 +1222,7 @@ impl Session {
                 }
                 TuneStrategy::Sequential => {
                     let first_outcome = report.outcomes.len();
-                    for (index, &candidate) in
-                        class.challengers.iter().enumerate().skip(next_candidate)
-                    {
+                    for &candidate in &undecided {
                         if start.elapsed() >= options.max_time {
                             report.time_budget_exhausted = true;
                             break;
@@ -1167,18 +1263,13 @@ impl Session {
                                 TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
                             )
                         {
-                            // Only skip a contiguous, fully measured prefix. A failed
-                            // or interrupted challenger is retried; later qualified
-                            // winners may still seed that retry.
-                            if index == next_candidate {
-                                next_candidate += 1;
-                            }
+                            record_decided(&mut decided_tiles, candidate);
                             if let Some(ref mut memo) = memo {
-                                memo.progress.insert(
+                                memo.record_progress(
                                     memo_key.clone(),
                                     KernelProgress {
                                         selected: incumbent,
-                                        next_candidate,
+                                        decided: decided_tiles.clone(),
                                     },
                                 );
                             }
@@ -2536,20 +2627,95 @@ mod memo_tests {
             &bg::DeviceInformation::default(),
             &TuneOptions::default(),
         ));
-        memo.progress.insert(
-            MemoKey(
-                32,
-                false,
-                TuneClass::default(),
-                vec![MatmulTile::Tile32, MatmulTile::Tile64],
-                1,
-            ),
+        memo.record_progress(
+            MemoKey(32, false, TuneClass::default(), MatmulTile::Tile32, 1),
             KernelProgress {
                 selected: MatmulTile::Tile64,
-                next_candidate: 1,
+                decided: vec![MatmulTile::Tile64],
             },
         );
         memo
+    }
+
+    #[test]
+    fn memo_preserves_decisions_across_reordered_and_extended_challengers() {
+        let tile_a = MatmulTile::Tile64;
+        let tile_b = MatmulTile::SpecializedConv {
+            tile_size: 32,
+            k_tile: 16,
+            interleave_columns: false,
+        };
+        let tile_c = MatmulTile::SpecializedConv {
+            tile_size: 64,
+            k_tile: 16,
+            interleave_columns: true,
+        };
+        let make_class = |challengers: Vec<MatmulTile>| SearchClass {
+            key: TuneClass::default(),
+            members: vec![0],
+            reductions: Vec::new(),
+            initial: MatmulTile::Tile32,
+            challengers,
+            input_b_copies: 1,
+        };
+        let plan = crate::compile::compile(&crate::Graph::new());
+        let original = make_class(vec![tile_a, tile_b]);
+        let reordered = make_class(vec![tile_b, tile_a]);
+        let extended = make_class(vec![tile_b, tile_c, tile_a]);
+        let retired_winner = make_class(vec![tile_b, tile_c]);
+
+        // MemoKey is independent of challenger order or additions.
+        assert_eq!(memo_key(&plan, &original), memo_key(&plan, &reordered));
+        assert_eq!(memo_key(&plan, &original), memo_key(&plan, &extended));
+
+        let progress = KernelProgress {
+            selected: tile_a,
+            decided: vec![tile_a, tile_b],
+        };
+        assert!(progress.is_complete(&original));
+        assert!(progress.is_complete(&reordered));
+        assert!(progress.undecided(&reordered).is_empty());
+
+        // Adding a new challenger keeps the prior winner and probes only the newcomer.
+        assert!(progress.applies_to(&extended));
+        assert!(!progress.is_complete(&extended));
+        assert_eq!(progress.undecided(&extended), vec![tile_c]);
+
+        // Retiring the previously selected tile invalidates the stale winner safely.
+        assert!(!progress.applies_to(&retired_winner));
+        assert!(!progress.is_complete(&retired_winner));
+
+        // Recording a winner for a restricted challenger subset (`[B, C]`, where
+        // `A` is inadmissible) keeps BOTH entries so switching between programs
+        // P1 (`[A, B]`) and P2 (`[B, C]`) never overwrites or re-probes either.
+        let mut memo = KernelMemo::default();
+        let key = memo_key(&plan, &original);
+        memo.record_progress(key.clone(), progress);
+        memo.record_progress(
+            key.clone(),
+            KernelProgress {
+                selected: tile_c,
+                decided: vec![tile_b, tile_c],
+            },
+        );
+        assert_eq!(
+            memo.find_progress(&key, &original).unwrap().selected,
+            tile_a
+        );
+        assert!(
+            memo.find_progress(&key, &original)
+                .unwrap()
+                .is_complete(&original)
+        );
+        assert_eq!(
+            memo.find_progress(&key, &retired_winner).unwrap().selected,
+            tile_c
+        );
+        assert!(
+            memo.find_progress(&key, &retired_winner)
+                .unwrap()
+                .is_complete(&retired_winner)
+        );
     }
 
     #[test]
@@ -2607,10 +2773,10 @@ mod memo_tests {
         memo.save(&path).unwrap();
         let loaded = KernelMemo::load(&path).unwrap();
         assert_eq!(loaded.scope, memo.scope);
-        let progress = loaded.progress.values().next().unwrap();
+        let progress = &loaded.progress.values().next().unwrap()[0];
         assert_eq!(
-            (progress.selected, progress.next_candidate),
-            (MatmulTile::Tile64, 1)
+            (progress.selected, progress.decided.as_slice()),
+            (MatmulTile::Tile64, [MatmulTile::Tile64].as_slice())
         );
         let kept = |scope: MemoScope| {
             let mut loaded = KernelMemo::load(&path).unwrap();
@@ -2672,10 +2838,51 @@ mod memo_tests {
             }
             std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
             let mut loaded = KernelMemo::load(&path).unwrap();
-            assert_eq!(loaded.len(), 1);
+            if change == "engine" {
+                assert_eq!(loaded.len(), 1);
+            } else {
+                // Revision mismatches discard version-specific entries at load time.
+                assert!(loaded.is_empty(), "{change}");
+            }
             loaded.bind_scope(memo.scope.unwrap());
             assert!(loaded.is_empty(), "{change}");
         }
+    }
+
+    /// A non-empty revision-18 memo (whose `MemoKey` carried `Vec<MatmulTile>`
+    /// and `KernelProgress` carried `next_candidate`) must load as an empty memo
+    /// instead of returning `InvalidData`, while a malformed current-revision
+    /// memo still fails with `InvalidData`.
+    #[test]
+    fn loads_revision_18_memo_as_empty_and_rejects_corrupt_current_memo() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("memo.json");
+        let memo = populated_memo();
+        let mut scope = serde_json::to_value(memo.scope.as_ref().unwrap()).unwrap();
+        scope["revision"] = 18u32.into();
+        let rev18 = serde_json::json!({
+            "scope": scope,
+            "progress": [[
+                [32, false, TuneClass::default(), ["Tile32", "Tile64"], 1],
+                { "selected": "Tile64", "next_candidate": 2 }
+            ]]
+        });
+        std::fs::write(&path, serde_json::to_vec(&rev18).unwrap()).unwrap();
+        let loaded = KernelMemo::load(&path).expect("rev-18 memo should upgrade cleanly");
+        assert!(loaded.is_empty());
+
+        let corrupt_current = serde_json::json!({
+            "scope": memo.scope.as_ref().unwrap(),
+            "progress": [[
+                [32, false, TuneClass::default(), ["Tile32"], 1],
+                { "selected": "Tile64", "next_candidate": 1 }
+            ]]
+        });
+        std::fs::write(&path, serde_json::to_vec(&corrupt_current).unwrap()).unwrap();
+        let err = KernelMemo::load(&path)
+            .err()
+            .expect("corrupt current-revision memo must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -2731,6 +2938,64 @@ mod memo_tests {
             }
         });
         assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn superset_winner_preserves_subset_program_entry() {
+        let mut memo = KernelMemo::default();
+        let tile_a = MatmulTile::Tile32;
+        let tile_b = MatmulTile::CooperativeF16 { tile_size: 16 };
+        let tile_c = MatmulTile::CooperativeF32 { tile_size: 16 };
+        let key = MemoKey(0, false, TuneClass::default(), MatmulTile::Tile64, 1);
+
+        let p1 = SearchClass {
+            key: TuneClass::default(),
+            initial: MatmulTile::Tile64,
+            members: vec![0],
+            reductions: vec![],
+            challengers: vec![tile_a, tile_b],
+            input_b_copies: 1,
+        };
+        let p3 = SearchClass {
+            challengers: vec![tile_a, tile_b, tile_c],
+            ..SearchClass {
+                key: TuneClass::default(),
+                initial: MatmulTile::Tile64,
+                members: vec![0],
+                reductions: vec![],
+                challengers: vec![],
+                input_b_copies: 1,
+            }
+        };
+
+        // P1 records winner A over [A, B].
+        memo.record_progress(
+            key.clone(),
+            KernelProgress {
+                selected: tile_a,
+                decided: vec![tile_a, tile_b],
+            },
+        );
+        // P3 beats A with C over [A, B, C]; P1's entry for A must survive.
+        memo.record_progress(
+            key.clone(),
+            KernelProgress {
+                selected: tile_c,
+                decided: vec![tile_a, tile_c],
+            },
+        );
+
+        let found_p1 = memo
+            .find_progress(&key, &p1)
+            .expect("P1 must still find its admissible winner A");
+        assert_eq!(found_p1.selected, tile_a);
+        assert!(found_p1.is_complete(&p1));
+
+        let found_p3 = memo
+            .find_progress(&key, &p3)
+            .expect("P3 must find its winner C with transitive coverage");
+        assert_eq!(found_p3.selected, tile_c);
+        assert!(found_p3.is_complete(&p3));
     }
 }
 
@@ -2992,8 +3257,8 @@ mod tests {
         assert!(first.races[0].complete);
         assert!(first.class_limit_reached);
         assert_eq!(memo.len(), 1);
-        let (_, progress) = memo.progress.iter().next().unwrap();
-        assert_eq!(progress.selected, first.races[0].selected);
+        let (_, entries) = memo.progress.iter().next().unwrap();
+        assert_eq!(entries[0].selected, first.races[0].selected);
         assert!(create().kernel_probes_pending(&options, Some(&memo)));
 
         // The decided class is reused without a slot; the other one races.
@@ -3063,11 +3328,11 @@ mod tests {
             .unwrap();
         let mut memo = KernelMemo::default();
         memo.bind(&gpu, &options, false);
-        memo.progress.insert(
+        memo.record_progress(
             memo_key(&session.plan, tail),
             KernelProgress {
                 selected,
-                next_candidate: tail.challengers.len(),
+                decided: tail.challengers.clone(),
             },
         );
 
@@ -3138,11 +3403,11 @@ mod tests {
         assert_ne!(selected, class.initial);
         let mut memo = KernelMemo::default();
         memo.bind(&gpu, &tuning, false);
-        memo.progress.insert(
+        memo.record_progress(
             memo_key(&ordinary.plan, class),
             KernelProgress {
                 selected,
-                next_candidate: class.challengers.len(),
+                decided: class.challengers.clone(),
             },
         );
         let memo = Arc::new(Mutex::new(memo));
@@ -3333,10 +3598,10 @@ mod tests {
         drop(fresh);
         // Keep an actual qualified prefix, without timing-dependent sleeps or
         // an assumed GPU speed to interrupt the first search at this point.
-        *memo.progress.values_mut().next().unwrap() = KernelProgress {
+        *memo.progress.values_mut().next().unwrap() = vec![KernelProgress {
             selected: first.outcomes[0].selected,
-            next_candidate: 1,
-        };
+            decided: vec![first.outcomes[0].candidate],
+        }];
         let mut session = create();
         assert!(session.kernel_probes_pending(&options, Some(&memo)));
         session.set_input("x", &[0.25; 33 * 17]);
@@ -3350,8 +3615,10 @@ mod tests {
                 Some(&mut memo),
             )
             .unwrap();
-        assert!(skipped.outcomes.is_empty() && skipped.reused_classes.is_empty());
-        assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
+        assert!(skipped.outcomes.is_empty());
+        let already_held = first.outcomes[0].selected == first.outcomes[0].initial;
+        assert_eq!(skipped.reused_classes.len(), usize::from(already_held));
+        assert_eq!(memo.progress.values().next().unwrap()[0].decided.len(), 1);
         let replayed = create()
             .tune_with_memo(
                 TuneOptions {
@@ -3364,7 +3631,7 @@ mod tests {
         assert!(replayed.outcomes.is_empty());
         assert_eq!(replayed.reused_classes.len(), 1);
         assert_eq!(replayed.reused_classes[0].1, first.outcomes[0].selected);
-        assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
+        assert_eq!(memo.progress.values().next().unwrap()[0].decided.len(), 1);
         assert!(session.kernel_probes_pending(&options, Some(&memo)));
         let resumed = session
             .tune_with_memo(options.clone(), Some(&mut memo))

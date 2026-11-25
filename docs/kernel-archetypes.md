@@ -20,21 +20,25 @@ Current boundary, still hand-written by design: GroupNorm (its epilogue needs pe
 
 ## Matmul
 
-Tiled matrix multiplication with:
+Tiled matrix multiplication (`src/codegen/`, `src/kernels/matmul.rs`) with:
 - **Epilogue fusion** (`MatMulEpilogue`) — fuse BiasAdd, ReLU, Silu, etc. into the store phase, eliminating a separate dispatch and an intermediate buffer write.
 - **Prologue support** (`MatMulPrologue`) — fuse normalization (e.g. RMSNorm scale) into the A-tile staging phase.
-- **K-split GEMV** — for batch-1 LM decode (M=1), switch to a GEMV kernel that splits the K dimension across threads with vec4-coalesced reads. ~2.5x faster than the tiled path for single-token generation.
-- **Cooperative matrix** — when `VK_KHR_cooperative_matrix` is available, stages tiles through shared memory in f16 and dispatches hardware tensor-core multiply-accumulate. Includes vec4 staging for both normal and transposed layouts.
+- **K-split GEMV** — for batch-1 LM decode (M=1), switch to a GEMV kernel that splits the K dimension across threads with vec4-coalesced reads, quantized weight decoding (`Q4_0`, `Q8`, `Q3_K`..`Q6_K`), optional integer dot-product activations (`dot4I8Packed`), and optional folded input RMSNorm.
+- **Cooperative matrix** — when `VK_KHR_cooperative_matrix` or Metal simdgroup matrices are available, dispatches hardware tensor-core multiply-accumulate across typed F16/BF16/F32 matrix shapes, subgroup-tiled and workgroup-tiled schedules, split-K, and direct/staged loads.
+
+## Convolution
+
+Implicit-GEMM 2D convolution (`src/kernels/conv.rs`) lowered across scalar tiles, subgroup-tiled cooperative kernels (`src/codegen/workgroup.rs`), legacy cooperative convolutions, BF16 paths, depthwise conv (`conv2d_dw`), and Winograd 3×3 transform + batched matmul (`src/shaders/winograd_*.wgsl`).
 
 ## Attention
 
-Unified forward attention with online softmax, BKV=8 KV-tiling, and runtime mask selection:
+Generated forward and backward FlashAttention kernels (`src/codegen/attention.rs`, `src/kernels/attention_grad.rs`) with online softmax, configurable KV-tiling, register-blocked and cooperative/product-matrix variants, and runtime mask selection:
 - **Causal** — `kv_seq == 0` triggers `kv_len = pos + 1` at runtime.
 - **Full** — `kv_seq == q_seq` for bidirectional attention (Whisper encoder, ViT).
 - **Cross** — `kv_seq` set to actual KV sequence length.
 - **Sliding window** — `window_size > 0` limits how far back each position attends.
 
-Parameterized by `head_dim` (determines workgroup size). A single generated shader handles all 6 forward attention variants (CausalAttention, CausalAttentionRoPE, FullAttention, CrossAttention, MultiHeadAttn, SlidingWindowAttention). Backward pass uses separate hand-written shaders with fused GradKV dispatch.
+Decode and specialized attention paths (cached KV attention, split-K cached block attention, chunked relative attention, biased attention) live in dedicated WGSL shaders in `src/shaders/` alongside the remaining hand-written layout/norm/optimizer kernels.
 
 ## Cost Model
 

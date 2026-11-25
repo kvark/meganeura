@@ -1,5 +1,10 @@
 # Unreleased
 
+- `KernelMemo` revision moves to 19: decisions are now keyed by `(class, initial)`
+  with an order-independent set of decided challengers (retaining separate entries
+  when distinct challenger subsets disallow a prior winner) rather than by the
+  ordered candidate list. Pre-19 memo files are cleanly discarded on load.
+
 - Checked cooperative dense products and convolutions also support native
   8x8x8 F32, F16/F32 and BF16/F32 tiles on Metal. Auto search can qualify these
   reduced multiplication paths on Apple GPUs with F32 storage and outputs.
