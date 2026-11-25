@@ -14,7 +14,9 @@
   depends on `oxionnx-core` and `oxionnx-proto`, which change to the Business
   Source License from 0.1.8. Initializers become parameters in file order,
   external data is read by offset instead of loading the whole file per
-  tensor, and model-local functions are not inlined.
+  tensor, and model-local functions are not inlined. An ONNX `Gelu` node
+  imports as the exact form unless its `approximate` attribute is `tanh`;
+  it was always the tanh form before.
 
 - Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
 

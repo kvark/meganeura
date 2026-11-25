@@ -163,7 +163,14 @@ fn translate_node(
         "Abs" => unary_op(graph, node, name_to_id, shapes, Op::Abs)?,
         "Log" => unary_op(graph, node, name_to_id, shapes, Op::Log)?,
         "Reciprocal" => unary_op(graph, node, name_to_id, shapes, Op::Recip)?,
-        "Gelu" => unary_op(graph, node, name_to_id, shapes, Op::Gelu)?,
+        // Exact unless the node asks for the tanh approximation.
+        "Gelu" => {
+            let op = match attrs.s("approximate") {
+                Some("tanh") => Op::Gelu,
+                _ => Op::GeluErf,
+            };
+            unary_op(graph, node, name_to_id, shapes, op)?
+        }
         "Silu" | "SiLU" => unary_op(graph, node, name_to_id, shapes, Op::Silu)?,
 
         // Elementary math, as exporters write decomposed norms and
@@ -1579,6 +1586,29 @@ mod tests {
 
         // Should have exactly 1 output
         assert_eq!(onnx_model.graph.outputs().len(), 1);
+    }
+
+    #[test]
+    fn gelu_follows_its_approximation() {
+        for (approximate, exact) in [(None, true), (Some("none"), true), (Some("tanh"), false)] {
+            let mut node = build_node_proto("Gelu", &["x"], &["y"], &[], &[]);
+            if let Some(value) = approximate {
+                let mut attr = pb_field_bytes(1, b"approximate");
+                attr.extend(pb_field_bytes(4, value.as_bytes()));
+                attr.extend(pb_field_varint(20, 3)); // attr_type = STRING
+                node.extend(pb_field_bytes(5, &attr));
+            }
+            let bytes = build_onnx_model(
+                &[node],
+                &[],
+                &[build_value_info("x", &[2, 4])],
+                &[build_value_info("y", &[2, 4])],
+            );
+            let graph = load_onnx_bytes(&bytes, None).unwrap().graph;
+            let op = &graph.node(graph.outputs()[0]).op;
+            assert_eq!(matches!(*op, Op::GeluErf), exact, "{approximate:?}: {op:?}");
+            assert_eq!(matches!(*op, Op::Gelu), !exact, "{approximate:?}: {op:?}");
+        }
     }
 
     #[test]

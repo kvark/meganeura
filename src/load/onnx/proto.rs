@@ -80,6 +80,11 @@ impl Attributes {
         self.get(name, INT).map_or(default, |a| a.i.unwrap_or(0))
     }
 
+    pub fn s(&self, name: &str) -> Option<&str> {
+        self.get(name, STRING)
+            .map(|a| a.s.as_deref().unwrap_or_default())
+    }
+
     pub fn ints(&self, name: &str) -> &[i64] {
         self.get(name, INTS).map_or(&[], |a| &a.ints)
     }
