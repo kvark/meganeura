@@ -346,8 +346,8 @@ impl ExecutionPlan {
         r.params[2] = u32::from(serial);
         r.params[3] = 0;
         r.workgroups = [groups, 1, 1];
-        let size = &mut self.buffers[partial.0 as usize];
-        *size = (*size).max(bytes);
+        let new_size = self.buffers[partial.0 as usize].max(bytes);
+        self.set_buffer_bytes(partial, new_size);
         true
     }
 

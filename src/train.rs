@@ -336,13 +336,21 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         Mode::Training => 0,
         Mode::Inference => 1,
     };
+    let info = gpu.device_information();
+    let target_fp = cache::BuildTargetFingerprint {
+        device_name: &info.device_name,
+        driver_name: &info.driver_name,
+        driver_info: &info.driver_info,
+        subgroup_size: gpu.capabilities().subgroup_size,
+        coop_caps,
+        shared_memory_bytes,
+    };
     let build_hash = cache::hash_build_config(
         &options,
         &cfg.optimize,
         mode_tag,
         skip_full_optimize,
-        coop_caps,
-        shared_memory_bytes,
+        &target_fp,
     );
 
     if let Some(path) = cache_path {
@@ -429,7 +437,7 @@ fn compile_for_target(
 /// The plan [`build`] compiles for `forward_graph` under `cfg`, against
 /// the same target, without creating a session or reading a plan cache.
 /// Session construction then picks implementations (see
-/// `runtime::select_variants`), which this does not apply.
+/// `compile::lower::select_variants`), which this does not apply.
 pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::ExecutionPlan {
     let gpu = cfg.gpu.clone().unwrap_or_else(runtime::default_gpu_context);
     let mut options = cfg.options.clone();

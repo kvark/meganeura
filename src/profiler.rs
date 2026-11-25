@@ -338,7 +338,10 @@ pub struct ProfilePlan {
     pub forward_dispatch_count: usize,
     pub backward_dispatch_count: usize,
     pub barrier_group_count: usize,
+    /// Sum of plan buffer capacities before aliasing, including target padding.
     pub logical_buffer_bytes: usize,
+    /// Sum of unpadded logical tensor byte sizes before target tile padding.
+    pub unpadded_buffer_bytes: usize,
     pub allocated_buffer_bytes: usize,
     /// Resident graph/optimizer buffer requests, not driver allocation or peak.
     pub resident_buffer_bytes: usize,
@@ -808,6 +811,7 @@ fn capture_windows(
             backward_dispatch_count,
             barrier_group_count: session.num_groups(),
             logical_buffer_bytes: memory.total_buffer_bytes,
+            unpadded_buffer_bytes: session.plan().total_logical_buffer_bytes(),
             allocated_buffer_bytes: memory.allocated_buffer_bytes,
             resident_buffer_bytes: memory.total_allocated_bytes(),
             adam_state_bytes: memory.adam_state_bytes,

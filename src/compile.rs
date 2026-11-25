@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 mod bf16;
+pub(crate) mod lower;
 mod params;
 mod softplus;
 mod split_k;
+pub use lower::CoopPolicy;
 pub(crate) use split_k::{plan_k_split, split_target_workgroups};
 pub(crate) mod stages;
 pub(crate) use params::{
@@ -1467,7 +1469,14 @@ pub struct BufferRef(pub u32);
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     /// Buffer sizes in bytes, indexed by BufferRef.
+    /// Physical byte size for each logical buffer. Target lowering may grow
+    /// individual entries to satisfy cooperative tile-store alignment; see
+    /// [`Self::logical_buffers`] and [`Self::logical_buffer_bytes`].
     pub buffers: Vec<usize>,
+    /// Unpadded logical byte sizes captured before target lowering pads any
+    /// entry in [`Self::buffers`]. Empty when no buffer was padded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logical_buffers: Vec<usize>,
     /// Which buffers hold parameters (need initialization).
     pub param_buffers: Vec<(String, BufferRef)>,
     /// Logical parameter types, unaffected by runtime allocation padding.
@@ -1532,6 +1541,33 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    /// Unpadded logical byte size of `buffer`, unaffected by target cooperative
+    /// tile padding.
+    pub fn logical_buffer_bytes(&self, buffer: BufferRef) -> usize {
+        let idx = buffer.0 as usize;
+        self.logical_buffers
+            .get(idx)
+            .copied()
+            .unwrap_or(self.buffers[idx])
+    }
+
+    /// Sum of unpadded logical byte sizes across all plan buffers.
+    pub fn total_logical_buffer_bytes(&self) -> usize {
+        (0..self.buffers.len())
+            .map(|i| self.logical_buffer_bytes(BufferRef(i as u32)))
+            .sum()
+    }
+
+    /// Update both physical capacity and logical byte size of `buffer` (for
+    /// non-padding resizes such as storage narrowing or split-K partial sizing).
+    pub(crate) fn set_buffer_bytes(&mut self, buffer: BufferRef, bytes: usize) {
+        let idx = buffer.0 as usize;
+        self.buffers[idx] = bytes;
+        if let Some(logical) = self.logical_buffers.get_mut(idx) {
+            *logical = bytes;
+        }
+    }
+
     /// The dispatches the plan runs, independent of their order and buffer
     /// numbering: each one's shader, kernel, parameters, grid, operand
     /// counts and fused prologue, epilogue, norm, weight format and

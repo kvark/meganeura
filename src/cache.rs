@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 42 adds ExecutionPlan::logical_buffers and full target fingerprinting.
 // Version 41 adds subgroup-tiled Winograd and convolution grids, WorkgroupMatmulShape
 // subgroup_rows/prefetch, and ScalarMatmulShape vector_fragments.
 // Version 40 splits MaxPool2dGrad into a winner-index pass and a gather pass.
@@ -56,7 +57,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 41;
+const CACHE_FORMAT_VERSION: u32 = 42;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -80,12 +81,42 @@ pub fn save_plan(plan: &ExecutionPlan, forward_graph: &Graph, path: &Path) -> io
     save_plan_impl(plan, forward_graph, 0, path)
 }
 
+static NEXT_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolve symlinks (including dangling ones) so atomic rename updates the
+/// link target instead of replacing the symlink with a regular file.
+fn resolve_save_destination(path: &Path) -> io::Result<std::path::PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&cur)?;
+                cur = if target.is_absolute() {
+                    target
+                } else {
+                    cur.parent().map_or(target.clone(), |p| p.join(&target))
+                };
+            }
+            Ok(_) => return Ok(cur),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(cur),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "too many levels of symbolic links",
+    ))
+}
+
 fn save_plan_impl(
     plan: &ExecutionPlan,
     forward_graph: &Graph,
     build_hash: u64,
     path: &Path,
 ) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering;
+
     let cached = CachedPlan {
         format_version: CACHE_FORMAT_VERSION,
         graph_hash: hash_graph(forward_graph),
@@ -94,7 +125,53 @@ fn save_plan_impl(
     };
     let ron_str = ron::ser::to_string_pretty(&cached, ron::ser::PrettyConfig::default())
         .map_err(io::Error::other)?;
-    std::fs::write(path, ron_str)
+    let dest = resolve_save_destination(path)?;
+    let existing_perms = std::fs::metadata(&dest).ok().map(|m| m.permissions());
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = dest.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache path needs a file name")
+    })?;
+    // Keep the temporary beside the destination for an atomic rename, using
+    // `create_new(true)` so we never truncate a sibling file or another writer.
+    let (tmp, mut file) = loop {
+        let mut name = file_name.to_os_string();
+        name.push(format!(
+            ".{}-{}.partial",
+            std::process::id(),
+            NEXT_SAVE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let candidate = dest.with_file_name(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let write_result = (|| -> io::Result<()> {
+        if let Some(perms) = existing_perms {
+            file.set_permissions(perms)?;
+        }
+        file.write_all(ron_str.as_bytes())?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Load a previously cached execution plan from a RON file.
@@ -159,6 +236,17 @@ pub(crate) fn load_build_plan(
     load_plan_impl(forward_graph, build_hash, path)
 }
 
+/// Hardware and driver identity that governs cached plan reuse.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct BuildTargetFingerprint<'a> {
+    pub device_name: &'a str,
+    pub driver_name: &'a str,
+    pub driver_info: &'a str,
+    pub subgroup_size: u32,
+    pub coop_caps: CoopCaps,
+    pub shared_memory_bytes: u32,
+}
+
 /// Fingerprint every build input that can alter the execution plan.
 ///
 /// `mode_tag` is deliberately numeric to keep this module independent of the
@@ -168,8 +256,7 @@ pub(crate) fn hash_build_config(
     optimize: &OptimizeConfig,
     mode_tag: u8,
     skip_full_optimize: bool,
-    coop_caps: CoopCaps,
-    shared_memory_bytes: u32,
+    target: &BuildTargetFingerprint<'_>,
 ) -> u64 {
     #[derive(Serialize)]
     struct BuildFingerprint<'a> {
@@ -178,8 +265,7 @@ pub(crate) fn hash_build_config(
         optimize: &'a OptimizeConfig,
         mode_tag: u8,
         skip_full_optimize: bool,
-        coop_caps: CoopCaps,
-        shared_memory_bytes: u32,
+        target: &'a BuildTargetFingerprint<'a>,
     }
 
     let fingerprint = BuildFingerprint {
@@ -188,8 +274,7 @@ pub(crate) fn hash_build_config(
         optimize,
         mode_tag,
         skip_full_optimize,
-        coop_caps,
-        shared_memory_bytes,
+        target,
         // Flash coop flags and EPT caps live in `options`, hashed above.
     };
     hash_serializable(&fingerprint)
@@ -434,18 +519,74 @@ mod tests {
     fn test_build_hash_includes_mode_options_and_target() {
         let defaults = CompileOptions::default();
         let optimize = OptimizeConfig::default();
-        let base = hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default(), 49_152);
+        let base_target = BuildTargetFingerprint {
+            device_name: "TestGPU",
+            driver_name: "Mesa",
+            driver_info: "26.0",
+            subgroup_size: 32,
+            coop_caps: CoopCaps::default(),
+            shared_memory_bytes: 49_152,
+        };
+        let base = hash_build_config(&defaults, &optimize, 0, false, &base_target);
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 1, false, CoopCaps::default(), 49_152),
+            hash_build_config(&defaults, &optimize, 1, false, &base_target),
         );
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 0, true, CoopCaps::default(), 49_152),
+            hash_build_config(&defaults, &optimize, 0, true, &base_target),
         );
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default(), 65_536),
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    shared_memory_bytes: 65_536,
+                    ..base_target
+                },
+            ),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    device_name: "OtherGPU",
+                    ..base_target
+                },
+            ),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    driver_info: "26.1",
+                    ..base_target
+                },
+            ),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(
+                &defaults,
+                &optimize,
+                0,
+                false,
+                &BuildTargetFingerprint {
+                    subgroup_size: 64,
+                    ..base_target
+                },
+            ),
         );
         assert_ne!(
             base,
@@ -457,8 +598,7 @@ mod tests {
                 &optimize,
                 0,
                 false,
-                CoopCaps::default(),
-                49_152,
+                &base_target,
             ),
         );
         assert_ne!(
@@ -468,12 +608,14 @@ mod tests {
                 &optimize,
                 0,
                 false,
-                CoopCaps {
-                    f16_tile: 16,
-                    f32_tile: 0,
-                    f16_attention_rows: 0,
+                &BuildTargetFingerprint {
+                    coop_caps: CoopCaps {
+                        f16_tile: 16,
+                        f32_tile: 0,
+                        f16_attention_rows: 0,
+                    },
+                    ..base_target
                 },
-                49_152,
             ),
         );
     }
@@ -487,9 +629,11 @@ mod tests {
         graph.set_outputs(vec![x]);
         let options = CompileOptions::default();
         let defaults = OptimizeConfig::default();
-        let hash = |config: &OptimizeConfig| {
-            hash_build_config(&options, config, 1, false, CoopCaps::default(), 49_152)
+        let target = BuildTargetFingerprint {
+            shared_memory_bytes: 49_152,
+            ..BuildTargetFingerprint::default()
         };
+        let hash = |config: &OptimizeConfig| hash_build_config(&options, config, 1, false, &target);
         let plan = compile::compile(&graph);
         let path = std::env::temp_dir().join(format!(
             "meganeura_test_rewrite_cache_{}.ron",
@@ -640,5 +784,61 @@ mod cache_format_tests {
         std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
         assert!(load_plan(&graph, &path).unwrap().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn save_plan_does_not_clobber_preexisting_sibling_files() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[4]);
+        let y = graph.relu(x);
+        graph.set_outputs(vec![y]);
+        let plan = compile::compile(&graph);
+
+        let dir =
+            std::env::temp_dir().join(format!("meganeura-cache-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.ron");
+        // Pre-populate several upcoming candidate temp file names so even if
+        // another test advances `NEXT_SAVE` concurrently, `create_new(true)`
+        // hits a collision and skips over existing files without truncating.
+        let base = NEXT_SAVE.load(std::sync::atomic::Ordering::Relaxed);
+        let colliders: Vec<_> = (base..base + 16)
+            .map(|n| dir.join(format!("plan.ron.{}-{n}.partial", std::process::id())))
+            .collect();
+        for collider in &colliders {
+            std::fs::write(collider, b"keep-partial-sibling").unwrap();
+        }
+
+        save_plan(&plan, &graph, &path).unwrap();
+        for collider in &colliders {
+            assert_eq!(std::fs::read(collider).unwrap(), b"keep-partial-sibling");
+        }
+        let restored = load_plan(&graph, &path).unwrap().unwrap();
+        assert_eq!(restored.dispatches, plan.dispatches);
+
+        #[cfg(unix)]
+        {
+            let target_dir = dir.join("shared");
+            let target = target_dir.join("target.ron");
+            let link = dir.join("dangling.ron");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            save_plan(&plan, &graph, &link).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "saving through a dangling symlink must preserve the symlink"
+            );
+            assert!(
+                target.exists(),
+                "target file must be created through symlink"
+            );
+            let restored = load_plan(&graph, &link).unwrap().unwrap();
+            assert_eq!(restored.dispatches, plan.dispatches);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

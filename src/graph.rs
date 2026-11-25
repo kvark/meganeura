@@ -900,6 +900,29 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// Remap any non-dataflow `NodeId` references stored directly inside an op
+    /// payload (currently `MultiHeadAttnGrad{Q,K,V}::fwd_node`). Every pass
+    /// that renumbers graph nodes must invoke this alongside remapping
+    /// `node.inputs`.
+    pub(crate) fn remap_node_ids(&mut self, mut map: impl FnMut(NodeId) -> NodeId) {
+        match *self {
+            Op::MultiHeadAttnGradQ {
+                ref mut fwd_node, ..
+            }
+            | Op::MultiHeadAttnGradK {
+                ref mut fwd_node, ..
+            }
+            | Op::MultiHeadAttnGradV {
+                ref mut fwd_node, ..
+            } => {
+                *fwd_node = map(*fwd_node);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Implementation chosen for a matrix op. Equality saturation treats these
 /// as the same tensor; measured search is what picks one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -1090,21 +1113,10 @@ impl Graph {
             let mut node = old_nodes[old_id]
                 .take()
                 .expect("toposort: active node was already moved");
-            match node.op {
-                Op::MultiHeadAttnGradQ {
-                    ref mut fwd_node, ..
-                }
-                | Op::MultiHeadAttnGradK {
-                    ref mut fwd_node, ..
-                }
-                | Op::MultiHeadAttnGradV {
-                    ref mut fwd_node, ..
-                } => {
-                    *fwd_node = old_to_new[*fwd_node as usize]
-                        .expect("toposort: attention gradient refers to removed forward node");
-                }
-                _ => {}
-            }
+            node.op.remap_node_ids(|fwd| {
+                old_to_new[fwd as usize]
+                    .expect("toposort: attention gradient refers to removed forward node")
+            });
             node.inputs = node
                 .inputs
                 .into_iter()

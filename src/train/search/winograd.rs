@@ -143,7 +143,8 @@ fn fill_scoped(
         ]) {
             let p = &mut plan.dispatches[index];
             p.kernel = Kernel::WinogradTransform(storage);
-            plan.buffers[p.output_buffer.0 as usize] = (elements * 2) as usize;
+            let out = p.output_buffer;
+            plan.set_buffer_bytes(out, (elements * 2) as usize);
         }
         let d = &mut plan.dispatches[i];
         d.kernel = Kernel::WinogradMatmul { storage, tile };

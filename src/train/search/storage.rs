@@ -134,7 +134,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             };
             types.output = dtype;
         }
-        plan.buffers[source.0 as usize] = bytes / 2;
+        plan.set_buffer_bytes(source, bytes / 2);
         conversions.insert((source, dtype));
     }
     for d in &mut plan.dispatches {
