@@ -179,7 +179,12 @@ fn vision_classifiers() {
 
 #[test]
 fn onnx_exports() {
-    for name in ["bert_layer", "llama_layer", "llama_gqa_dynamic_layer"] {
+    for name in [
+        "bert_layer",
+        "llama_layer",
+        "llama_gqa_dynamic_layer",
+        "resnet_block",
+    ] {
         let bytes = crate::onnx_exports::fixture(&format!("{name}.onnx"));
         let model = meganeura::load_onnx_bytes(bytes, None).unwrap();
         assert_parity(name, &model.graph, INFERENCE);

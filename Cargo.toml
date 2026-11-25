@@ -83,8 +83,6 @@ log = "0.4"
 flate2 = "1"
 safetensors = "0.4"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
-oxionnx-core = "0.1"
-oxionnx-proto = "0.1"
 half = "2"
 memmap2 = { version = "0.9.11", optional = true }
 tracing = "0.1"

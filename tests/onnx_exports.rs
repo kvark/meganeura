@@ -1,4 +1,5 @@
-//! Transformer layers in the form PyTorch's exporter writes, end to end.
+//! Transformer layers and a ResNet block in the form PyTorch's exporter
+//! writes, end to end.
 //!
 //! `tests/fixtures/onnx/generate.py` authors the models node by node in
 //! that form (they are not exporter output) and computes their expected
@@ -28,6 +29,9 @@ pub(super) fn fixture(name: &str) -> &'static [u8] {
         "llama_gqa_dynamic_layer.onnx",
         "llama_gqa_dynamic_layer.input.bin",
         "llama_gqa_dynamic_layer.expected.bin",
+        "resnet_block.onnx",
+        "resnet_block.input.bin",
+        "resnet_block.expected.bin",
     )
 }
 
@@ -40,8 +44,9 @@ fn floats(name: &str) -> Vec<f32> {
         .collect()
 }
 
-/// Run the export and return the recognized, optimized graph's ops.
-fn run(name: &str) -> Vec<Op> {
+/// Run the export on its `input` and return the recognized, optimized
+/// graph's ops.
+fn run(name: &str, input: &str) -> Vec<Op> {
     let model = load_onnx_bytes(fixture(&format!("{name}.onnx")), None)
         .unwrap_or_else(|e| panic!("{name}: import failed: {e}"));
     let mut config = SessionConfig::from_env();
@@ -51,7 +56,7 @@ fn run(name: &str) -> Vec<Op> {
     for (param, data) in &model.weights {
         session.set_parameter(param, data);
     }
-    session.set_input("hidden_states", &floats(&format!("{name}.input.bin")));
+    session.set_input(input, &floats(&format!("{name}.input.bin")));
     session.step();
     session.wait();
     let expected = floats(&format!("{name}.expected.bin"));
@@ -72,14 +77,14 @@ fn count(ops: &[Op], matches: impl Fn(&Op) -> bool) -> usize {
 
 #[test]
 fn bert_layer() {
-    let ops = run("bert_layer");
+    let ops = run("bert_layer", "hidden_states");
     assert_eq!(count(&ops, |op| matches!(op, Op::LayerNorm { .. })), 2);
     assert_eq!(count(&ops, |op| matches!(op, Op::Softmax)), 1);
 }
 
 #[test]
 fn llama_layer() {
-    let ops = run("llama_layer");
+    let ops = run("llama_layer", "hidden_states");
     assert_eq!(count(&ops, |op| matches!(op, Op::RmsNorm { .. })), 2);
     assert_eq!(count(&ops, |op| matches!(op, Op::Softmax)), 1);
     assert_eq!(
@@ -90,9 +95,15 @@ fn llama_layer() {
 
 #[test]
 fn llama_gqa_dynamic_layer() {
-    let ops = run("llama_gqa_dynamic_layer");
+    let ops = run("llama_gqa_dynamic_layer", "hidden_states");
     assert_eq!(count(&ops, |op| matches!(op, Op::RmsNorm { .. })), 2);
     assert_eq!(count(&ops, |op| matches!(op, Op::Softmax)), 1);
     // Shape arithmetic is folded at import: nothing on the GPU computes it.
     assert_eq!(count(&ops, |op| matches!(op, Op::Constant { .. })), 0);
+}
+
+#[test]
+fn resnet_block() {
+    let ops = run("resnet_block", "pixel_values");
+    assert_eq!(count(&ops, |op| matches!(op, Op::Conv2d { .. })), 4);
 }
