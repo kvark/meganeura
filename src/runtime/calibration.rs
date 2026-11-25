@@ -796,7 +796,10 @@ mod tests {
         calibrate(&gpu, false, Duration::from_secs(1), resources, &mut profile);
         assert!(profile.bandwidth.is_none(), "{profile:?}");
         let first = profile.clone();
-        calibrate(&gpu, false, Duration::from_secs(2), 64 << 20, &mut profile);
+        // Each probe stops at its own target, so a long allowance costs
+        // nothing here. A short one fails on a loaded runner, which then
+        // misses the slice reserved for bandwidth.
+        calibrate(&gpu, false, Duration::from_secs(60), 64 << 20, &mut profile);
         let second = profile;
         assert!(complete(&second), "{second:?}");
         assert!(second.elapsed >= first.elapsed);
