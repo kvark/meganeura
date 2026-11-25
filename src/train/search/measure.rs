@@ -1221,17 +1221,18 @@ mod tests {
             ..Default::default()
         };
         // Keep cold shader compilation outside the deadline test.
+        // `SHARED_PIPELINES` holds weak references, so this session must stay
+        // alive across all cases to keep the compiled pipeline resident.
         let mut warm = Session::with_context_opts(plan.clone(), gpu.clone(), runtime.clone());
         warm.step();
         warm.wait();
-        drop(warm);
-        // Far longer than one warm trial of this matmul, so only the
-        // challenger's sleep can exhaust it. The "program" case runs the
-        // baseline trial alone; slow runners (coverage builds on lavapipe)
-        // stretch the deadline to four times its duration.
-        let mut deadline = Duration::from_millis(500);
+        // Far longer than one warm trial of this matmul (even under CI GPU
+        // contention where Metal compile+qualify can take ~500 ms), so only
+        // the challenger's sleep can exhaust it. Earlier cases also stretch
+        // the deadline to four times any observed baseline trial duration for
+        // slower runners (coverage builds on lavapipe).
+        let mut deadline = Duration::from_secs(2);
         for case in ["program", "memory", "qualification", "deadline"] {
-            let started = std::time::Instant::now();
             let initialized = std::cell::Cell::new(0);
             let mut checks = 0;
             let mut untuned = Vec::new();
@@ -1299,11 +1300,13 @@ mod tests {
             assert!(report.trials[0].outcome.qualified);
             assert!(report.trials[0].kernel_tuning.is_none());
             assert_eq!(session.plan().dispatches, untuned, "{case}");
+            if case != "deadline" {
+                deadline = deadline.max(report.trials[0].outcome.elapsed * 4);
+            }
             match case {
                 "program" => {
                     assert_eq!(report.trials.len(), 1);
                     assert!(report.truncated);
-                    deadline = deadline.max(started.elapsed() * 4);
                 }
                 "memory" => {
                     assert_eq!(initialized.get(), 1);
@@ -1321,7 +1324,19 @@ mod tests {
                     assert!(!report.final_qualification_time.is_zero());
                 }
                 "deadline" => {
-                    assert_eq!(report.trials.len(), 2, "deadline {deadline:?}");
+                    let t0 = &report.trials[0];
+                    assert_eq!(
+                        report.trials.len(),
+                        2,
+                        "deadline {deadline:?}, search {:?}, untuned trial {:?} \
+                         (construct {:?}, init {:?}, copy {:?}, qualify {:?})",
+                        report.elapsed,
+                        t0.outcome.elapsed,
+                        t0.construction_time,
+                        t0.initialization_time,
+                        t0.state_copy_time,
+                        t0.qualification_time,
+                    );
                     assert_eq!(report.trials[1].outcome.decision, TuneDecision::TimeBudget);
                     assert!(report.trials[1].outcome.baseline_ms.is_empty());
                     assert!(report.truncated);
@@ -1337,6 +1352,7 @@ mod tests {
                     .all(|&x| (x - 0.53125).abs() < 1e-5)
             );
         }
+        drop(warm);
     }
 
     /// Identical programs never replace the first, so only the stop rules end
