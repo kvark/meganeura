@@ -244,3 +244,24 @@ fn construction_donates_a_whole_training_arena() {
         assert_eq!(values, expected, "{name}");
     }
 }
+
+/// Measured construction builds private candidates and so cannot honour a
+/// donor. It used to accept one and return a session that shared nothing.
+#[test]
+fn measured_construction_refuses_a_donor() {
+    let mut donor = meganeura::build(&graph(2), crate::support::gpu::inference_config()).0;
+    let mut config = crate::support::gpu::inference_config();
+    config.share_parameters_from = Some(&mut donor);
+    let result = meganeura::train::build_measured(
+        &graph(2),
+        config,
+        meganeura::train::BuildSearchOptions {
+            max_programs: 1,
+            ..Default::default()
+        },
+        |_, _| Ok(()),
+        |_| Ok(()),
+    );
+    let error = result.err().expect("a donor must be refused");
+    assert!(error.contains("share_parameters_from"), "{error}");
+}

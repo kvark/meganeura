@@ -151,7 +151,8 @@ pub struct BuildSearchReport {
 /// result keeps its initialized state and its last qualified outputs.
 ///
 /// `options` bound graphs, programs, plan bytes and a soft total deadline, and
-/// `options.tuning` replaces `cfg.tune`. The build-plan cache is unsupported.
+/// `options.tuning` replaces `cfg.tune`. The build-plan cache is unsupported,
+/// and so is `cfg.share_parameters_from`: every candidate owns its state.
 /// Inputs stay resident; [`build_measured_with_inputs`] uploads them each step.
 pub fn build_measured(
     forward_graph: &Graph,
@@ -190,6 +191,13 @@ pub fn build_measured_with_inputs(
     let _span = tracing::info_span!("build_measured").entered();
     if cfg.cache.is_some() {
         return Err("measured construction does not use the ordinary build-plan cache".into());
+    }
+    if cfg.share_parameters_from.is_some() {
+        return Err(
+            "measured construction gives every candidate private state, so it cannot honour \
+             share_parameters_from; share parameters with Session::share_parameter_from afterwards"
+                .into(),
+        );
     }
     if options.max_graphs == 0 || options.max_programs == 0 || options.max_time.is_zero() {
         return Err("measured construction needs positive graph, program and time bounds".into());

@@ -27,14 +27,14 @@
 //! Execution model: `eval` compiles the graph **without rewrites or
 //! dispatch fusion** (every node materializes, semantics are the direct
 //! per-op ones) into a debug session, runs a step, and reads the node's
-//! buffer. The session is cached and reused until the graph grows or an
-//! input changes; each rebuild recompiles only because the plan changed —
+//! buffer. The session is cached and reused until the graph or an input
+//! changes; each rebuild recompiles only because the plan changed —
 //! pipelines for repeated op shapes are cheap, but this is a development
 //! mode: expect whole-prefix re-execution per growth step, and use
 //! `build_session` for anything performance-sensitive.
 
 use crate::{
-    compile,
+    cache, compile,
     graph::{Graph, NodeId},
     runtime::{Session, SessionOptions, init_gpu_context},
 };
@@ -66,9 +66,9 @@ pub struct Eager {
     inputs: HashMap<String, Vec<f32>>,
     inputs_u32: HashMap<String, Vec<u32>>,
     params: HashMap<String, Vec<f32>>,
-    /// Cached session + the graph size it was compiled at. Invalidated
-    /// when the graph grows or bound data changes.
-    session: Option<(Session, usize)>,
+    /// Cached session and the fingerprint of the graph it was compiled
+    /// from. Any other graph, grown, edited or unrelated, gets a new one.
+    session: Option<(Session, u64)>,
     stepped: bool,
 }
 
@@ -112,7 +112,7 @@ impl Eager {
     }
 
     /// Evaluate `node` of `g` and return its value. Reuses the cached
-    /// session when the graph hasn't grown since the last call.
+    /// session when `g` is the graph the last call compiled.
     pub fn eval(&mut self, g: &Graph, node: NodeId) -> Tensor {
         let n_nodes = g.nodes().len();
         assert!(
@@ -120,12 +120,14 @@ impl Eager {
             "eval: node {node} not in graph ({n_nodes} nodes)"
         );
 
-        let rebuild = match self.session {
-            Some((_, built_at)) => built_at != n_nodes,
-            None => true,
-        };
-        if rebuild {
-            self.session = Some((self.build_session(g), n_nodes));
+        // The node count alone cannot tell two graphs of one size apart.
+        let fingerprint = cache::hash_graph(g);
+        if self
+            .session
+            .as_ref()
+            .is_none_or(|entry| entry.1 != fingerprint)
+        {
+            self.session = Some((self.build_session(g), fingerprint));
             self.stepped = false;
         }
         let session = &mut self.session.as_mut().expect("just built").0;

@@ -82,3 +82,21 @@ fn eval_dead_branch_and_rebind() {
     e.set_input("x", vec![1.0, -2.0, 3.0, -4.0]);
     assert_eq!(e.eval(&g, a).data, vec![1.0, 0.0, 3.0, 0.0]);
 }
+
+/// One evaluator serves any graph it is handed. A second graph with the
+/// same number of nodes used to be answered from the first one's session.
+#[test]
+fn eval_follows_the_graph_it_is_given() {
+    let mut e = Eager::with_context(crate::support::gpu::gpu());
+    e.set_input("x", vec![2.0]);
+
+    let mut negated = Graph::new();
+    let x = negated.input("x", &[1]);
+    let y = negated.neg(x);
+    assert_eq!(e.eval(&negated, y).data, vec![-2.0]);
+
+    let mut rectified = Graph::new();
+    let x = rectified.input("x", &[1]);
+    let y = rectified.relu(x);
+    assert_eq!(e.eval(&rectified, y).data, vec![2.0]);
+}

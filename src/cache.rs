@@ -294,7 +294,7 @@ pub(crate) fn hash_build_config(
 /// outputs, and derived-parameter transforms. The old cache hashed only op
 /// discriminants and shapes, allowing semantically different graphs to reuse
 /// an unsafe stale plan.
-fn hash_graph(graph: &Graph) -> u64 {
+pub(crate) fn hash_graph(graph: &Graph) -> u64 {
     #[derive(Serialize)]
     struct GraphFingerprint<'a> {
         nodes: &'a [crate::graph::Node],
