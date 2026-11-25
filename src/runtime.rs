@@ -967,15 +967,18 @@ enum Variant {
         bool,
         bool,
     ),
-    CoopWorkgroup(
-        ShaderEntry,
-        crate::codegen::WorkgroupMatmulShape,
-        crate::codegen::MatrixTypes,
+    CoopWorkgroup {
+        entry: ShaderEntry,
+        weight_format: crate::compile::WeightFormat,
+        shape: crate::codegen::WorkgroupMatmulShape,
+        types: crate::codegen::MatrixTypes,
         /// Guard global accesses to the final, incomplete row tile.
-        bool,
+        row_bounds: bool,
+        /// Guard global accesses to the final, incomplete column tile.
+        column_bounds: bool,
         /// Optional unary fused elementwise epilogue.
-        Option<crate::compile::MatMulEpilogue>,
-    ),
+        epilogue: Option<crate::compile::MatMulEpilogue>,
+    },
     CoopTiled(
         ShaderEntry,
         crate::codegen::CooperativeMatmulShape,
@@ -1097,7 +1100,7 @@ impl Variant {
             | Variant::Attention(ref e, _, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _, _, _)
-            | Variant::CoopWorkgroup(ref e, _, _, _, _)
+            | Variant::CoopWorkgroup { entry: ref e, .. }
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1131,10 +1134,28 @@ impl Variant {
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
             }
-            Variant::CoopWorkgroup(ref e, shape, types, row_bounds, ref epilogue) => {
-                let suffix = if row_bounds { "-row-bounds" } else { "" };
+            Variant::CoopWorkgroup {
+                entry: ref e,
+                weight_format,
+                shape,
+                types,
+                row_bounds,
+                column_bounds,
+                ref epilogue,
+            } => {
+                let weight = if weight_format.uses_reduced_storage() {
+                    format!("-{weight_format:?}")
+                } else {
+                    String::new()
+                };
+                let suffix = match (row_bounds, column_bounds) {
+                    (true, true) => "-row-col-bounds",
+                    (true, false) => "-row-bounds",
+                    (false, true) => "-col-bounds",
+                    (false, false) => "",
+                };
                 let epi = if epilogue.is_some() { "-epilogue" } else { "" };
-                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}{epi}")
+                format!("{e:?}:workgroup{weight}-{shape:?}-{types:?}{suffix}{epi}")
             }
             Variant::CoopTyped(ref e, types, staging) => {
                 use crate::codegen::MatrixTypes;
@@ -2372,28 +2393,59 @@ impl Pipelines {
                     gpu.capabilities().subgroup_size,
                 )
             }
-            Variant::CoopWorkgroup(_, shape, types, row_bounds, ref epilogue) => {
+            Variant::CoopWorkgroup {
+                weight_format,
+                shape,
+                types,
+                row_bounds,
+                column_bounds,
+                ref epilogue,
+                ..
+            } => {
                 let capabilities = gpu.capabilities();
-                if !dispatch.mnk().is_some_and(|(m, n, k)| {
-                    shape.supports_layout(&capabilities, types, Some(group), m, n, k)
-                }) {
-                    return Err("unsupported workgroup cooperative product".to_owned());
-                }
                 if !workgroup_matmul_epilogue_supported(shape, epilogue.as_ref()) {
                     return Err("unsupported epilogue on workgroup cooperative product".to_owned());
                 }
-                let (native, subgroup) =
-                    workgroup_matmul_shape_and_subgroup(shape, types, &capabilities)
-                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
-                crate::codegen::generate_workgroup_matmul_for_device(
-                    group,
-                    shape,
-                    types,
-                    native,
-                    subgroup,
-                    row_bounds,
-                    epilogue.as_ref(),
-                )
+                if weight_format.is_quantized() {
+                    if !dispatch.mnk().is_some_and(|(m, n, k)| {
+                        shape.supports_quantized(&capabilities, m, n, k, epilogue.is_some())
+                    }) {
+                        return Err(
+                            "unsupported quantized workgroup cooperative product".to_owned()
+                        );
+                    }
+                    let (native, subgroup) =
+                        crate::codegen::native_subgroup_shape(&capabilities, types.multiply)
+                            .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
+                    crate::codegen::generate_subgroup_quantized_matmul(
+                        group,
+                        weight_format,
+                        shape,
+                        native,
+                        subgroup,
+                        row_bounds,
+                        column_bounds,
+                        epilogue.as_ref(),
+                    )
+                } else {
+                    if !dispatch.mnk().is_some_and(|(m, n, k)| {
+                        shape.supports_layout(&capabilities, types, Some(group), m, n, k)
+                    }) {
+                        return Err("unsupported workgroup cooperative product".to_owned());
+                    }
+                    let (native, subgroup) =
+                        workgroup_matmul_shape_and_subgroup(shape, types, &capabilities)
+                            .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
+                    crate::codegen::generate_workgroup_matmul_for_device(
+                        group,
+                        shape,
+                        types,
+                        native,
+                        subgroup,
+                        row_bounds,
+                        epilogue.as_ref(),
+                    )
+                }
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
@@ -2782,13 +2834,19 @@ impl Pipelines {
             _ => {}
         }
         if let crate::compile::Kernel::CooperativeWorkgroup { shape, types, .. } = dispatch.kernel {
-            return Variant::CoopWorkgroup(
+            let (row_bounds, column_bounds) = dispatch
+                .mnk()
+                .map(|(m, n, _)| (shape.ragged_rows(m), !n.is_multiple_of(shape.columns)))
+                .unwrap_or((false, false));
+            return Variant::CoopWorkgroup {
                 entry,
+                weight_format: dispatch.weight_format,
                 shape,
-                types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
-                dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
-                dispatch.matmul_epilogue.clone(),
-            );
+                types: types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
+                row_bounds,
+                column_bounds,
+                epilogue: dispatch.matmul_epilogue.clone(),
+            };
         }
         if let crate::compile::Kernel::CooperativeTyped {
             types, specialize, ..
@@ -3935,6 +3993,10 @@ pub struct Session {
     /// Session policy/capabilities after the cooperative smoke test. Tuning
     /// must not re-enable a rejected or explicitly disabled implementation.
     coop_config: Option<crate::codegen::CoopConfig>,
+    /// Cooperative-matrix policy selected at session construction. Tuning uses
+    /// this to decide whether F16-staged quantized cooperative prefill tiles
+    /// may challenge the scalar path.
+    coop_policy: CoopPolicy,
     plan: ExecutionPlan,
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
@@ -4962,6 +5024,7 @@ impl Session {
             pipelines,
             blend_pipeline: None,
             coop_config,
+            coop_policy: opts.coop,
             plan,
             groups,
             preparation,

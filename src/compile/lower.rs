@@ -46,10 +46,14 @@ pub enum CoopPolicy {
     Disabled,
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
-    /// and can overflow or lose gradient range. Measured search also considers
-    /// device-qualified typed F16/BF16 candidates for eligible forward products,
-    /// AT/BT derivatives and pointwise convolution input gradients,
-    /// subject to the caller's whole-program accuracy and timing gates.
+    /// and can overflow (`|x| > 65504`) or lose gradient range. Kernel tuning
+    /// ([`crate::Session::tune_with`] / `MEGANEURA_TUNE=1`) also admits
+    /// subgroup-tiled F16-staged cooperative candidates for block-quantized
+    /// forward prefill products, while untuned sessions keep the exact-F32
+    /// scalar path. Measured search also considers device-qualified typed
+    /// F16/BF16 candidates for eligible forward products, AT/BT derivatives
+    /// and pointwise convolution input gradients, subject to the caller's
+    /// whole-program accuracy and timing gates.
     AllowF16,
 }
 
@@ -194,6 +198,53 @@ pub(crate) fn reset_workgroup_matmuls(plan: &mut ExecutionPlan) {
     }
 }
 
+/// Whether `plan` contains at least one block-quantized forward matmul that
+/// kernel tuning can evaluate with subgroup-tiled F16 cooperative candidates
+/// on `caps`. Checked before running the once-per-context F16 subnormal GPU
+/// qualification probe so decode-only GEMV sessions pay no probe cost.
+pub(crate) fn has_quantized_coop_candidate(
+    plan: &ExecutionPlan,
+    caps: &blade_graphics::Capabilities,
+) -> bool {
+    plan.dispatches
+        .iter()
+        .any(|d| is_quantized_coop_candidate(d, caps))
+}
+
+fn is_quantized_coop_candidate(dispatch: &Dispatch, caps: &blade_graphics::Capabilities) -> bool {
+    if !matches!(
+        dispatch.shader,
+        ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd
+    ) || !dispatch.weight_format.is_quantized()
+        || !matches!(
+            dispatch.kernel,
+            Kernel::Default | Kernel::SmallTile | Kernel::CooperativeWorkgroup { types: None, .. }
+        )
+        || dispatch.full_precision()
+        || dispatch.schedule_locked
+        || dispatch.horizontal_batch > 1
+        || dispatch.matmul_prologue.is_some()
+        || dispatch
+            .matmul_epilogue
+            .as_ref()
+            .is_some_and(|e| !e.inputs.is_empty())
+    {
+        return false;
+    }
+    let Some((m, n, k)) = dispatch.mnk() else {
+        return false;
+    };
+    m >= 16
+        && n >= 16
+        && crate::codegen::has_quantized_matmul_shape(
+            caps,
+            m,
+            n,
+            k,
+            dispatch.matmul_epilogue.is_some(),
+        )
+}
+
 /// Select an opt-in workgroup-cooperative matmul shape for eligible F16/BF16
 /// products when `coop_policy == CoopPolicy::AllowF16`.
 pub(crate) fn select_workgroup_matmuls(
@@ -205,6 +256,14 @@ pub(crate) fn select_workgroup_matmuls(
     let Some(shape) = workgroup_matmul.filter(|_| coop_policy == CoopPolicy::AllowF16) else {
         return;
     };
+    select_configured_workgroup_matmuls(plan, caps, shape);
+}
+
+fn select_configured_workgroup_matmuls(
+    plan: &mut ExecutionPlan,
+    caps: &blade_graphics::Capabilities,
+    shape: WorkgroupMatmulShape,
+) {
     for dispatch in &mut plan.dispatches {
         let (types, splits) = match dispatch.kernel {
             Kernel::CooperativeTyped { types, splits, .. } => (Some(types), splits),
@@ -690,6 +749,111 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d.kernel, Kernel::CooperativeWorkgroup { .. }))
         );
+    }
+
+    #[test]
+    fn quantized_prefill_is_tuner_candidate_only_and_resets_cleanly() {
+        let mut device = caps();
+        device.subgroup_size = 32;
+        device.cooperative_matrix.f16_f32_shapes = vec![[16, 16, 16]];
+
+        let q4_plan = |m: usize, k: usize, n: usize| {
+            let mut g = Graph::new();
+            let a = g.input("a", &[m, k]);
+            let b = g.parameter_q4("b", &[k, n]);
+            let y = g.matmul(a, b);
+            g.set_outputs(vec![y]);
+            crate::compile::compile(&g)
+        };
+
+        // Decode-only GEMV (`m = 1`) must not register as a quantized coop candidate.
+        let decode = q4_plan(1, 256, 512);
+        assert!(!has_quantized_coop_candidate(&decode, &device));
+
+        // Prefill shapes (aligned and ragged) are eligible tuner candidates,
+        // but untuned `select_workgroup_matmuls` never promotes them statically.
+        for (m, k, n) in [(64, 256, 512), (65, 512, 368), (65, 512, 68)] {
+            let mut p = q4_plan(m, k, n);
+            assert!(has_quantized_coop_candidate(&p, &device));
+            for policy in [
+                CoopPolicy::Auto,
+                CoopPolicy::AllowF16,
+                CoopPolicy::NativeF32,
+                CoopPolicy::Disabled,
+            ] {
+                select_workgroup_matmuls(&mut p, &device, None, policy);
+                assert!(
+                    p.dispatches
+                        .iter()
+                        .all(|d| !matches!(d.kernel, Kernel::CooperativeWorkgroup { .. })),
+                    "untuned {policy:?} must not statically promote quantized prefill"
+                );
+            }
+        }
+
+        // Full-precision or schedule-locked quantized matmuls are excluded.
+        let mut locked = q4_plan(64, 256, 512);
+        locked.dispatches[0].requires_full_precision = true;
+        assert!(!has_quantized_coop_candidate(&locked, &device));
+        locked.dispatches[0].requires_full_precision = false;
+        locked.dispatches[0].schedule_locked = true;
+        assert!(!has_quantized_coop_candidate(&locked, &device));
+
+        // `TuneClass` admits quantized CooperativeWorkgroup candidates only when
+        // `quantized_coop_f16` is enabled, and `reset_workgroup_matmuls` restores
+        // a tuned quantized dispatch back to the scalar default.
+        let mut p = q4_plan(64, 256, 512);
+        let mut class = crate::tune::TuneClass::from_dispatch(&p.dispatches[0], None)
+            .expect("quantized matmul should form a TuneClass");
+        class.binding_bytes = p.dispatches[0]
+            .input_buffers
+            .iter()
+            .chain(std::iter::once(&p.dispatches[0].output_buffer))
+            .map(|b| p.buffers[b.0 as usize])
+            .collect();
+        let without = class.challengers_for_device(
+            crate::tune::MatmulTile::Tile64,
+            None,
+            &[[16, 16, 16]],
+            32,
+            false,
+        );
+        assert!(
+            without
+                .iter()
+                .all(|t| !matches!(t, crate::tune::MatmulTile::CooperativeWorkgroup { .. })),
+            "without AllowF16 qualification, no quantized coop candidates may appear"
+        );
+        let with = class.challengers_for_device(
+            crate::tune::MatmulTile::Tile64,
+            None,
+            &[[16, 16, 16]],
+            32,
+            true,
+        );
+        let coop_tile = with
+            .iter()
+            .copied()
+            .find(|t| matches!(t, crate::tune::MatmulTile::CooperativeWorkgroup { .. }))
+            .expect("AllowF16 should admit quantized CooperativeWorkgroup candidates");
+        assert!(with.contains(&crate::tune::MatmulTile::Tile32));
+
+        coop_tile.apply(&mut p.dispatches[0], &class);
+        assert!(matches!(
+            p.dispatches[0].kernel,
+            Kernel::CooperativeWorkgroup { types: None, .. }
+        ));
+        assert_eq!(
+            crate::tune::TuneClass::from_dispatch(&p.dispatches[0], None).map(|mut c| {
+                c.binding_bytes = class.binding_bytes.clone();
+                c
+            }),
+            Some(class),
+            "TuneClass must stay invariant after installing a quantized coop winner"
+        );
+        reset_workgroup_matmuls(&mut p);
+        assert_eq!(p.dispatches[0].kernel, Kernel::Default);
+        assert_eq!(p.dispatches[0].workgroups, [8, 1, 1]);
     }
 
     #[test]
