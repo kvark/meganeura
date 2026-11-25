@@ -8,7 +8,8 @@
 use meganeura::reference::{Feeds, Rng, Tolerance, gpu, gradients};
 use meganeura::{Graph, NodeId};
 
-const DIMS: [usize; 5] = [1, 3, 4, 8, 17];
+/// Small extents, and the ones on either side of a 32- and a 64-wide tile.
+const DIMS: [usize; 9] = [1, 3, 4, 8, 17, 31, 33, 64, 65];
 
 struct Builder {
     g: Graph,
@@ -27,8 +28,11 @@ impl Builder {
         }
     }
 
+    /// The smaller of two draws, so most extents stay cheap and the ones
+    /// beside a 32- or 64-wide tile edge still turn up.
     fn dim(&mut self) -> usize {
-        DIMS[self.rng.below(DIMS.len() as u32) as usize]
+        let draw = |rng: &mut Rng| rng.below(DIMS.len() as u32);
+        DIMS[draw(&mut self.rng).min(draw(&mut self.rng)) as usize]
     }
 
     fn shape(&self, id: NodeId) -> Vec<usize> {
