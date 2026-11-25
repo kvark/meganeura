@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 47 copies a gradient that is a constant, or shared between
+// parameters, into a buffer of its own.
 // Version 46 pairs gradients with their parameters explicitly, which drops
 // the pair an untrained one-element parameter used to get.
 // Version 45 raises fused PointwiseDAG arity from 3 to 7 and adds ReductionKernel::preserve_tree_order.
@@ -62,7 +64,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 46;
+const CACHE_FORMAT_VERSION: u32 = 47;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

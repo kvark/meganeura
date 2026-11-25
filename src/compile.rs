@@ -1537,7 +1537,9 @@ pub struct ExecutionPlan {
     pub loss_buffer: Option<BufferRef>,
     /// All graph output buffers (for reading back multiple outputs).
     pub output_buffers: Vec<BufferRef>,
-    /// Parameter buffer → gradient buffer mapping (for SGD).
+    /// Parameter buffer → gradient buffer mapping (for SGD). A compiled
+    /// plan writes each gradient buffer on every step and gives it no other
+    /// role, so the update may scale it in place.
     pub param_grad_pairs: Vec<(BufferRef, BufferRef)>,
     /// LSE buffers allocated for MultiHeadAttn forward nodes: (node_id, buffer).
     pub lse_buffers: Vec<(NodeId, BufferRef)>,
@@ -1839,6 +1841,7 @@ impl ExecutionPlan {
     }
 
     fn finish(mut self, options: &CompileOptions) -> Self {
+        own_gradients(&mut self);
         if options.fuse_dispatches {
             fuse_epilogues(&mut self);
             fold_uniform_constants(&mut self);
@@ -2005,6 +2008,64 @@ fn compile_with_caps_policy(
     .into_plan();
     plan.attach_borrowed_constant_buffers(graph);
     plan.finish(options)
+}
+
+/// Give every trained parameter a gradient buffer that is its update's own.
+///
+/// Gradient clipping scales a gradient where it is stored, so that buffer
+/// must be written again on every step, belong to one parameter, and hold
+/// nothing anyone else reads after the step. A gradient that reaches its
+/// parameter through additions alone can instead be the constant that seeds
+/// the backward pass, or one buffer that several parameters share. Such a
+/// gradient is copied into a buffer of its own; every other gradient stays
+/// where its backward dispatch wrote it.
+fn own_gradients(plan: &mut ExecutionPlan) {
+    let written: HashSet<BufferRef> = plan
+        .dispatches
+        .iter()
+        .flat_map(|dispatch| {
+            dispatch
+                .extra_outputs
+                .iter()
+                .copied()
+                .chain([dispatch.output_buffer])
+        })
+        .collect();
+    let mut taken: HashSet<BufferRef> = plan.output_buffers.iter().copied().collect();
+    taken.extend(plan.loss_buffer);
+    taken.extend(plan.param_buffers.iter().map(|entry| entry.1));
+    taken.extend(plan.derived_params.iter().map(|entry| entry.0));
+    taken.extend(plan.input_buffers.iter().map(|entry| entry.1));
+    taken.extend(plan.constant_buffers.iter().map(|entry| entry.0));
+    taken.extend(plan.uniform_constants.iter().map(|entry| entry.0));
+    taken.extend(plan.lse_buffers.iter().map(|entry| entry.1));
+    for index in 0..plan.param_grad_pairs.len() {
+        let gradient = plan.param_grad_pairs[index].1;
+        if written.contains(&gradient) && taken.insert(gradient) {
+            continue;
+        }
+        let bytes = plan.buffers[gradient.0 as usize];
+        let owned = BufferRef(plan.buffers.len() as u32);
+        plan.buffers.push(bytes);
+        let len = (bytes / 4) as u32;
+        plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::Generated,
+            workgroups: [len.div_ceil(256), 1, 1],
+            input_buffers: vec![gradient],
+            output_buffer: owned,
+            params: vec![len, 0, 0, 0],
+            kernel: Kernel::Pointwise(PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0)],
+                output: 0,
+            }),
+            fusion_barrier: true,
+            is_derivative: true,
+            label: format!("GradientCopy[{len}x0]"),
+            ..Default::default()
+        });
+        plan.param_grad_pairs[index].1 = owned;
+    }
 }
 
 /// Fuse the table-gradient chain produced by

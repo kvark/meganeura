@@ -11,6 +11,15 @@
   output, a node that reads it and also depends on the result, or a second
   write to it.
 
+- Gradient clipping no longer changes values that are not one parameter's
+  own gradient. A gradient that reached its parameter through additions
+  alone could be the constant that seeds the backward pass, or a buffer
+  shared with another parameter. Clipping scaled it in place, so the
+  constant stayed scaled on every later step and a shared gradient could be
+  scaled once per parameter. Such gradients are now copied into buffers of
+  their own. Plans whose gradients were already exclusive are unchanged, and
+  the plan cache format moves to 47.
+
 - The ONNX importer reads models with its own protobuf decoder and no longer
   depends on `oxionnx-core` and `oxionnx-proto`, which change to the Business
   Source License from 0.1.8. Initializers become parameters in file order,
