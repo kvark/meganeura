@@ -166,8 +166,14 @@ fn translate_node(
         // Exact unless the node asks for the tanh approximation.
         "Gelu" => {
             let op = match attrs.s("approximate") {
+                None | Some("none") => Op::GeluErf,
                 Some("tanh") => Op::Gelu,
-                _ => Op::GeluErf,
+                Some(other) => {
+                    return Err(OnnxError::UnsupportedOp(format!(
+                        "Gelu '{}': approximate = {other:?}",
+                        node.name
+                    )));
+                }
             };
             unary_op(graph, node, name_to_id, shapes, op)?
         }
@@ -1693,7 +1699,12 @@ mod tests {
 
     #[test]
     fn gelu_follows_its_approximation() {
-        for (approximate, exact) in [(None, true), (Some("none"), true), (Some("tanh"), false)] {
+        for (approximate, exact) in [
+            (None, Some(true)),
+            (Some("none"), Some(true)),
+            (Some("tanh"), Some(false)),
+            (Some("fast"), None),
+        ] {
             let mut node = build_node_proto("Gelu", &["x"], &["y"], &[], &[]);
             if let Some(value) = approximate {
                 let mut attr = pb_field_bytes(1, b"approximate");
@@ -1707,6 +1718,14 @@ mod tests {
                 &[build_value_info("x", &[2, 4])],
                 &[build_value_info("y", &[2, 4])],
             );
+            let Some(exact) = exact else {
+                // An approximation this importer does not know is refused.
+                assert!(matches!(
+                    load_onnx_bytes(&bytes, None),
+                    Err(OnnxError::UnsupportedOp(_))
+                ));
+                continue;
+            };
             let graph = load_onnx_bytes(&bytes, None).unwrap().graph;
             let op = &graph.node(graph.outputs()[0]).op;
             assert_eq!(matches!(*op, Op::GeluErf), exact, "{approximate:?}: {op:?}");

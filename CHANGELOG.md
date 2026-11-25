@@ -10,13 +10,15 @@
   compile and names `Graph::materialize`: the replaced cache as a graph
   output, a node that reads it and also depends on the result, or a second
   write to it.
+
 - The ONNX importer reads models with its own protobuf decoder and no longer
   depends on `oxionnx-core` and `oxionnx-proto`, which change to the Business
   Source License from 0.1.8. Initializers become parameters in file order,
   external data is read by offset instead of loading the whole file per
   tensor, and model-local functions are not inlined. An ONNX `Gelu` node
   imports as the exact form unless its `approximate` attribute is `tanh`;
-  it was always the tanh form before.
+  it was always the tanh form before. Any other value of the attribute is
+  refused.
 
 - ONNX convolutional networks import and run. Every ResNet export used to
   panic in `Conv`, whose input and kernel kept their N-D shapes; `Conv`,
