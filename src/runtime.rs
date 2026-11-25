@@ -3685,9 +3685,6 @@ pub struct Session {
     /// rewritten when it changes, so a step recorded while an earlier one is
     /// in flight does not touch memory the GPU may be reading.
     optimizer_table: Vec<optimizer::Segment>,
-    /// Cached optimizer dispatch units for `(accumulating, units)`. Invalidated
-    /// whenever a buffer binding, LR multiplier, or accumulator changes.
-    cached_optimizer_units: Option<(bool, std::sync::Arc<[optimizer::Unit]>)>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
     /// this diagnostic does not require another dispatch or shader variant.
@@ -4734,7 +4731,6 @@ impl Session {
             optimizer_chunks,
             optimizer_segments: None,
             optimizer_table: Vec::new(),
-            cached_optimizer_units: None,
             adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
@@ -4964,7 +4960,6 @@ impl Session {
             self.invariants_cacheable = false;
         }
         self.buffers[index] = physical.handle.at(offset as u64);
-        self.cached_optimizer_units = None;
         let target = self
             .alias
             .rebind(index, self.plan.buffers[index], offset, device_local);
@@ -6993,14 +6988,12 @@ impl Session {
         } else {
             self.lr_multipliers.push((name_prefix.to_string(), mul));
         }
-        self.cached_optimizer_units = None;
     }
 
     /// Clear all per-parameter LR multipliers (returns all params to
     /// the base learning rate).
     pub fn clear_lr_multipliers(&mut self) {
         self.lr_multipliers.clear();
-        self.cached_optimizer_units = None;
     }
 
     /// Internal: longest-prefix-match lookup. Static helper so it can
@@ -7208,7 +7201,6 @@ impl Session {
             let mut device_bufs = Vec::new();
             let accumulators = optimizer::ChunkBuffers::new(self, "grad_accum", &mut device_bufs);
             self.grad_accum = Some(accumulators);
-            self.cached_optimizer_units = None;
             self.zero_optimizer_buffers(&device_bufs, "zero_grad_accum");
         }
         self.grad_accum_scale = Some(1.0 / micro_batches as f32);
