@@ -2045,6 +2045,7 @@ fn own_gradients(plan: &mut ExecutionPlan) {
             continue;
         }
         let bytes = plan.buffers[gradient.0 as usize];
+        debug_assert_eq!(bytes % 4, 0, "a parameter gradient is stored as f32");
         let owned = BufferRef(plan.buffers.len() as u32);
         plan.buffers.push(bytes);
         let len = (bytes / 4) as u32;
