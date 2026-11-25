@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 46 pairs gradients with their parameters explicitly, which drops
+// the pair an untrained one-element parameter used to get.
 // Version 45 raises fused PointwiseDAG arity from 3 to 7 and adds ReductionKernel::preserve_tree_order.
 // Version 44 adds the register-blocked attention kernel.
 // Version 43 adds ExecutionPlan::uniform_constants (Op::Fill).
@@ -60,7 +62,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 45;
+const CACHE_FORMAT_VERSION: u32 = 46;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -295,14 +297,14 @@ fn hash_graph(graph: &Graph) -> u64 {
     struct GraphFingerprint<'a> {
         nodes: &'a [crate::graph::Node],
         outputs: &'a [crate::graph::NodeId],
-        num_param_grad_outputs: usize,
+        param_grads: Vec<(crate::graph::NodeId, crate::graph::NodeId)>,
         derived_params: &'a [crate::graph::DerivedParam],
     }
 
     hash_serializable(&GraphFingerprint {
         nodes: graph.nodes(),
         outputs: graph.outputs(),
-        num_param_grad_outputs: graph.num_param_grad_outputs(),
+        param_grads: graph.param_grads().collect(),
         derived_params: &graph.derived_params,
     })
 }

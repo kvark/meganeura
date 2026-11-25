@@ -30,6 +30,15 @@
   padded windows are refused with an error. `Split` imports, with its sizes
   from an input, the `split` attribute, or `num_outputs`.
 
+- A one-element parameter that the loss does not reach, or that sits behind
+  `stop_gradient`, is no longer updated. Autodiff used to mark a missing
+  gradient with a scalar zero that the compiler recognized by its size, so
+  such a parameter received that zero as its gradient and decayed under
+  AdamW. `Graph::param_grads` now names the parameter of every gradient
+  output, and only parameters with a gradient have one.
+  `Graph::append_param_grads` replaces `append_param_grad_outputs`, and the
+  plan cache format moves to 46.
+
 - Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
 
 - `KernelMemo` revision moves to 19: decisions are now keyed by `(class, initial)`

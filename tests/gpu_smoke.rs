@@ -423,6 +423,45 @@ fn lr_multipliers_apply_to_sgd_update() {
     );
 }
 
+/// A parameter behind `stop_gradient` has no gradient, so the update leaves
+/// it alone, weight decay included, at any size. A parameter the loss does
+/// reach stays trained when its gradient is zero, and so still decays.
+#[test]
+fn frozen_parameters_are_left_out_of_the_update() {
+    for len in [1, 8] {
+        let mut g = Graph::new();
+        let trained = g.parameter("trained", &[len]);
+        let frozen = g.parameter("frozen", &[len]);
+        let idle = g.parameter("idle", &[len]);
+        let gate = g.input("gate", &[len]);
+        let detached = g.stop_gradient(frozen);
+        let gated = g.mul(idle, gate);
+        let sum = g.add(trained, detached);
+        let sum = g.add(sum, gated);
+        let loss = g.mean_all(sum);
+        g.set_outputs(vec![loss]);
+        let mut session = meganeura::build(&g, crate::support::gpu::config()).0;
+        for name in ["trained", "frozen", "idle"] {
+            session.set_parameter(name, &vec![2.0; len]);
+        }
+        session.set_input("gate", &vec![0.0; len]);
+        session.set_adam(0.1, 0.9, 0.999, 1e-8);
+        session.set_weight_decay(0.5);
+        session.step();
+        session.wait();
+
+        let mut frozen = vec![0.0; len];
+        session.read_param("frozen", &mut frozen);
+        assert_eq!(frozen, vec![2.0; len], "length {len}");
+        let mut idle = vec![0.0; len];
+        session.read_param("idle", &mut idle);
+        assert!(
+            idle.iter().all(|value| (value - 1.9).abs() < 1e-6),
+            "length {len}: {idle:?}"
+        );
+    }
+}
+
 #[test]
 fn full_precision_weight_gradient_preserves_tiny_values() {
     // This shape reaches the f16 cooperative-matrix promotion threshold on

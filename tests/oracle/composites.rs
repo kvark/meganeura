@@ -11,6 +11,7 @@
 use meganeura::graph::OpClass;
 use meganeura::reference::{Feeds, evaluate_outputs, gradients};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, OptimizeConfig, compile_plan};
+use std::collections::BTreeMap;
 
 /// The plan's dispatch inventory, and the digest of what it computes.
 fn signature(graph: &Graph, mode: Mode) -> (Vec<String>, u64) {
@@ -101,13 +102,18 @@ impl Case {
         if self.trainable {
             let primitive = param_grads(&decomposed, &self.feeds);
             let recognized = param_grads(&decomposed.recompose_for(Mode::Training), &self.feeds);
-            assert_eq!(primitive.len(), recognized.len(), "{what}: parameters");
-            for ((name, p), (_, r)) in primitive.iter().zip(&recognized) {
-                // A parameter without a gradient has a scalar zero.
-                let zero = |g: &[f64]| g.iter().all(|&v| v == 0.0);
-                if p.len() != r.len() && zero(p) && zero(r) {
+            for name in primitive.keys().chain(recognized.keys()) {
+                let (Some(p), Some(r)) = (primitive.get(name), recognized.get(name)) else {
+                    // One form can reach a parameter through an op that
+                    // ignores it while the other drops the path. The
+                    // gradient that exists must then be zero.
+                    let only = primitive.get(name).or(recognized.get(name)).unwrap();
+                    assert!(
+                        only.iter().all(|&v| v == 0.0),
+                        "{what}: gradient of {name} in one form only"
+                    );
                     continue;
-                }
+                };
                 assert_eq!(p.len(), r.len(), "{what}: gradient of {name}");
                 let scale = p.iter().fold(1.0f64, |m, v| m.max(v.abs()));
                 for (i, (a, b)) in p.iter().zip(r).enumerate() {
@@ -153,26 +159,18 @@ impl Case {
     }
 }
 
-/// The loss gradient of each parameter of `forward`, on the reference
-/// interpreter, by parameter name.
-fn param_grads(forward: &Graph, feeds: &Feeds) -> Vec<(String, Vec<f64>)> {
-    let names: Vec<String> = forward
-        .nodes()
-        .iter()
-        .filter_map(|node| match node.op {
-            meganeura::graph::Op::Parameter { ref name } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
+/// The loss gradient of each parameter of `forward` that has one, on the
+/// reference interpreter, by parameter name.
+fn param_grads(forward: &Graph, feeds: &Feeds) -> BTreeMap<String, Vec<f64>> {
     let diff = meganeura::autodiff::differentiate(forward);
     let out = evaluate_outputs(&diff, feeds).unwrap();
-    let mut grads: Vec<_> = names
-        .into_iter()
+    diff.param_grads()
         .zip(&out[forward.outputs().len()..])
-        .map(|(name, grad)| (name, grad.data.clone()))
-        .collect();
-    grads.sort_by(|a, b| a.0.cmp(&b.0));
-    grads
+        .map(|((param, _), grad)| match diff.node(param).op {
+            meganeura::graph::Op::Parameter { ref name } => (name.clone(), grad.data.clone()),
+            ref other => panic!("{other:?} has a gradient output"),
+        })
+        .collect()
 }
 
 fn check_all(cases: Vec<Case>) {
@@ -845,7 +843,7 @@ fn loss_gradients_stay_exact_in_training() {
         },
         &feeds,
     );
-    let (_, labels) = grads.iter().find(|(n, _)| n == "labels").unwrap();
+    let labels = &grads["labels"];
     for &g in labels {
         assert!((g - std::f64::consts::LN_2).abs() < 1e-7, "{labels:?}");
     }
@@ -862,6 +860,6 @@ fn loss_gradients_stay_exact_in_training() {
         },
         &feeds,
     );
-    let (_, pred) = grads.iter().find(|(n, _)| n == "pred").unwrap();
+    let pred = &grads["pred"];
     assert_eq!(pred, &vec![0.0]);
 }

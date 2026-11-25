@@ -905,59 +905,33 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // Outputs layout (from autodiff): [user_outputs..., param_grads...]
-        // Where `param_grads` is the last `num_param_grad_outputs()` entries
-        // (one per Parameter node, exactly aligned with param_buffers order).
-        // For inference (no autodiff), num_param_grad_outputs() == 0 and every
-        // output is user-facing.
+        // Outputs layout (from autodiff): [user_outputs..., param_grads...],
+        // where the trailing entries are the gradients `param_grads()` pairs
+        // with their parameters. For inference (no autodiff) there are none
+        // and every output is user-facing.
         let outputs = self.graph.outputs();
-        let num_grads = self.graph.num_param_grad_outputs();
-        let num_user = outputs.len() - num_grads;
 
         // Collect user-facing output buffers (accessible via read_output_by_index).
-        for &out_id in &outputs[..num_user] {
+        for &out_id in &outputs[..self.graph.num_user_outputs()] {
             self.plan.output_buffers.push(self.get_buffer(out_id));
         }
         if let Some(&loss_id) = outputs.first() {
             self.plan.loss_buffer = Some(self.get_buffer(loss_id));
         }
 
-        // Build param→grad pairs from the trailing grad outputs.
-        if num_grads > 0 {
-            let param_nodes: Vec<&Node> = self
-                .graph
-                .nodes()
-                .iter()
-                .filter(|node| matches!(node.op, Op::Parameter { .. }))
-                .collect();
+        // Only parameters the loss reaches are paired. The optimizer walks
+        // these pairs, so a frozen or unused parameter is never updated.
+        for (param, grad) in self.graph.param_grads() {
+            let (param_node, grad_node) = (self.graph.node(param), self.graph.node(grad));
             assert_eq!(
-                param_nodes.len(),
-                num_grads,
-                "autodiff must emit one grad output per Parameter",
+                grad_node.ty.num_elements(),
+                param_node.ty.num_elements(),
+                "the gradient of {:?} does not match its size",
+                param_node.op,
             );
-            for i in 0..num_grads {
-                let grad_node = self.graph.node(outputs[num_user + i]);
-                if grad_node.ty.num_elements() != param_nodes[i].ty.num_elements() {
-                    // Autodiff uses a scalar zero as the positional placeholder
-                    // for a parameter that receives no gradient (for example,
-                    // one behind StopGradient). Do not expose that sentinel as
-                    // a real gradient: optimizers iterate over the parameter's
-                    // full length and would otherwise read past the scalar.
-                    assert!(
-                        matches!(grad_node.op, Op::Constant { ref data } if data == &[0.0])
-                            || matches!(
-                                grad_node.op,
-                                Op::Fill { value }
-                                    if value == 0.0 && grad_node.ty.num_elements() == 1
-                            ),
-                        "parameter gradient shape mismatch without a zero placeholder",
-                    );
-                    continue;
-                }
-                let param_buf = self.plan.param_buffers[i].1;
-                let grad_buf = self.get_buffer(outputs[num_user + i]);
-                self.plan.param_grad_pairs.push((param_buf, grad_buf));
-            }
+            self.plan
+                .param_grad_pairs
+                .push((self.get_buffer(param), self.get_buffer(grad)));
         }
     }
 
