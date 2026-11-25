@@ -2746,6 +2746,10 @@ fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
         rows_per_workgroup,
         gather_elem: Vec::new(),
         input_row_repeats: Vec::new(),
+        // Preserve scalar tree reduction order so debug sessions
+        // (`fuse_dispatches=false`), prologue-fused RmsNorm, and
+        // `fuse_rmsnorm_into_add` (`rms_norm_add.wgsl`) match identically.
+        preserve_tree_order: true,
     }
 }
 

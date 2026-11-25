@@ -512,6 +512,7 @@ impl<'a> Compiler<'a> {
             rows_per_workgroup,
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
+            preserve_tree_order: false,
         };
         self.plan.dispatches.push(Dispatch {
             shader: ShaderEntry::Generated,
@@ -616,6 +617,7 @@ impl<'a> Compiler<'a> {
                 rows_per_workgroup: WORKGROUP_SIZE / lanes,
                 gather_elem: Vec::new(),
                 input_row_repeats: Vec::new(),
+                preserve_tree_order: false,
             }),
             ..Default::default()
         });
@@ -1516,6 +1518,7 @@ impl<'a> Compiler<'a> {
                     rows_per_workgroup: 256,
                     gather_elem: vec![],
                     input_row_repeats: vec![],
+                    preserve_tree_order: false,
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Generated,
@@ -1577,6 +1580,7 @@ impl<'a> Compiler<'a> {
                     rows_per_workgroup: 256,
                     gather_elem: vec![],
                     input_row_repeats: vec![],
+                    preserve_tree_order: false,
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Generated,
@@ -1618,6 +1622,7 @@ impl<'a> Compiler<'a> {
                     rows_per_workgroup: 256,
                     gather_elem: vec![],
                     input_row_repeats: vec![pairs, 1],
+                    preserve_tree_order: false,
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Generated,
@@ -1690,6 +1695,7 @@ impl<'a> Compiler<'a> {
                     rows_per_workgroup: 256,
                     gather_elem: vec![],
                     input_row_repeats: vec![1, pairs],
+                    preserve_tree_order: false,
                 };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Generated,
@@ -3387,6 +3393,7 @@ impl<'a> Compiler<'a> {
                     rows_per_workgroup: 1,
                     gather_elem: Vec::new(),
                     input_row_repeats: Vec::new(),
+                    preserve_tree_order: false,
                 };
                 self.plan.dispatches.push(Dispatch {
                     // Generated-reduction routing takes priority over the
@@ -3956,6 +3963,7 @@ impl<'a> Compiler<'a> {
             rows_per_workgroup,
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
+            preserve_tree_order: false,
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel shader for runtime data-layout selection (UnaryData).
@@ -4019,6 +4027,7 @@ impl<'a> Compiler<'a> {
             rows_per_workgroup,
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
+            preserve_tree_order: false,
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel for runtime data-layout: 1 per-elem + 1 per-row → 2

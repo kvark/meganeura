@@ -971,11 +971,17 @@ enum Variant {
         crate::codegen::ScalarMatmulShape,
     ),
     /// Schedule-template kernels, keyed by kernel content hash plus codegen
-    /// flags (`(hash, use_subgroups, vec4)` for reductions; `(hash, vec4)` for
-    /// pointwise). These are generated from a DAG rather than a shader group,
-    /// so no `ShaderEntry` identifies them.
-    Reduction(u64, bool, bool),
-    Pointwise(u64, bool),
+    /// flags. These are generated from a DAG rather than a shader group, so no
+    /// `ShaderEntry` identifies them.
+    Reduction {
+        hash: u64,
+        use_subgroups: bool,
+        vec4: bool,
+    },
+    Pointwise {
+        hash: u64,
+        vec4: bool,
+    },
     /// Attention specialization includes the head width and the scalar
     /// backward EPT cap. Both can differ between dispatches in one plan.
     /// The last flag is permission to store flash Q and K tiles as f16.
@@ -1059,7 +1065,7 @@ impl Variant {
     /// schedule-template kernels, which have no entry of their own.
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
-            Variant::Reduction(..) | Variant::Pointwise(..) => None,
+            Variant::Reduction { .. } | Variant::Pointwise { .. } => None,
             Variant::StoredGate(ref e, _)
             | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
@@ -1130,12 +1136,16 @@ impl Variant {
             Variant::SpecializedConv(ref e, ref params, k_tile, interleave) => {
                 format!("{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-{params:?}")
             }
-            Variant::Reduction(hash, sg, vec4) => {
-                let sg = if sg { ":sg" } else { "" };
+            Variant::Reduction {
+                hash,
+                use_subgroups,
+                vec4,
+            } => {
+                let sg = if use_subgroups { ":sg" } else { "" };
                 let v4 = if vec4 { ":v4" } else { "" };
                 format!("generated-reduction:{hash:016x}{sg}{v4}")
             }
-            Variant::Pointwise(hash, vec4) => {
+            Variant::Pointwise { hash, vec4 } => {
                 let v4 = if vec4 { ":v4" } else { "" };
                 format!("generated-pointwise:{hash:016x}{v4}")
             }
@@ -2433,7 +2443,7 @@ impl Pipelines {
                 }
                 _ => unreachable!("non-parameterized attention group {group:?}"),
             },
-            Variant::Pointwise(_, vec4) => {
+            Variant::Pointwise { vec4, .. } => {
                 let dag = dispatch.pointwise().expect("pointwise implementation");
                 layout = pointwise_data_layout(dag.n_inputs);
                 entry_point = crate::schedule::POINTWISE_ENTRY;
@@ -2455,7 +2465,11 @@ impl Pipelines {
                     )
                 }
             }
-            Variant::Reduction(_, use_subgroups, vec4) => {
+            Variant::Reduction {
+                use_subgroups,
+                vec4,
+                ..
+            } => {
                 let kernel = dispatch.reduction().expect("reduction implementation");
                 layout = reduction_data_layout(kernel);
                 entry_point = crate::schedule::REDUCTION_ENTRY;
@@ -2653,48 +2667,39 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
-            // Keep RmsNorm-rooted reductions (plain and fused-prologue alike)
-            // on the scalar tree path so debug sessions (`fuse_dispatches=false`)
-            // and `fuse_rmsnorm_into_add` (`rms_norm.wgsl`) preserve identical
-            // floating-point reduction order.
-            let is_rmsnorm = crate::compile::is_plain_rmsnorm(dispatch)
-                || (kernel.op == crate::schedule::ReduceOp::Sum
-                    && kernel.extra_prologues.is_empty()
-                    && kernel.n_per_row == 0
-                    && kernel.epilogue.as_ref().is_some_and(|epi| {
-                        epi.n_per_col_inputs == 1
-                            && epi
-                                .dag
-                                .ops
-                                .iter()
-                                .any(|op| matches!(op, crate::schedule::Pw::Rsqrt(_)))
-                    }));
-            let use_subgroups = !is_rmsnorm
-                && caps.subgroup_size > 0
-                && kernel.rows_per_workgroup == 1
-                && kernel.workgroup_size > 1;
+            let use_subgroups = kernel.can_use_subgroups(caps.subgroup_size);
             let inner = dispatch.params.get(1).copied().unwrap_or(0);
-            let vec4 = !is_rmsnorm && kernel.can_vectorize(dispatch.pointwise_storage, inner);
-            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
-                return Variant::Reduction(kernel.hash_key(), use_subgroups, vec4);
-            }
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            kernel.hash(&mut hash);
-            dispatch.pointwise_storage.hash(&mut hash);
-            return Variant::Reduction(hash.finish(), use_subgroups, vec4);
+            let vec4 = kernel.can_vectorize(dispatch.pointwise_storage, inner);
+            let hash = if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default()
+            {
+                kernel.hash_key()
+            } else {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                kernel.hash(&mut h);
+                dispatch.pointwise_storage.hash(&mut h);
+                h.finish()
+            };
+            return Variant::Reduction {
+                hash,
+                use_subgroups,
+                vec4,
+            };
         }
         if let Some(dag) = dispatch.pointwise() {
             let len = dispatch.params.first().copied().unwrap_or(0);
             let vec4 = dag.can_vectorize(dispatch.pointwise_storage, len);
-            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
-                return Variant::Pointwise(dag.hash_key(), vec4);
-            }
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            dag.hash(&mut hash);
-            dispatch.pointwise_storage.hash(&mut hash);
-            return Variant::Pointwise(hash.finish(), vec4);
+            let hash = if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default()
+            {
+                dag.hash_key()
+            } else {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                dag.hash(&mut h);
+                dispatch.pointwise_storage.hash(&mut h);
+                h.finish()
+            };
+            return Variant::Pointwise { hash, vec4 };
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             if dispatch.kernel == crate::compile::Kernel::BlockAttention {

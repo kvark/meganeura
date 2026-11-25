@@ -737,6 +737,12 @@ pub struct ReductionKernel {
     /// Empty is equivalent to all factors being one.
     #[serde(default)]
     pub input_row_repeats: Vec<u32>,
+    /// Keep the scalar shared-memory tree reduction order (disable subgroup
+    /// reduction and `vec4` lane grouping). Set by emitters whose late-fused
+    /// counterpart or debug-mode parity depends on the exact scalar tree
+    /// summation order (currently `RmsNorm` vs `rms_norm_add.wgsl`).
+    #[serde(default)]
+    pub preserve_tree_order: bool,
 }
 
 /// Maximum number of input streams supported by a fused [`PointwiseDAG`].
@@ -769,14 +775,25 @@ impl ReductionKernel {
         h.finish()
     }
 
+    /// Whether this reduction can safely execute using subgroup intrinsics
+    /// instead of a shared-memory tree reduction.
+    pub fn can_use_subgroups(&self, subgroup_size: u32) -> bool {
+        !self.preserve_tree_order
+            && subgroup_size > 0
+            && self.rows_per_workgroup == 1
+            && self.workgroup_size > 1
+    }
+
     /// Whether this reduction can safely execute 4 elements per thread via
     /// `vec4<f32>` loads (and stores when it has an F32 epilogue).
     ///
     /// Narrow packed rows (`lanes_per_row == 1`) stay scalar to preserve exact
-    /// sequential column summation order, and `ArgMax` stays scalar because it
-    /// tracks per-column indices.
+    /// sequential column summation order, `preserve_tree_order` keeps scalar
+    /// tree order, and `ArgMax` stays scalar because it tracks per-column
+    /// indices.
     pub fn can_vectorize(&self, storage: PointwiseStorage, inner: u32) -> bool {
-        self.op != ReduceOp::ArgMax
+        !self.preserve_tree_order
+            && self.op != ReduceOp::ArgMax
             && self.workgroup_size > self.rows_per_workgroup
             && storage == PointwiseStorage::default()
             && inner >= 4
@@ -2341,6 +2358,7 @@ mod tests {
             rows_per_workgroup: 1,
             gather_elem: vec![],
             input_row_repeats: vec![],
+            preserve_tree_order: false,
         };
         assert!(rms.can_vectorize(PointwiseStorage::default(), 64));
         assert!(!rms.can_vectorize(PointwiseStorage::default(), 62));
