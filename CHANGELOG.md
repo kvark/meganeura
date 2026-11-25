@@ -10,6 +10,15 @@
   compile and names `Graph::materialize`: the replaced cache as a graph
   output, a node that reads it and also depends on the result, or a second
   write to it.
+- A GPU observation that failed no longer counts as a result. The ordinary
+  cooperative-matmul probe compared each element with "error above the
+  tolerance", which NaN never is, so a kernel that produced NaN qualified;
+  the probe now starts from NaN-filled output and passes only elements within
+  the tolerance. A probe whose submission the device does not finish fails.
+  Program search and `save_checkpoint` stop with an error when a wait fails or
+  returns early, where they used to time, qualify or serialize whatever the
+  buffers held. `Session::wait` keeps its signature and now logs such a wait
+  as an error.
 
 - Three entry points now do what they say. `Eager::eval` keys its cached
   session on the graph's contents; it used to key on the node count, so a

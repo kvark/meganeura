@@ -352,7 +352,8 @@ impl Session {
 
         let wall_start = std::time::Instant::now();
         let wait_start = std::time::Instant::now();
-        self.wait();
+        // A step the device did not finish leaves nothing worth saving.
+        self.wait_checked().map_err(io::Error::other)?;
         let wait_duration = wait_start.elapsed();
         let collection_start = std::time::Instant::now();
         let mut tensors = Vec::new();
@@ -478,7 +479,13 @@ impl Session {
             }
         }
         let sync = self.gpu.submit(&mut encoder);
-        let _ = super::wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing());
+        // The staging buffer holds the tensors only if the copy finished.
+        if let Err(error) = super::completed(self.gpu.wait_for(&sync, !0), "checkpoint readback") {
+            self.gpu.destroy_command_encoder(&mut encoder);
+            self.gpu.destroy_buffer(staging);
+            return Err(io::Error::other(error));
+        }
+        super::resolved_timings(&self.gpu, &mut encoder, self.gpu_timing());
         for tensor in &tensors {
             let aligned_len = tensor.byte_len / 4 * 4;
             let tail_len = tensor.byte_len - aligned_len;
