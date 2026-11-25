@@ -66,6 +66,82 @@ fn long_scalar_products_retain_small_contributions() {
     }
 }
 
+/// A cache write replaces its cache in place, so a reader of the cache it
+/// was given has to run before it and a reader of its result after it.
+/// Ordering by data dependencies alone ran the write early, and
+/// `add(cache, relu(x))` saw the new row. Fusion moved reads across the
+/// write in both directions: a held `relu(cache)` folded into a consumer
+/// behind it, and an add of the updated cache folded into a norm ahead of it.
+/// A materialized copy keeps the old cache where no order would, and a
+/// second write waits for the readers of the first.
+#[test]
+fn cache_reads_stay_on_their_side_of_the_write() {
+    let mut failures = Vec::new();
+    for case in ["write", "prefix", "held", "norm", "kept", "twice"] {
+        let mut g = Graph::new();
+        let cache = g.parameter("cache", &[2, 2]);
+        let x = g.input("x", &[2, 2]);
+        // Built ahead of the write, which is the order they are emitted in.
+        let ahead = match case {
+            "held" => g.relu(cache),
+            "kept" => g.materialize(cache),
+            "norm" => {
+                let weight = g.parameter("weight", &[2]);
+                g.rms_norm(x, weight, 1e-5)
+            }
+            _ => {
+                let activation = g.relu(x);
+                g.add(cache, activation)
+            }
+        };
+        let row = g.input("row", &[1, 2]);
+        let pos = g.input_u32("pos", &[1]);
+        let updated = if case == "prefix" {
+            let valid = g.input_u32("valid", &[1]);
+            g.cache_write_prefix(row, cache, pos, valid)
+        } else {
+            g.cache_write(row, cache, pos)
+        };
+        let outputs = match case {
+            "held" | "norm" => vec![g.add(ahead, updated)],
+            "kept" => vec![ahead, g.add(ahead, updated)],
+            // A second write, with a reader of the cache between the two.
+            "twice" => {
+                let between = g.relu(updated);
+                let next = g.input_u32("next", &[1]);
+                let again = g.cache_write(row, updated, next);
+                vec![ahead, g.add(between, again)]
+            }
+            _ => vec![ahead, updated],
+        };
+        g.set_outputs(outputs);
+        let mut feeds = Feeds::new();
+        feeds
+            .set("cache", &[1.0, 2.0, 3.0, 4.0])
+            .set("x", &[10.0; 4])
+            .set("row", &[20.0, 30.0])
+            .set("weight", &[1.0; 2])
+            .set_u32("pos", &[0])
+            .set_u32("next", &[1])
+            .set_u32("valid", &[1]);
+        for mode in [
+            meganeura::OptimizeMode::EgglogOutlined,
+            meganeura::OptimizeMode::Off,
+        ] {
+            for fuse in [true, false] {
+                let mut options = gpu::Options::default();
+                options.optimize.mode = mode;
+                options.compile.fuse_dispatches = fuse;
+                let report = gpu::check_inference(&g, &feeds, &options).unwrap();
+                if !report.passed() {
+                    failures.push(format!("{case} {mode:?} fuse={fuse}:\n{report}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A parameter added straight into an activation receives the upstream
 /// gradient unchanged, so its gradient buffer is the output of a pointwise
 /// dispatch that also feeds the activation's backward. Dispatch fusion used

@@ -1,5 +1,16 @@
 # Unreleased
 
+- A cache write stays between the readers of the cache it was given and the
+  readers of its result. `cache_write` and `cache_write_prefix` replace their
+  cache in place, and a graph that also read that cache, such as
+  `add(cache, relu(x))` beside the write, saw the new row. An add of the
+  updated cache fused into an `RmsNorm` emitted ahead of the write read the
+  old one. Emission, scheduling, prepared stages and dispatch fusion now keep
+  each read on its side of the write. A graph that no order satisfies fails to
+  compile and names `Graph::materialize`: the replaced cache as a graph
+  output, a node that reads it and also depends on the result, or a second
+  write to it.
+
 - Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
 
 - `KernelMemo` revision moves to 19: decisions are now keyed by `(class, initial)`

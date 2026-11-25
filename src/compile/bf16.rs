@@ -34,6 +34,10 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                         continue;
                     }
                     let input = producer.input_buffers[0];
+                    // The consumer takes over the producer's read.
+                    if super::written_between(&plan.dispatches, input, pi, ci) {
+                        continue;
+                    }
                     let origin = producer.origin.clone();
                     let consumer = &mut plan.dispatches[ci];
                     consumer.input_buffers[slot] = input;

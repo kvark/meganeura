@@ -1039,6 +1039,11 @@ fn schedule_sequence(
 }
 
 /// Stable dependency ordering places independent dispatches next to each other.
+///
+/// The incoming order is the program: a dispatch follows the latest earlier
+/// write of each buffer it reads, and every earlier read of a buffer it
+/// writes. The second kind keeps an in-place cache write behind the readers
+/// of the cache it replaces.
 fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
     let n = dispatches.len();
     if n == 0 {
@@ -1046,19 +1051,30 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
     }
     // Map: buffer id → index of the dispatch that writes it.
     let mut producer: HashMap<u32, usize> = HashMap::new();
+    // Map: buffer id → the dispatches that read it since that write.
+    let mut readers: HashMap<u32, Vec<usize>> = HashMap::new();
     let mut levels = vec![0u32; n];
     for (i, dispatch) in dispatches.iter().enumerate() {
-        let level = dispatch
+        let writers = dispatch
             .input_buffers
             .iter()
-            .filter_map(|b| producer.get(&b.0))
+            .filter_map(|b| producer.get(&b.0));
+        let replaced = dispatch
+            .write_buffers()
+            .filter_map(|b| readers.get(&b.0))
+            .flatten();
+        let level = writers
+            .chain(replaced)
             .map(|&pred| levels[pred] + 1)
             .max()
             .unwrap_or(0);
         levels[i] = level;
-        producer.insert(dispatch.output_buffer.0, i);
-        for &extra in &dispatch.extra_outputs {
-            producer.insert(extra.0, i);
+        for b in &dispatch.input_buffers {
+            readers.entry(b.0).or_default().push(i);
+        }
+        for b in dispatch.write_buffers() {
+            producer.insert(b.0, i);
+            readers.remove(&b.0);
         }
     }
     // Stable sort by level keeps topological order within a level.
@@ -1068,21 +1084,24 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
     *dispatches = order.iter().map(|&i| old[i].clone()).collect();
 }
 
-/// Start a new compute pass when a dispatch reads an earlier write.
+/// Start a new compute pass when a dispatch reads an earlier write, or
+/// writes a buffer that an earlier dispatch of the pass reads.
 fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
     let mut dirty = HashSet::<u32>::new();
+    let mut read = HashSet::<u32>::new();
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0))
+            || dispatch.write_buffers().any(|b| read.contains(&b.0))
+        {
             groups.push(start..i);
             start = i;
             dirty.clear();
+            read.clear();
         }
-        dirty.insert(dispatch.output_buffer.0);
-        for &extra in &dispatch.extra_outputs {
-            dirty.insert(extra.0);
-        }
+        dirty.extend(dispatch.write_buffers().map(|b| b.0));
+        read.extend(dispatch.input_buffers.iter().map(|b| b.0));
     }
     if !dispatches.is_empty() {
         groups.push(start..dispatches.len());
@@ -1379,6 +1398,11 @@ impl Dispatch {
             | ShaderEntry::BatchMatMulBT => Some((a, b, c)),
             _ => None,
         }
+    }
+
+    /// Every buffer this dispatch writes.
+    pub(crate) fn write_buffers(&self) -> impl Iterator<Item = BufferRef> + '_ {
+        std::iter::once(self.output_buffer).chain(self.extra_outputs.iter().copied())
     }
 
     pub fn use_coop(&self) -> bool {
@@ -1764,8 +1788,9 @@ impl ExecutionPlan {
     /// Buffers whose contents are observed outside the dispatch that writes
     /// them: graph outputs, the loss, parameters and their gradients,
     /// derived parameters, inputs, constants, attention LSE side outputs,
-    /// and every dispatch's extra outputs. A fusion pass may elide the write
-    /// of an intermediate only when it is not one of these.
+    /// every dispatch's extra outputs, and the output of a dispatch that
+    /// reads a buffer ahead of a write replacing it. A fusion pass may elide
+    /// the write of an intermediate only when it is not one of these.
     pub(crate) fn externally_visible_buffers(&self) -> std::collections::HashSet<BufferRef> {
         let mut visible: std::collections::HashSet<BufferRef> =
             self.output_buffers.iter().copied().collect();
@@ -1783,6 +1808,32 @@ impl ExecutionPlan {
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
         for dispatch in &self.dispatches {
             visible.extend(dispatch.extra_outputs.iter().copied());
+        }
+        // A dispatch that reads a buffer before a later one replaces it (a
+        // cache ahead of its in-place write) has to keep its place. Folded
+        // into a consumer beyond the write, it would read the new contents.
+        let mut read = vec![false; self.buffers.len()];
+        let mut replaced = Vec::new();
+        for (index, dispatch) in self.dispatches.iter().enumerate() {
+            replaced.extend(
+                dispatch
+                    .write_buffers()
+                    .filter(|buffer| read.get(buffer.0 as usize) == Some(&true))
+                    .map(|buffer| (buffer, index)),
+            );
+            for buffer in &dispatch.input_buffers {
+                if let Some(seen) = read.get_mut(buffer.0 as usize) {
+                    *seen = true;
+                }
+            }
+        }
+        for (buffer, write) in replaced {
+            visible.extend(
+                self.dispatches[..write]
+                    .iter()
+                    .filter(|dispatch| dispatch.input_buffers.contains(&buffer))
+                    .map(|dispatch| dispatch.output_buffer),
+            );
         }
         visible
     }
@@ -1809,8 +1860,9 @@ impl ExecutionPlan {
 
 /// Compile a differentiated graph into an ExecutionPlan.
 /// Topological sort of graph nodes (Kahn's algorithm).
-/// Returns node IDs in dependency order: producers before consumers.
-fn topological_order(graph: &Graph) -> Vec<NodeId> {
+/// Returns node IDs in dependency order: producers before consumers, and
+/// the first node of each `before` pair ahead of the second.
+fn topological_order(graph: &Graph, before: &[(NodeId, NodeId)]) -> Vec<NodeId> {
     let n = graph.nodes().len();
     let mut in_degree = vec![0u32; n];
     // Consumer edges with multiplicity: a node listing the same input
@@ -1822,6 +1874,10 @@ fn topological_order(graph: &Graph) -> Vec<NodeId> {
         for &input in &node.inputs {
             consumers[input as usize].push(node.id);
         }
+    }
+    for &(first, second) in before {
+        in_degree[second as usize] += 1;
+        consumers[first as usize].push(second);
     }
 
     let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::new();
@@ -1847,6 +1903,15 @@ fn topological_order(graph: &Graph) -> Vec<NodeId> {
         let mut visited = vec![false; n];
         for &id in &order {
             visited[id as usize] = true;
+        }
+        // The graph alone has no cycle, so a stuck pair closes one: some
+        // node that must precede the second also depends on it.
+        if let Some(&(_, write)) = before.iter().find(|pair| !visited[pair.1 as usize]) {
+            panic!(
+                "cache write %{write} cannot follow every reader of the value it replaces, \
+                 because one of them also depends on the updated cache; read the old \
+                 value through `Graph::materialize`",
+            );
         }
         for node in graph.nodes() {
             if !visited[node.id as usize] {
@@ -2841,6 +2906,23 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
     log::info!("fuse_rmsnorm_into_gemv: folded {dropped} RmsNorm dispatches into their GEMVs");
 }
 
+/// Whether a dispatch between positions `from` and `to` writes `buffer`.
+/// A read of the buffer moved from one position to the other would then see
+/// different contents: an in-place cache write lies between the two.
+pub(crate) fn written_between(
+    dispatches: &[Dispatch],
+    buffer: BufferRef,
+    from: usize,
+    to: usize,
+) -> bool {
+    // `get` is empty for a read that does not move.
+    dispatches
+        .get(from.min(to) + 1..from.max(to))
+        .unwrap_or_default()
+        .iter()
+        .any(|dispatch| dispatch.write_buffers().any(|written| written == buffer))
+}
+
 /// Fuse a single-reader `RmsNorm → Add` pair into one `RmsNormAdd`
 /// dispatch.
 ///
@@ -2896,6 +2978,11 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
             .iter()
             .find(|&&b| b != normed)
             .expect("an add has two inputs");
+        // The fused dispatch runs where the norm did, so the residual is
+        // read earlier than the add read it.
+        if written_between(&plan.dispatches, residual, ni, ai) {
+            continue;
+        }
         // The add's result must not be read while the norm is rewritten
         // beneath it — checked by re-examining the add's own readers below.
         rewrite.push((ni, ai, residual));
@@ -4558,6 +4645,89 @@ mod tests {
                 assert!(plan.dispatches.contains(&normalized));
             }
         }
+    }
+
+    /// `old = add(cache, relu(x))` beside `cache_write(row, cache, position)`,
+    /// with further outputs built from the cache and the write.
+    fn cache_graph(outputs: impl FnOnce(&mut Graph, NodeId, NodeId) -> Vec<NodeId>) -> Graph {
+        let mut graph = Graph::new();
+        let cache = graph.parameter("cache", &[2, 2]);
+        let x = graph.input("x", &[2, 2]);
+        let activation = graph.relu(x);
+        let old = graph.add(cache, activation);
+        let row = graph.input("row", &[1, 2]);
+        let position = graph.input_u32("position", &[1]);
+        let updated = graph.cache_write(row, cache, position);
+        let mut all = vec![old, updated];
+        all.extend(outputs(&mut graph, cache, updated));
+        graph.set_outputs(all);
+        graph
+    }
+
+    #[test]
+    fn cache_write_is_scheduled_behind_the_readers_of_its_cache() {
+        let graph = cache_graph(|_, _, _| Vec::new());
+        for (fuse_dispatches, prepare) in [(false, false), (true, false), (true, true)] {
+            let options = CompileOptions {
+                fuse_dispatches,
+                ..Default::default()
+            };
+            let mut plan = compile_with(&graph, &options);
+            // Preparing the updated cache takes the readers of the old one along.
+            let prepared = if prepare {
+                stages::schedule(&mut plan, &[1], false, true).groups
+            } else {
+                schedule_dispatches(&mut plan, false, true);
+                plan.groups.len()
+            };
+            let group = |index: usize| {
+                plan.groups
+                    .iter()
+                    .position(|range| range.contains(&index))
+                    .unwrap()
+            };
+            let write = plan
+                .dispatches
+                .iter()
+                .position(|dispatch| dispatch.shader == ShaderEntry::CacheWrite)
+                .unwrap();
+            let cache = plan.dispatches[write].output_buffer;
+            let mut readers = (0..plan.dispatches.len())
+                .filter(|&index| index != write)
+                .filter(|&index| plan.dispatches[index].input_buffers.contains(&cache))
+                .peekable();
+            assert!(readers.peek().is_some());
+            assert!(readers.all(|reader| group(reader) < group(write)));
+            assert!(group(write) < prepared);
+        }
+    }
+
+    #[test]
+    fn cache_uses_that_no_order_satisfies_are_refused() {
+        let refusals = [
+            "also depends on the updated cache",
+            "replaces in place",
+            "both replace",
+        ];
+        for (case, expected) in refusals.into_iter().enumerate() {
+            let graph = cache_graph(|graph, cache, updated| match case {
+                0 => vec![graph.add(cache, updated)],
+                1 => vec![cache],
+                _ => {
+                    let row = graph.input("second_row", &[1, 2]);
+                    let position = graph.input_u32("second_position", &[1]);
+                    vec![graph.cache_write(row, cache, position)]
+                }
+            });
+            let refusal = std::panic::catch_unwind(|| compile(&graph)).unwrap_err();
+            let message = refusal.downcast_ref::<String>().unwrap();
+            assert!(message.contains(expected), "{message}");
+        }
+        // Each of them is in order once the old cache is read through a copy.
+        compile(&cache_graph(|graph, cache, updated| {
+            let kept = graph.materialize(cache);
+            vec![kept, graph.add(kept, updated)]
+        }));
     }
 
     #[test]

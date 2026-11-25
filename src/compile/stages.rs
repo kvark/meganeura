@@ -19,12 +19,16 @@ pub(crate) fn schedule(
 ) -> Preparation {
     assert!(!outputs.is_empty());
     let mut producers = HashMap::new();
+    let mut readers = HashMap::<_, Vec<usize>>::new();
     for (index, dispatch) in plan.dispatches.iter().enumerate() {
-        for buffer in std::iter::once(&dispatch.output_buffer).chain(&dispatch.extra_outputs) {
+        for buffer in dispatch.write_buffers() {
             assert!(
-                producers.insert(*buffer, index).is_none(),
+                producers.insert(buffer, index).is_none(),
                 "prepared execution requires single-writer buffers"
             );
+        }
+        for &buffer in &dispatch.input_buffers {
+            readers.entry(buffer).or_default().push(index);
         }
     }
     let inputs: HashSet<_> = plan.input_buffers.iter().map(|entry| entry.1).collect();
@@ -44,8 +48,19 @@ pub(crate) fn schedule(
             continue;
         }
         if let Some(&producer) = producers.get(&buffer) {
-            early[producer] = true;
-            pending.extend(plan.dispatches[producer].input_buffers.iter().copied());
+            // An earlier dispatch that reads what this one replaces in place
+            // has to run before it, so it joins the same stage.
+            let replaced = plan.dispatches[producer]
+                .write_buffers()
+                .filter_map(|written| readers.get(&written))
+                .flatten()
+                .copied()
+                .filter(|&reader| reader < producer);
+            for index in std::iter::once(producer).chain(replaced) {
+                if !std::mem::replace(&mut early[index], true) {
+                    pending.extend(plan.dispatches[index].input_buffers.iter().copied());
+                }
+            }
         }
     }
     let early_inputs = inputs.intersection(&ready).copied().collect();
