@@ -61,8 +61,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Lavapipe has cooperative matrices from Mesa 26.0, which the
+          # 24.04 image's Mesa 25.2 predates.
           - name: Linux (lavapipe)
-            os: ubuntu-latest
+            os: ubuntu-26.04
           - name: macOS (Metal)
             os: macos-latest
     steps:
