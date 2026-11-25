@@ -85,6 +85,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan-dev
           vulkaninfo --summary 2>&1 | head -30
+          # The package installs a driver for every vendor. The loader opens
+          # them all for each new instance and unloads those that find no
+          # device, which races with calls other threads make on a live
+          # device: a test binary died in `loader_get_icd_and_device` once
+          # in five runs. With lavapipe alone there is nothing to unload.
+          echo "VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
 
