@@ -53,7 +53,8 @@ pub struct BuildSearchOptions {
     /// finish in time.
     pub max_time: Duration,
     /// Includes the initial untuned fallback and its tuned challenger. One
-    /// returns only the fallback, without probing or applying kernel decisions.
+    /// returns only the fallback, without probing or applying kernel decisions
+    /// and without preparing any other program.
     pub max_programs: usize,
     /// Stop once this many consecutive trials have not replaced the incumbent.
     /// `None` searches until another bound ends it.
@@ -105,6 +106,7 @@ pub struct BuildSearchReport {
     pub extraction_truncated: bool,
     pub skipped_regions: Vec<String>,
     /// Requested arithmetic rejected by the device capability/numerical probe.
+    /// Empty when the search had no other program to probe for.
     pub unsupported_matrix_inputs: Vec<crate::DType>,
     pub preparation_time: Duration,
     pub selected: usize,
@@ -239,7 +241,11 @@ pub fn build_measured_with_inputs(
     }];
     let mut extraction_truncated = false;
     let mut skipped_regions = Vec::new();
-    if cfg.optimize.mode != optimize::OptimizeMode::Off
+    // A one-program request returns the ordinary fallback. No other program
+    // can run, so none is extracted, lowered or probed for.
+    let alternatives = options.max_programs > 1;
+    if alternatives
+        && cfg.optimize.mode != optimize::OptimizeMode::Off
         && options.max_graphs > 1
         && start.elapsed() < options.max_time
     {
@@ -306,7 +312,8 @@ pub fn build_measured_with_inputs(
         }
     }
     let mut backward_ranks = vec![0; graphs.len()];
-    if cfg.mode == crate::Mode::Training
+    if alternatives
+        && cfg.mode == crate::Mode::Training
         && cfg.optimize.mode != optimize::OptimizeMode::Off
         && options.max_graphs > 1
     {
@@ -347,55 +354,59 @@ pub fn build_measured_with_inputs(
     // Checked F16 reaches rectangular tiles and extracted scalar layouts that
     // the ordinary square-tile heuristic leaves alone.
     let matrix_inputs = matrix_input_order(cfg.runtime.coop, caps);
-    let (supported, unsupported_matrix_inputs): (Vec<_>, Vec<_>) = matrix_inputs
-        .iter()
-        .copied()
-        .partition(|&ty| runtime::typed_matrix_supported(&gpu, ty));
+    let mut unsupported_matrix_inputs = Vec::new();
     let mut programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
-    // Arithmetic alternatives may replace this search's extracted scalar layouts,
-    // but keep layouts already present in the caller's graph.
-    programs.replace_extracted_matrices = forward_graph
-        .nodes()
-        .iter()
-        .all(|n| n.matmul_impl.is_none());
-    programs.replace_extracted_attention = forward_graph
-        .nodes()
-        .iter()
-        .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
-    programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
-    programs.parallel_width = match options.tuning.calibration {
-        crate::tune::TuneCalibration::Profile(ref profile) => profile.parallel_width,
-        _ => None,
-    };
-    programs.attention_subgroup_size = gpu.capabilities().subgroup_size;
-    if programs.replace_extracted_attention {
-        programs.block_cooperative =
-            crate::kernels::attention::block_cooperative(&gpu.capabilities(), programs.caps);
-        programs.enable_block_attention();
-    }
-    programs.enable_matrix_inputs(&supported, &gpu.capabilities());
-    programs.enable_gradient_inputs(&supported);
-    programs.enable_conv_gradient_inputs(&supported);
-    if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
-        programs.enable_forward_products(gpu.capabilities().subgroup_size);
-    }
-    programs.enable_flash_reductions();
-    if cfg.mode == crate::Mode::Inference
-        && matches!(
-            cfg.runtime.coop,
-            crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
-        )
-        && gpu.capabilities().shader_float16
-    {
-        programs.enable_flash_tiles();
-    }
-    if cfg.mode == crate::Mode::Training {
-        programs.enable_flash_backward(
-            matches!(
+    if alternatives {
+        let supported: Vec<_>;
+        (supported, unsupported_matrix_inputs) = matrix_inputs
+            .iter()
+            .copied()
+            .partition(|&ty| runtime::typed_matrix_supported(&gpu, ty));
+        // Arithmetic alternatives may replace this search's extracted scalar layouts,
+        // but keep layouts already present in the caller's graph.
+        programs.replace_extracted_matrices = forward_graph
+            .nodes()
+            .iter()
+            .all(|n| n.matmul_impl.is_none());
+        programs.replace_extracted_attention = forward_graph
+            .nodes()
+            .iter()
+            .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
+        programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
+        programs.parallel_width = match options.tuning.calibration {
+            crate::tune::TuneCalibration::Profile(ref profile) => profile.parallel_width,
+            _ => None,
+        };
+        programs.attention_subgroup_size = gpu.capabilities().subgroup_size;
+        if programs.replace_extracted_attention {
+            programs.block_cooperative =
+                crate::kernels::attention::block_cooperative(&gpu.capabilities(), programs.caps);
+            programs.enable_block_attention();
+        }
+        programs.enable_matrix_inputs(&supported, &gpu.capabilities());
+        programs.enable_gradient_inputs(&supported);
+        programs.enable_conv_gradient_inputs(&supported);
+        if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
+            programs.enable_forward_products(gpu.capabilities().subgroup_size);
+        }
+        programs.enable_flash_reductions();
+        if cfg.mode == crate::Mode::Inference
+            && matches!(
                 cfg.runtime.coop,
                 crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
-            ) && gpu.capabilities().shader_float16,
-        );
+            )
+            && gpu.capabilities().shader_float16
+        {
+            programs.enable_flash_tiles();
+        }
+        if cfg.mode == crate::Mode::Training {
+            programs.enable_flash_backward(
+                matches!(
+                    cfg.runtime.coop,
+                    crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
+                ) && gpu.capabilities().shader_float16,
+            );
+        }
     }
     let preparation_time = start.elapsed();
     measure::select(
@@ -5242,6 +5253,82 @@ mod tests {
             session.read_params(&["w"])[0]
                 .iter()
                 .all(|w| (w - 0.12).abs() < 2e-6)
+        );
+    }
+
+    /// A search that can measure one program owes the caller the ordinary
+    /// one and nothing else, so it extracts no other graph form and probes
+    /// no arithmetic for programs it will never run.
+    #[test]
+    fn minimal_searches_prepare_only_the_ordinary_program() {
+        let gpu = crate::reference::gpu::shared_context();
+        let mut graph = Graph::new();
+        let mut hidden = graph.input("x", &[32, 32]);
+        for layer in ["first", "second"] {
+            let weight = graph.parameter(layer, &[32, 32]);
+            hidden = graph.matmul(hidden, weight);
+            hidden = graph.relu(hidden);
+        }
+        graph.set_outputs(vec![hidden]);
+        let search = |options: BuildSearchOptions| {
+            build_measured(
+                &graph,
+                SessionConfig {
+                    mode: crate::Mode::Inference,
+                    gpu: Some(gpu.clone()),
+                    ..Default::default()
+                },
+                BuildSearchOptions {
+                    tuning: TuneOptions {
+                        max_time: Duration::ZERO,
+                        ..Default::default()
+                    },
+                    warmup_runs: 1,
+                    warmup_time: Duration::ZERO,
+                    ..options
+                },
+                |session, _| {
+                    session.set_input("x", &[1.0; 32 * 32]);
+                    for layer in ["first", "second"] {
+                        session.set_parameter(layer, &[1.0 / 32.0; 32 * 32]);
+                    }
+                    Ok(())
+                },
+                |session| {
+                    let output = session.read_output(32 * 32);
+                    if output.iter().all(|value| (value - 1.0).abs() < 1e-5) {
+                        Ok(())
+                    } else {
+                        Err("the chain of averages changed".into())
+                    }
+                },
+            )
+            .unwrap()
+        };
+        // The graph has other forms, which a search with room for them extracts.
+        let (_, wider) = search(BuildSearchOptions {
+            max_programs: 2,
+            ..Default::default()
+        });
+        assert!(wider.graphs.len() > 1, "{:?}", wider.graphs);
+
+        let (mut session, report) = search(BuildSearchOptions {
+            max_programs: 1,
+            ..Default::default()
+        });
+        assert_eq!(report.graphs, ["ordinary extraction"]);
+        assert!(report.unsupported_matrix_inputs.is_empty());
+        assert_eq!((report.trials.len(), report.selected), (1, 0));
+        assert!(report.trials[0].outcome.qualified);
+        // Other programs exist; this search was not allowed to reach them.
+        assert!(report.truncated);
+        session.step();
+        session.wait();
+        assert!(
+            session
+                .read_output(32 * 32)
+                .iter()
+                .all(|value| (value - 1.0).abs() < 1e-5)
         );
     }
 }

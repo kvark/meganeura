@@ -18,6 +18,13 @@
   compile and names `Graph::materialize`: the replaced cache as a graph
   output, a node that reads it and also depends on the result, or a second
   write to it.
+- A measured build limited to one program prepares only that program.
+  `build_measured` with `max_programs = 1` used to extract every other graph
+  form, lay out their derivatives and probe the device's matrix arithmetic
+  before the single trial it was allowed. On a six-layer 32×32 product chain
+  that was 11.3 ms of preparation against 1.0 ms with `max_graphs = 1`; the
+  two now cost the same. Such a search reports one graph form and no
+  unsupported arithmetic.
 
 - A GPU observation that failed no longer counts as a result. The ordinary
   cooperative-matmul probe compared each element with "error above the
