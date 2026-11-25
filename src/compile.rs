@@ -2915,7 +2915,10 @@ pub(crate) fn written_between(
     from: usize,
     to: usize,
 ) -> bool {
-    dispatches[from.min(to) + 1..from.max(to)]
+    // `get` is empty for a read that does not move.
+    dispatches
+        .get(from.min(to) + 1..from.max(to))
+        .unwrap_or_default()
         .iter()
         .any(|dispatch| dispatch.write_buffers().any(|written| written == buffer))
 }
