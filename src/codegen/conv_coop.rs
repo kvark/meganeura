@@ -464,7 +464,7 @@ pub fn generate_conv2d_coop_module(
     }
     src.push_str("}\n");
 
-    ShaderModule::new(&src)
+    ShaderModule::new(&src).with_subgroup(0, [64, 1, 1])
 }
 
 /// Emit the im2col staging loop for grad_input (backward) direction.

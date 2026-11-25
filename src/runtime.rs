@@ -1085,29 +1085,6 @@ impl Variant {
         }
     }
 
-    /// Whether this pipeline relies on subgroup operations whose workgroup
-    /// geometry assumes `caps.subgroup_size` full lanes.
-    fn uses_subgroups(&self, caps: &blade_graphics::Capabilities) -> bool {
-        match *self {
-            Variant::CoopWorkgroup(..)
-            | Variant::CoopConv(..)
-            | Variant::CoopTyped(..)
-            | Variant::CoopTiled(..)
-            | Variant::Coop(..)
-            | Variant::CoopEpilogue(..)
-            | Variant::CoopPrologue(..)
-            | Variant::Horizontal(_, _, HorizMatMulKind::Coop) => true,
-            Variant::Gemv(_, _, shape)
-            | Variant::GemvIntDot(_, _, shape)
-            | Variant::GemvRmsNorm(_, _, shape)
-            | Variant::GemvRmsNormIntDot(_, _, shape) => {
-                shape.reduction == crate::codegen::GemvReduction::Subgroup
-            }
-            Variant::Scalar(ShaderEntry::LayerNorm) => caps.subgroup_size > 0,
-            _ => false,
-        }
-    }
-
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
@@ -1814,36 +1791,46 @@ fn create_gen_shader(
     .map_err(|error| error.to_string())
 }
 
-/// Parse literal `@workgroup_size(x[, y[, z]])` from generated WGSL source.
-fn parse_wgsl_workgroup_size(source: &str) -> Option<[u32; 3]> {
-    let start = source.find("@workgroup_size(")?;
-    let rest = &source[start + "@workgroup_size(".len()..];
-    let end = rest.find(')')?;
-    let mut dims = [1u32; 3];
-    let mut count = 0usize;
-    for part in rest[..end].split(',') {
-        let token = part.trim().trim_end_matches(['u', 'i']);
-        if token.is_empty() || count >= 3 {
-            return None;
-        }
-        dims[count] = token.parse().ok()?;
-        count += 1;
-    }
-    (count >= 1).then_some(dims)
-}
-
+/// Resolve the explicit subgroup requirement carried by a generated
+/// [`crate::codegen::ShaderModule`] against the device's full-subgroup
+/// capabilities.
 fn required_full_subgroup_size(
     caps: &blade_graphics::Capabilities,
-    key: &Variant,
-    source: &str,
+    req: Option<crate::codegen::SubgroupRequirement>,
 ) -> Option<u32> {
-    if !key.uses_subgroups(caps) || caps.subgroup_size == 0 {
+    let req = req?;
+    let size = if req.size == 0 {
+        caps.subgroup_size
+    } else {
+        req.size
+    };
+    if size == 0 {
         return None;
     }
-    let wg = parse_wgsl_workgroup_size(source)?;
     caps.full_subgroups
-        .is_some_and(|fs| fs.supports(caps.subgroup_size, wg))
-        .then_some(caps.subgroup_size)
+        .is_some_and(|fs| fs.supports(size, req.workgroup_size))
+        .then_some(size)
+}
+
+/// Shared workgroup-cooperative tile resolution used by both `Pipelines::compile`
+/// and `tuning::tile_module`.
+pub(super) fn workgroup_matmul_shape_and_subgroup(
+    shape: crate::codegen::WorkgroupMatmulShape,
+    types: crate::codegen::MatrixTypes,
+    caps: &blade_graphics::Capabilities,
+) -> Option<([u32; 3], u32)> {
+    if shape.subgroup_rows != 0 {
+        crate::codegen::native_subgroup_shape(caps, types.multiply)
+    } else {
+        Some(([16, 16, 16], 32))
+    }
+}
+
+pub(super) fn workgroup_matmul_epilogue_supported(
+    shape: crate::codegen::WorkgroupMatmulShape,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
+) -> bool {
+    epilogue.is_none_or(|epi| shape.subgroup_rows != 0 && epi.inputs.is_empty())
 }
 
 fn create_profiled_pipeline(
@@ -2140,19 +2127,12 @@ impl Pipelines {
                 }) {
                     return Err("unsupported workgroup cooperative product".to_owned());
                 }
-                if let Some(ref epi) = *epilogue {
-                    if shape.subgroup_rows == 0 || !epi.inputs.is_empty() {
-                        return Err(
-                            "unsupported epilogue on workgroup cooperative product".to_owned()
-                        );
-                    }
+                if !workgroup_matmul_epilogue_supported(shape, epilogue.as_ref()) {
+                    return Err("unsupported epilogue on workgroup cooperative product".to_owned());
                 }
-                let (native, subgroup) = if shape.subgroup_rows != 0 {
-                    crate::codegen::native_subgroup_shape(&capabilities, types.multiply)
-                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?
-                } else {
-                    ([16, 16, 16], 32)
-                };
+                let (native, subgroup) =
+                    workgroup_matmul_shape_and_subgroup(shape, types, &capabilities)
+                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
                 crate::codegen::generate_workgroup_matmul_for_device(
                     group,
                     shape,
@@ -2440,8 +2420,7 @@ impl Pipelines {
         if let Some(dir) = dump_dir {
             module.dump(dir);
         }
-        let full_subgroup_size =
-            required_full_subgroup_size(&gpu.capabilities(), key, &module.source);
+        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
         let shared_key = SharedPipelineKey {
             context: Arc::as_ptr(gpu) as usize,
             entry_point,
@@ -3589,7 +3568,7 @@ pub struct Session {
     optimizer_table: Vec<optimizer::Segment>,
     /// Cached optimizer dispatch units for `(accumulating, units)`. Invalidated
     /// whenever a buffer binding, LR multiplier, or accumulator changes.
-    cached_optimizer_units: Option<(bool, Vec<optimizer::Unit>)>,
+    cached_optimizer_units: Option<(bool, std::sync::Arc<[optimizer::Unit]>)>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
     /// this diagnostic does not require another dispatch or shader variant.

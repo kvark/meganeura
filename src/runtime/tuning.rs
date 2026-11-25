@@ -565,16 +565,22 @@ pub(super) fn tile_module(
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 let types = super::checked_matrix_types(dispatch)
                     .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
-                let native = crate::codegen::checked_cooperative_shape(super::cooperative_shapes(
-                    &caps.cooperative_matrix,
-                    types.multiply,
-                ))
-                .unwrap_or([16, 16, 16]);
-                let subgroup = if caps.subgroup_size == 0 {
-                    32
-                } else {
-                    caps.subgroup_size
-                };
+                let epilogue = dispatch.matmul_epilogue.as_ref().filter(|_| {
+                    super::workgroup_matmul_epilogue_supported(
+                        shape,
+                        dispatch.matmul_epilogue.as_ref(),
+                    )
+                });
+                assert!(
+                    super::workgroup_matmul_epilogue_supported(
+                        shape,
+                        dispatch.matmul_epilogue.as_ref()
+                    ),
+                    "unsupported epilogue on workgroup cooperative product"
+                );
+                let (native, subgroup) =
+                    super::workgroup_matmul_shape_and_subgroup(shape, types, caps)
+                        .unwrap_or(([16, 16, 16], 32));
                 crate::codegen::generate_workgroup_matmul_for_device(
                     entry.shader_group(),
                     shape,
@@ -582,7 +588,7 @@ pub(super) fn tile_module(
                     native,
                     subgroup,
                     dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
-                    dispatch.matmul_epilogue.as_ref(),
+                    epilogue,
                 )
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
@@ -2480,6 +2486,9 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
             av *= inv_rms * w[inner] as f64;
         }
         value += av * bv;
+    }
+    if let Some(ref epilogue) = class.epilogue {
+        value = epilogue.eval_unary_f64(value);
     }
     match class.matrix_types {
         Some(types) if types.output != crate::DType::F32 => {
@@ -4953,5 +4962,150 @@ mod tests {
             assert!(!outputs_agree(&output, &corrupt, scale));
             assert!(!qualify_output(&class, &inputs, &corrupt, scale));
         }
+    }
+
+    #[test]
+    fn reference_dot_evaluates_unary_epilogue() {
+        use crate::schedule::{PointwiseDAG, Pw};
+        let relu = PointwiseDAG {
+            n_inputs: 1,
+            ops: vec![Pw::LoadInput(0), Pw::Relu(0)],
+            output: 1,
+        };
+        let class = TuneClass {
+            shader: ShaderEntry::MatMul,
+            m: 16,
+            n: 16,
+            k: 32,
+            epilogue: Some(relu),
+            ..Default::default()
+        };
+        let sizes = class.buffer_sizes().unwrap();
+        let inputs = test_inputs(&sizes, 0);
+        let raw_class = TuneClass {
+            epilogue: None,
+            ..class.clone()
+        };
+        let mut saw_negative_raw = false;
+        let mut output = Vec::with_capacity(16 * 16);
+        for row in 0..16 {
+            for col in 0..16 {
+                let raw = reference_dot(&raw_class, &inputs, row, col);
+                if raw < 0.0 {
+                    saw_negative_raw = true;
+                }
+                let expected = raw.max(0.0);
+                assert_eq!(reference_dot(&class, &inputs, row, col), expected);
+                output.push(expected as f32);
+            }
+        }
+        assert!(saw_negative_raw, "test pattern must exercise negative dots");
+        assert!(qualify_output(&class, &inputs, &output, 1.0));
+        // Raw (un-ReLU'd) output must NOT qualify against the ReLU epilogue.
+        let raw_output: Vec<f32> = (0..16 * 16)
+            .map(|i| reference_dot(&raw_class, &inputs, i / 16, i % 16) as f32)
+            .collect();
+        assert!(!qualify_output(&class, &inputs, &raw_output, 1.0));
+    }
+
+    #[test]
+    fn subgroup_requirement_metadata_covers_gemv_winograd_attention_and_coop() {
+        use crate::codegen::{
+            FlashAttentionShape, GemvReduction, GemvShape, MatrixTypes, ShaderGroup,
+            SubgroupRequirement,
+        };
+        use crate::compile::WeightFormat;
+        use crate::runtime::required_full_subgroup_size;
+        let caps = bg::Capabilities {
+            subgroup_size: 32,
+            full_subgroups: Some(bg::FullSubgroups {
+                min_size: 16,
+                max_size: 64,
+                max_workgroup_subgroups: 16,
+            }),
+            ..Default::default()
+        };
+
+        // Subgroup GEMV carries explicit [threads * column_groups, 1, 1].
+        let sg_gemv = GemvShape {
+            threads: 128,
+            column_groups: 1,
+            reduction: GemvReduction::Subgroup,
+            ..GemvShape::initial(ShaderGroup::MatMulGemv)
+        };
+        let m_sg = crate::codegen::generate_module_gemv(
+            ShaderGroup::MatMulGemv,
+            WeightFormat::F32,
+            sg_gemv,
+        );
+        assert_eq!(
+            m_sg.subgroup,
+            Some(SubgroupRequirement {
+                size: 0,
+                workgroup_size: [128, 1, 1],
+            })
+        );
+        assert_eq!(required_full_subgroup_size(&caps, m_sg.subgroup), Some(32));
+
+        // Tree GEMV does not request full subgroups.
+        let tree_gemv = GemvShape {
+            reduction: GemvReduction::Tree,
+            ..sg_gemv
+        };
+        let m_tree = crate::codegen::generate_module_gemv(
+            ShaderGroup::MatMulGemv,
+            WeightFormat::F32,
+            tree_gemv,
+        );
+        assert_eq!(m_tree.subgroup, None);
+        assert_eq!(required_full_subgroup_size(&caps, m_tree.subgroup), None);
+
+        // WinogradMatmul, CoopTyped (including Conv2dBF16), FlashAttention
+        // subgroup tiles, and LayerNormSubgroup all carry explicit metadata.
+        let m_wino =
+            crate::codegen::winograd::matmul(crate::DType::F16, [16, 16, 16], [32, 32], 32);
+        assert!(m_wino.subgroup.is_some());
+        assert_eq!(
+            required_full_subgroup_size(&caps, m_wino.subgroup),
+            Some(32)
+        );
+
+        let m_typed = crate::codegen::generate_module_coop_typed_with_subgroup(
+            ShaderGroup::MatMul,
+            MatrixTypes::BF16,
+            [16, 16, 16],
+            Default::default(),
+            32,
+        );
+        assert!(m_typed.subgroup.is_some());
+        assert_eq!(
+            required_full_subgroup_size(&caps, m_typed.subgroup),
+            Some(32)
+        );
+
+        let m_flash_sg = crate::codegen::generate_flash_attention_module_for_device(
+            64,
+            16,
+            FlashAttentionShape::default(),
+            false,
+            true,
+        );
+        assert!(m_flash_sg.subgroup.is_some());
+        assert_eq!(
+            required_full_subgroup_size(&caps, m_flash_sg.subgroup),
+            Some(32)
+        );
+
+        let m_flash_tree = crate::codegen::generate_flash_attention_module_for_device(
+            64,
+            16,
+            FlashAttentionShape::default(),
+            false,
+            false,
+        );
+        assert_eq!(m_flash_tree.subgroup, None);
+
+        let m_ln = crate::codegen::generate_layer_norm_subgroup();
+        assert_eq!(required_full_subgroup_size(&caps, m_ln.subgroup), Some(32));
     }
 }

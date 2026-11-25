@@ -134,7 +134,6 @@ pub(super) struct Segment {
 
 /// What one dispatch of a pass covers: a whole chunk, or one pair that left
 /// its chunk.
-#[derive(Clone)]
 pub(super) struct Unit {
     chunk: usize,
     /// Byte offset of the unit within the chunk's moments and accumulators.
@@ -289,11 +288,11 @@ impl Session {
     /// Split the chunks into dispatch units and write their segment table.
     /// The table is host-visible, so when it changes (after a parameter is
     /// rebound, for instance) the GPU must be idle.
-    fn optimizer_units(&mut self, accumulating: bool) -> Vec<Unit> {
+    fn optimizer_units(&mut self, accumulating: bool) -> std::sync::Arc<[Unit]> {
         if let Some((cached_accumulating, ref units)) = self.cached_optimizer_units
             && cached_accumulating == accumulating
         {
-            return units.clone();
+            return std::sync::Arc::clone(units);
         }
         struct Plan {
             chunk: usize,
@@ -402,7 +401,7 @@ impl Session {
         }
         let segments = self.optimizer_segments.unwrap();
         let accumulators = self.grad_accum.as_ref().filter(|_| accumulating);
-        let built: Vec<Unit> = units
+        let built: std::sync::Arc<[Unit]> = units
             .into_iter()
             .map(|(plan, start, groups, slot)| Unit {
                 chunk: plan.chunk,
@@ -418,7 +417,7 @@ impl Session {
                 slot,
             })
             .collect();
-        self.cached_optimizer_units = Some((accumulating, built.clone()));
+        self.cached_optimizer_units = Some((accumulating, std::sync::Arc::clone(&built)));
         built
     }
 
@@ -439,7 +438,7 @@ impl Session {
             {
                 let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
                 let mut pass = self.encoder.compute("grad_accum");
-                for unit in &units {
+                for unit in units.iter() {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -458,10 +457,13 @@ impl Session {
                     pc.dispatch(unit.grid());
                 }
             }
-            // Ensure the accumulated gradients are visible to clipping and
-            // optimizer passes in the same command buffer without forcing a
-            // synchronous CPU/GPU drain.
-            self.encoder.barrier();
+            // Submit + wait so the accumulator this pass wrote is fully
+            // durable before the optimizer's separate passes read it.
+            // Sharing one submission left a write/read hazard that
+            // corrupted the accumulator on the apply step.
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            self.wait();
+            self.encoder.start();
         }
 
         if clip {
@@ -477,7 +479,7 @@ impl Session {
             Some(Update::Sgd { lr }) => {
                 let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
                 let mut pass = self.encoder.compute("sgd_update");
-                for unit in &units {
+                for unit in units.iter() {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -521,7 +523,7 @@ impl Session {
                     };
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
                 let mut pass = self.encoder.compute("adam_update");
-                for unit in &units {
+                for unit in units.iter() {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,

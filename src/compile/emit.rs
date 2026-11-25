@@ -880,7 +880,11 @@ impl<'a> Compiler<'a> {
                     // full length and would otherwise read past the scalar.
                     assert!(
                         matches!(grad_node.op, Op::Constant { ref data } if data == &[0.0])
-                            || matches!(grad_node.op, Op::Fill { value } if value == 0.0),
+                            || matches!(
+                                grad_node.op,
+                                Op::Fill { value }
+                                    if value == 0.0 && grad_node.ty.num_elements() == 1
+                            ),
                         "parameter gradient shape mismatch without a zero placeholder",
                     );
                     continue;

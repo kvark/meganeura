@@ -93,6 +93,95 @@ impl PointwiseDAG {
         h.finish()
     }
 
+    /// Evaluate a single-input (`n_inputs == 1`, non-broadcast) DAG in `f64`
+    /// for CPU reference qualification (e.g. unary matmul epilogue tuning).
+    pub fn eval_unary_f64(&self, input: f64) -> f64 {
+        assert_eq!(self.n_inputs, 1, "eval_unary_f64 requires n_inputs == 1");
+        let mut vals: Vec<f64> = Vec::with_capacity(self.ops.len());
+        for op in &self.ops {
+            let v = match *op {
+                Pw::LoadInput(0) => input,
+                Pw::LoadInput(_) | Pw::LoadBroadcast { .. } => {
+                    unreachable!("non-unary load in eval_unary_f64")
+                }
+                Pw::Const(bits) => f64::from(f32::from_bits(bits)),
+                Pw::Add(a, b) => vals[a as usize] + vals[b as usize],
+                Pw::Mul(a, b) => vals[a as usize] * vals[b as usize],
+                Pw::Sub(a, b) => vals[a as usize] - vals[b as usize],
+                Pw::Div(a, b) => vals[a as usize] / vals[b as usize],
+                Pw::Min(a, b) => vals[a as usize].min(vals[b as usize]),
+                Pw::Max(a, b) => vals[a as usize].max(vals[b as usize]),
+                Pw::Greater(a, b) => {
+                    if vals[a as usize] > vals[b as usize] {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                Pw::Neg(a) => -vals[a as usize],
+                Pw::Recip(a) => 1.0 / vals[a as usize],
+                Pw::Exp(a) => vals[a as usize].exp(),
+                Pw::Log(a) => vals[a as usize].ln(),
+                Pw::Abs(a) => vals[a as usize].abs(),
+                Pw::Sqrt(a) => vals[a as usize].sqrt(),
+                Pw::Rsqrt(a) => 1.0 / vals[a as usize].sqrt(),
+                Pw::Relu(a) => vals[a as usize].max(0.0),
+                Pw::Sigmoid(a) => 1.0 / (1.0 + (-vals[a as usize]).exp()),
+                Pw::Silu(a) => {
+                    let x = vals[a as usize];
+                    x / (1.0 + (-x).exp())
+                }
+                Pw::Tanh(a) => vals[a as usize].tanh(),
+                Pw::Erf(a) => {
+                    let x = vals[a as usize];
+                    let z = x.abs();
+                    let s = x * x;
+                    if z < 0.5 {
+                        const POLY: [f64; 6] = [
+                            std::f64::consts::FRAC_2_SQRT_PI,
+                            -0.37612639,
+                            0.11283792,
+                            -0.026866172,
+                            0.0052239776,
+                            -0.00085483270,
+                        ];
+                        let mut p = 0.0;
+                        for &c in POLY.iter().rev() {
+                            p = p * s + c;
+                        }
+                        x * p
+                    } else {
+                        const CHEB: [f64; 10] = [
+                            -1.26551223,
+                            1.00002368,
+                            0.37409196,
+                            0.09678418,
+                            -0.18628806,
+                            0.27886807,
+                            -1.13520398,
+                            1.48851587,
+                            -0.82215223,
+                            0.17087277,
+                        ];
+                        let t = 1.0 / (1.0 + 0.5 * z);
+                        let mut poly = 0.0;
+                        for &c in CHEB.iter().rev() {
+                            poly = poly * t + c;
+                        }
+                        let c = t * (-s + poly).exp();
+                        x.signum() * (1.0 - c)
+                    }
+                }
+                Pw::Sin(a) => vals[a as usize].sin(),
+                Pw::Cos(a) => vals[a as usize].cos(),
+                Pw::U32ToF32(a) => f64::from((vals[a as usize] as f32).to_bits() as f32),
+                Pw::F32ToU32(a) => f64::from(f32::from_bits((vals[a as usize] as f32) as u32)),
+            };
+            vals.push(v);
+        }
+        vals[self.output as usize]
+    }
+
     /// Emit the DAG body as WGSL statements. `load(idx)` returns the
     /// complete WGSL expression that loads input stream `idx` at the
     /// current element position — typically something like
