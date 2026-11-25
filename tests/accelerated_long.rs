@@ -24,17 +24,6 @@ fn accelerated() -> gpu::Options {
     }
 }
 
-fn skip_backprop() -> bool {
-    // CI Metal and lavapipe skip training checks. MHA backward gradients
-    // diverge on those runners.
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
-        true
-    } else {
-        false
-    }
-}
-
 fn software_device() -> bool {
     gpu::shared_context()
         .device_information()
@@ -53,7 +42,7 @@ fn values(n: usize, scale: f32) -> Vec<f32> {
 #[test]
 #[ignore = "GPU: three Whisper-scale F64 backward oracles; run explicitly"]
 fn accelerated_whisper_attention_matches_oracle() {
-    if skip_backprop() || software_device() {
+    if software_device() {
         eprintln!("skipping long accelerated oracle on a software Vulkan device");
         return;
     }
@@ -118,7 +107,7 @@ fn accelerated_whisper_attention_matches_oracle() {
 
 #[test]
 fn accelerated_peaked_unmasked_attention_matches_oracle() {
-    if skip_backprop() || software_device() {
+    if software_device() {
         eprintln!("skipping peaked attention oracle on a software Vulkan device");
         return;
     }

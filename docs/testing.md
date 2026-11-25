@@ -326,9 +326,8 @@ cargo llvm-cov report --ignore-filename-regex '(^|/)(tests|examples|bench)/' --h
 These are **Rust host** measurements, not WGSL execution coverage. Generating a
 shader does not prove its arithmetic correct. Pair coverage with broad GPU
 output/gradient parity and state round-trips. Record the adapter, feature
-configuration and skips: lavapipe/Metal CI currently skip known unstable
-backprop and bit-exact cases; hardware runs must not silently inherit those
-skips. Coverage does not establish numerical accuracy or all-platform coverage.
+configuration and skips: lavapipe/Metal CI currently skip the bit-exact
+cases; hardware runs must not silently inherit that skip. Coverage does not establish numerical accuracy or all-platform coverage.
 
 September 8 baseline on RTX 5070, Rust 1.98.0 / cargo-llvm-cov 0.9.1, default
 features, no backprop/bit-exact skips (ordinary ignored tests remain ignored):
