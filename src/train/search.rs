@@ -50,7 +50,8 @@ pub struct BuildSearchOptions {
     /// In-flight driver work and caller validation cannot be preempted. An
     /// incomplete comparison cannot select its program, so the search does not
     /// start one when even its cheapest recent complete comparison would not
-    /// finish in time.
+    /// finish in time. The ordinary fallback is exempt: it is built and
+    /// qualified even when the deadline has already passed.
     pub max_time: Duration,
     /// Includes the initial untuned fallback and its tuned challenger. One
     /// returns only the fallback, without probing or applying kernel decisions
@@ -108,6 +109,8 @@ pub struct BuildSearchReport {
     /// Requested arithmetic rejected by the device capability/numerical probe.
     /// Empty when the search had no other program to probe for.
     pub unsupported_matrix_inputs: Vec<crate::DType>,
+    /// Lowering the ordinary program, plus preparing every other program if
+    /// the search went on to a second one.
     pub preparation_time: Duration,
     pub selected: usize,
     pub trials: Vec<BuildSearchTrial>,
@@ -146,7 +149,10 @@ pub struct BuildSearchReport {
 /// every output, gradient and persistent update after one step, repeated
 /// `qualification_runs` times; different plans, including one plan before and
 /// after kernel tuning, may use different arithmetic. The untuned ordinary
-/// program is qualified first and is the fallback. Challengers are qualified
+/// program is qualified first and is the fallback. Only then are the other
+/// graph forms extracted and the device probed for the physical choices, so a
+/// search that ends there, by its program bound or its deadline, has paid for
+/// nothing else and still returns that program. Challengers are qualified
 /// before timing and again on a win, and are discarded on failure. The selected
 /// program is rechecked if others ran since, or per `final_qualification_runs`;
 /// that failure aborts. State is reset before each step, outside timing; the
@@ -235,191 +241,228 @@ pub fn build_measured_with_inputs(
         cfg.skip_full_optimize,
         cfg.options.bf16_matrix_gradients,
     );
-    let mut graphs = vec![optimize::search::Candidate {
-        graph: ordinary,
-        expression: "ordinary extraction".into(),
-    }];
-    let mut extraction_truncated = false;
-    let mut skipped_regions = Vec::new();
-    // A one-program request returns the ordinary fallback. No other program
-    // can run, so none is extracted, lowered or probed for.
-    let alternatives = options.max_programs > 1;
-    if alternatives
-        && cfg.optimize.mode != optimize::OptimizeMode::Off
-        && options.max_graphs > 1
-        && start.elapsed() < options.max_time
-    {
-        let source = super::recognize(forward_graph, cfg.mode, &cfg.optimize).into_toposort();
-        let limit = options.max_graphs - 1;
-        let space = optimize::search::candidates(&source, cfg.optimize, limit, target);
-        let spaces = if space.is_ok()
-            || source.nodes().len()
-                <= cfg
-                    .optimize
-                    .saturation_cutoff
-                    .min(optimize::SATURATION_CUTOFF)
-        {
-            vec![space]
-        } else {
-            // Reuse outlining, not model names or a second pattern matcher.
-            let regions = crate::outline::detect_repeated_regions(&source);
-            extraction_truncated |= regions.len() > 1;
-            if regions.is_empty() {
-                skipped_regions.push("large graph has no bounded repeated region".into());
-            }
-            regions
-                .into_iter()
-                .take(1)
-                .map(|region| {
-                    optimize::search::repeated_candidates(
-                        &source,
-                        region,
-                        cfg.optimize,
-                        limit,
-                        target,
-                    )
-                })
-                .collect()
-        };
-        for space in spaces {
-            match space {
-                Ok(space) => {
-                    extraction_truncated |= space.truncated;
-                    let unfused = optimize::OptimizeConfig {
-                        mode: optimize::OptimizeMode::Off,
-                        ..cfg.optimize
-                    };
-                    for form in space.candidates {
-                        if start.elapsed() >= options.max_time {
-                            extraction_truncated = true;
-                            break;
-                        }
-                        graphs.push(optimize::search::Candidate {
-                            graph: prepare_graph(
-                                &form.graph,
-                                cfg.mode,
-                                unfused,
-                                cfg.skip_full_optimize,
-                                cfg.options.bf16_matrix_gradients,
-                            )
-                            .0,
-                            expression: form.expression,
-                        });
-                    }
-                }
-                Err(error) => skipped_regions.push(error),
-            }
-        }
-    }
-    let mut backward_ranks = vec![0; graphs.len()];
-    if alternatives
-        && cfg.mode == crate::Mode::Training
-        && cfg.optimize.mode != optimize::OptimizeMode::Off
-        && options.max_graphs > 1
-    {
-        let (space, ranks) = backward_layouts(
-            graphs,
-            cfg.optimize,
-            target,
-            options.max_graphs,
-            start + options.max_time,
-            &mut skipped_regions,
-        );
-        backward_ranks = ranks;
-        graphs = space.candidates;
-        extraction_truncated |= space.truncated;
-    }
-    let expressions = graphs.iter().map(|form| form.expression.clone()).collect();
-    // Compile graph forms only once. Physical alternatives remain lazy, and are
-    // interleaved across forms rather than spending the budget on the first form.
-    let mut seeds: Vec<Seed> = Vec::new();
-    for (index, form) in graphs.into_iter().enumerate() {
-        if start.elapsed() >= options.max_time {
-            extraction_truncated = true;
-            break;
-        }
-        let graph = std::sync::Arc::new(form.graph);
-        let plan = compile::compile_with_caps(&graph, &cfg.options, caps, shared_memory_bytes);
-        if !seeds.iter().any(|seed| seed.plan == plan) {
-            seeds.push(Seed {
-                backward_rank: backward_ranks[index],
-                description: format!("graph={index}"),
-                plan,
-                graph,
-                options: cfg.options.clone(),
-            });
-        }
-    }
+    // The ordinary program is lowered now and runs first. Everything else
+    // the search may measure is prepared by `alternatives`, once that program
+    // has run: the caller holds a qualified fallback before any optional work
+    // is paid for, and a one-program request never pays for it.
+    let ordinary = std::sync::Arc::new(ordinary);
+    let fallback = implementations(
+        vec![Seed {
+            backward_rank: 0,
+            description: "graph=0".into(),
+            plan: compile::compile_with_caps(&ordinary, &cfg.options, caps, shared_memory_bytes),
+            graph: ordinary,
+            options: cfg.options.clone(),
+        }],
+        caps,
+        shared_memory_bytes,
+        options.max_plan_bytes,
+    );
     // Arithmetic permission belongs to the runtime policy, not a second opt-in.
     // Checked F16 reaches rectangular tiles and extracted scalar layouts that
     // the ordinary square-tile heuristic leaves alone.
     let matrix_inputs = matrix_input_order(cfg.runtime.coop, caps);
-    let mut unsupported_matrix_inputs = Vec::new();
-    let mut programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
-    if alternatives {
-        let supported: Vec<_>;
-        (supported, unsupported_matrix_inputs) = matrix_inputs
+    let coop = cfg.runtime.coop;
+    let allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
+    let device = gpu.clone();
+    let alternatives = |programs: &mut Implementations, report: &mut BuildSearchReport| {
+        let prepared = Instant::now();
+        let (max_graphs, max_time) = (report.options.max_graphs, report.options.max_time);
+        let mut extracted = Vec::new();
+        let mut extraction_truncated = false;
+        let mut skipped_regions = Vec::new();
+        if cfg.optimize.mode != optimize::OptimizeMode::Off
+            && max_graphs > 1
+            && start.elapsed() < max_time
+        {
+            let source = super::recognize(forward_graph, cfg.mode, &cfg.optimize).into_toposort();
+            let limit = max_graphs - 1;
+            let space = optimize::search::candidates(&source, cfg.optimize, limit, target);
+            let spaces = if space.is_ok()
+                || source.nodes().len()
+                    <= cfg
+                        .optimize
+                        .saturation_cutoff
+                        .min(optimize::SATURATION_CUTOFF)
+            {
+                vec![space]
+            } else {
+                // Reuse outlining, not model names or a second pattern matcher.
+                let regions = crate::outline::detect_repeated_regions(&source);
+                extraction_truncated |= regions.len() > 1;
+                if regions.is_empty() {
+                    skipped_regions.push("large graph has no bounded repeated region".into());
+                }
+                regions
+                    .into_iter()
+                    .take(1)
+                    .map(|region| {
+                        optimize::search::repeated_candidates(
+                            &source,
+                            region,
+                            cfg.optimize,
+                            limit,
+                            target,
+                        )
+                    })
+                    .collect()
+            };
+            for space in spaces {
+                match space {
+                    Ok(space) => {
+                        extraction_truncated |= space.truncated;
+                        let unfused = optimize::OptimizeConfig {
+                            mode: optimize::OptimizeMode::Off,
+                            ..cfg.optimize
+                        };
+                        for form in space.candidates {
+                            if start.elapsed() >= max_time {
+                                extraction_truncated = true;
+                                break;
+                            }
+                            extracted.push(optimize::search::Candidate {
+                                graph: prepare_graph(
+                                    &form.graph,
+                                    cfg.mode,
+                                    unfused,
+                                    cfg.skip_full_optimize,
+                                    cfg.options.bf16_matrix_gradients,
+                                )
+                                .0,
+                                expression: form.expression,
+                            });
+                        }
+                    }
+                    Err(error) => skipped_regions.push(error),
+                }
+            }
+        }
+        // The ordinary form keeps the seed it ran from. `forms` are the
+        // others, each with the rank of its backward layout.
+        let ordinary = programs.seeds.remove(0);
+        let forms: Vec<_> = if cfg.mode == crate::Mode::Training
+            && cfg.optimize.mode != optimize::OptimizeMode::Off
+            && max_graphs > 1
+        {
+            let graphs: Vec<_> = std::iter::once((&*ordinary.graph, ORDINARY))
+                .chain(
+                    extracted
+                        .iter()
+                        .map(|form| (&form.graph, form.expression.as_str())),
+                )
+                .collect();
+            let (space, ranks) = backward_layouts(
+                &graphs,
+                cfg.optimize,
+                target,
+                max_graphs,
+                start + max_time,
+                &mut skipped_regions,
+            );
+            extraction_truncated |= space.truncated;
+            // The first layout is the ordinary graph again.
+            space.candidates.into_iter().zip(ranks).skip(1).collect()
+        } else {
+            extracted.into_iter().map(|form| (form, 0)).collect()
+        };
+        let expressions = std::iter::once(ORDINARY.into())
+            .chain(forms.iter().map(|form| form.0.expression.clone()))
+            .collect();
+        // Compile graph forms only once. Physical alternatives remain lazy, and are
+        // interleaved across forms rather than spending the budget on the first form.
+        let mut seeds = vec![ordinary];
+        for (index, (form, backward_rank)) in forms.into_iter().enumerate() {
+            if start.elapsed() >= max_time {
+                extraction_truncated = true;
+                break;
+            }
+            let graph = std::sync::Arc::new(form.graph);
+            let plan = compile::compile_with_caps(&graph, &cfg.options, caps, shared_memory_bytes);
+            if !seeds.iter().any(|seed| seed.plan == plan) {
+                seeds.push(Seed {
+                    backward_rank,
+                    description: format!("graph={}", index + 1),
+                    plan,
+                    graph,
+                    options: cfg.options.clone(),
+                });
+            }
+        }
+        let (supported, unsupported_matrix_inputs): (Vec<_>, Vec<_>) = report
+            .matrix_inputs
             .iter()
             .copied()
-            .partition(|&ty| runtime::typed_matrix_supported(&gpu, ty));
+            .partition(|&ty| runtime::typed_matrix_supported(&device, ty));
+        let mut all = implementations(
+            seeds,
+            caps,
+            shared_memory_bytes,
+            report.options.max_plan_bytes,
+        );
         // Arithmetic alternatives may replace this search's extracted scalar layouts,
         // but keep layouts already present in the caller's graph.
-        programs.replace_extracted_matrices = forward_graph
+        all.replace_extracted_matrices = forward_graph
             .nodes()
             .iter()
             .all(|n| n.matmul_impl.is_none());
-        programs.replace_extracted_attention = forward_graph
+        all.replace_extracted_attention = forward_graph
             .nodes()
             .iter()
             .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
-        programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
-        programs.parallel_width = match options.tuning.calibration {
+        all.allow_matrix_storage = allow_matrix_storage;
+        all.parallel_width = match report.options.tuning.calibration {
             crate::tune::TuneCalibration::Profile(ref profile) => profile.parallel_width,
             _ => None,
         };
-        programs.attention_subgroup_size = gpu.capabilities().subgroup_size;
-        if programs.replace_extracted_attention {
-            programs.block_cooperative =
-                crate::kernels::attention::block_cooperative(&gpu.capabilities(), programs.caps);
-            programs.enable_block_attention();
+        all.attention_subgroup_size = device.capabilities().subgroup_size;
+        if all.replace_extracted_attention {
+            all.block_cooperative =
+                crate::kernels::attention::block_cooperative(&device.capabilities(), all.caps);
+            all.enable_block_attention();
         }
-        programs.enable_matrix_inputs(&supported, &gpu.capabilities());
-        programs.enable_gradient_inputs(&supported);
-        programs.enable_conv_gradient_inputs(&supported);
+        all.enable_matrix_inputs(&supported, &device.capabilities());
+        all.enable_gradient_inputs(&supported);
+        all.enable_conv_gradient_inputs(&supported);
         if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
-            programs.enable_forward_products(gpu.capabilities().subgroup_size);
+            all.enable_forward_products(device.capabilities().subgroup_size);
         }
-        programs.enable_flash_reductions();
+        all.enable_flash_reductions();
         if cfg.mode == crate::Mode::Inference
-            && matches!(
-                cfg.runtime.coop,
-                crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
-            )
-            && gpu.capabilities().shader_float16
+            && matches!(coop, crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16)
+            && device.capabilities().shader_float16
         {
-            programs.enable_flash_tiles();
+            all.enable_flash_tiles();
         }
         if cfg.mode == crate::Mode::Training {
-            programs.enable_flash_backward(
-                matches!(
-                    cfg.runtime.coop,
-                    crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
-                ) && gpu.capabilities().shader_float16,
+            all.enable_flash_backward(
+                matches!(coop, crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16)
+                    && device.capabilities().shader_float16,
             );
         }
-    }
+        // This frontier opens with the ordinary program too. It has run, so
+        // the frontier moves past it and learns how it fared.
+        let fallback = measure::Frontier::next(&mut all, None).and_then(|program| program.origin);
+        debug_assert_eq!(fallback, Some(measure::Origin { form: 0, choice: 0 }));
+        if let (Some(origin), Some(trial)) = (fallback, report.trials.first()) {
+            measure::Frontier::observe(&mut all, origin, trial.outcome.qualified);
+        }
+        *programs = all;
+        report.graphs = expressions;
+        report.extraction_truncated = extraction_truncated;
+        report.skipped_regions = skipped_regions;
+        report.unsupported_matrix_inputs = unsupported_matrix_inputs;
+        report.preparation_time += prepared.elapsed();
+    };
     let preparation_time = start.elapsed();
     measure::select(
-        programs,
+        fallback,
+        alternatives,
         gpu,
         cfg.runtime,
         BuildSearchReport {
             options,
-            graphs: expressions,
-            extraction_truncated,
-            skipped_regions,
+            graphs: vec![ORDINARY.into()],
             matrix_inputs,
-            unsupported_matrix_inputs,
             preparation_time,
             ..Default::default()
         },
@@ -427,6 +470,9 @@ pub fn build_measured_with_inputs(
         (initialize, refresh_inputs, qualify),
     )
 }
+
+/// How the report names the form that ordinary extraction gives.
+const ORDINARY: &str = "ordinary extraction";
 
 fn matrix_input_order(
     policy: crate::CoopPolicy,
@@ -447,7 +493,7 @@ fn matrix_input_order(
 /// Cover one backward layout and one joint graph/layout choice early, then
 /// interleave both axes so neither displaces the other under a deadline.
 fn backward_layouts(
-    graphs: Vec<optimize::search::Candidate>,
+    graphs: &[(&Graph, &str)],
     config: optimize::OptimizeConfig,
     target: optimize::search::Target,
     limit: usize,
@@ -476,17 +522,17 @@ fn backward_layouts(
                 ranks,
             );
         }
-        let graph = &graphs[index];
+        let (graph, expression) = graphs[index];
         if layout == 0 {
             ranks.push(layout);
             candidates.push(optimize::search::Candidate {
-                graph: graph.graph.deep_clone(),
-                expression: graph.expression.clone(),
+                graph: graph.deep_clone(),
+                expression: expression.into(),
             });
             continue;
         }
         let pending = layouts[index].get_or_insert_with(|| {
-            match optimize::search::backward_candidates(&graph.graph, config, limit - 1, target) {
+            match optimize::search::backward_candidates(graph, config, limit - 1, target) {
                 Ok(space) => {
                     truncated |= space.truncated;
                     space.candidates.into()
@@ -501,7 +547,7 @@ fn backward_layouts(
             ranks.push(layout);
             candidates.push(optimize::search::Candidate {
                 graph: form.graph,
-                expression: format!("{}; backward={}", graph.expression, form.expression),
+                expression: format!("{expression}; backward={}", form.expression),
             });
         }
     }
@@ -5256,9 +5302,11 @@ mod tests {
         );
     }
 
-    /// A search that can measure one program owes the caller the ordinary
-    /// one and nothing else, so it extracts no other graph form and probes
-    /// no arithmetic for programs it will never run.
+    /// A search that may measure one program, or whose deadline leaves no
+    /// room for a second, owes the caller the ordinary one and nothing else.
+    /// It extracts no other graph form and probes no arithmetic for programs
+    /// it will never run, and it returns that program however little time
+    /// it was given.
     #[test]
     fn minimal_searches_prepare_only_the_ordinary_program() {
         let gpu = crate::reference::gpu::shared_context();
@@ -5312,23 +5360,34 @@ mod tests {
         });
         assert!(wider.graphs.len() > 1, "{:?}", wider.graphs);
 
-        let (mut session, report) = search(BuildSearchOptions {
-            max_programs: 1,
-            ..Default::default()
-        });
-        assert_eq!(report.graphs, ["ordinary extraction"]);
-        assert!(report.unsupported_matrix_inputs.is_empty());
-        assert_eq!((report.trials.len(), report.selected), (1, 0));
-        assert!(report.trials[0].outcome.qualified);
-        // Other programs exist; this search was not allowed to reach them.
-        assert!(report.truncated);
-        session.step();
-        session.wait();
-        assert!(
-            session
-                .read_output(32 * 32)
-                .iter()
-                .all(|value| (value - 1.0).abs() < 1e-5)
-        );
+        let bounds = [
+            BuildSearchOptions {
+                max_programs: 1,
+                ..Default::default()
+            },
+            // Over before the ordinary program is even lowered.
+            BuildSearchOptions {
+                max_time: Duration::from_nanos(1),
+                ..Default::default()
+            },
+        ];
+        for (case, bound) in ["one program", "no time"].into_iter().zip(bounds) {
+            let (mut session, report) = search(bound);
+            assert_eq!(report.graphs, ["ordinary extraction"], "{case}");
+            assert!(report.unsupported_matrix_inputs.is_empty(), "{case}");
+            assert_eq!((report.trials.len(), report.selected), (1, 0), "{case}");
+            assert!(report.trials[0].outcome.qualified, "{case}");
+            // Other programs exist; this search could not reach them.
+            assert!(report.truncated, "{case}");
+            session.step();
+            session.wait();
+            assert!(
+                session
+                    .read_output(32 * 32)
+                    .iter()
+                    .all(|value| (value - 1.0).abs() < 1e-5),
+                "{case}"
+            );
+        }
     }
 }

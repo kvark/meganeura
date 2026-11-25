@@ -220,8 +220,16 @@ fn kernel_probe_budget(
     available.saturating_sub(comparison.saturating_mul(slots)) / slots
 }
 
-pub(super) fn select(
-    mut programs: impl Frontier,
+/// Measure `programs` against each other and return the fastest that
+/// qualifies.
+///
+/// The first program is the fallback. It runs whatever the deadline, because
+/// without it there is nothing to return. `alternatives` then runs once,
+/// before a second program is requested, and prepares everything else the
+/// frontier may offer. A search that stops at the fallback never calls it.
+pub(super) fn select<P: Frontier>(
+    mut programs: P,
+    alternatives: impl FnOnce(&mut P, &mut BuildSearchReport),
     gpu: Arc<blade_graphics::Context>,
     runtime: SessionOptions,
     mut report: BuildSearchReport,
@@ -262,6 +270,7 @@ pub(super) fn select(
     // Nothing executed since the incumbent's last qualification.
     let mut incumbent_checked = false;
     let mut incumbent_origin = None;
+    let mut alternatives = Some(alternatives);
     for index in 0..options.max_programs {
         // Preserve room for mandatory final checks without spending it on
         // losing candidates. The first trial supplies the cost estimate.
@@ -270,7 +279,10 @@ pub(super) fn select(
                 .max(incumbent_step)
                 .saturating_mul(options.final_qualification_runs),
         );
-        if start.elapsed() >= search_time {
+        // The deadline bounds the search for something better. It does not
+        // take the fallback away.
+        let fallback = index == 0;
+        if !fallback && start.elapsed() >= search_time {
             report.truncated = true;
             break;
         }
@@ -286,6 +298,14 @@ pub(super) fn select(
             report.truncated = true;
             report.deadline_reserved = true;
             break;
+        }
+        if !fallback && let Some(prepare) = alternatives.take() {
+            prepare(&mut programs, &mut report);
+            // Preparation is not preempted, and can use up what was left.
+            if start.elapsed() >= search_time {
+                report.truncated = true;
+                break;
+            }
         }
         let lowering = Instant::now();
         // Cover early arithmetic and the first layouts, then alternate so
@@ -313,7 +333,7 @@ pub(super) fn select(
         };
         probe_submission = program.submission_chunks.is_none();
         let lowering_time = lowering.elapsed();
-        if start.elapsed() >= search_time {
+        if !fallback && start.elapsed() >= search_time {
             report.truncated = true;
             break;
         }
@@ -669,6 +689,7 @@ mod tests {
     ) -> Result<(Session, BuildSearchReport), String> {
         super::select(
             programs.into_iter().fuse(),
+            |_, _| {},
             gpu,
             runtime,
             BuildSearchReport {
@@ -1396,6 +1417,7 @@ mod tests {
             };
             let (mut session, report) = super::select(
                 programs.fuse(),
+                |_, _| {},
                 gpu.clone(),
                 SessionOptions::default(),
                 BuildSearchReport {
