@@ -4434,10 +4434,19 @@ impl Session {
             }
             for &(buf_ref, value) in &plan.uniform_constants {
                 let buffer = &buffers[buf_ref.0 as usize];
-                let elems = plan.buffers[buf_ref.0 as usize] / std::mem::size_of::<f32>();
+                let logical_bytes = plan.logical_buffer_bytes(buf_ref);
+                let physical_bytes = plan.buffers[buf_ref.0 as usize];
+                let elems = logical_bytes / std::mem::size_of::<f32>();
                 unsafe {
                     let ptr = buffer.data() as *mut f32;
                     std::slice::from_raw_parts_mut(ptr, elems).fill(value);
+                    if physical_bytes > logical_bytes {
+                        std::ptr::write_bytes(
+                            buffer.data().add(logical_bytes),
+                            0,
+                            physical_bytes - logical_bytes,
+                        );
+                    }
                 }
             }
         }

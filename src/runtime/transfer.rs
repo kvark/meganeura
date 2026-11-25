@@ -789,7 +789,7 @@ impl Session {
                 .iter()
                 .find_map(|&(buffer, value)| {
                     (buffer == target).then_some(ConstRef::Uniform {
-                        len: self.plan.buffers[buffer.0 as usize] / std::mem::size_of::<f32>(),
+                        len: self.plan.logical_buffer_bytes(buffer) / std::mem::size_of::<f32>(),
                         bits: value.to_bits(),
                     })
                 })

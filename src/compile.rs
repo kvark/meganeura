@@ -1650,7 +1650,7 @@ impl ExecutionPlan {
             );
         }
         for &(buf, value) in &self.uniform_constants {
-            let elems = self.buffers[buf.0 as usize] / 4;
+            let elems = self.logical_buffer_bytes(buf) / 4;
             current.insert(
                 buf,
                 hash_constant_bits(elems, std::iter::repeat_n(value.to_bits(), elems)),
