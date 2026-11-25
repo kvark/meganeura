@@ -3650,7 +3650,8 @@ pub enum CoopPolicy {
     /// f16 staging for scalar flash attention: forward Q/K and backward Q/K/V, with
     /// forward V, backward dO and dot arithmetic kept f32. Search also considers
     /// device-qualified F16/BF16 forward products, mixed-precision cooperative
-    /// attention derivatives, AT/BT derivative products and pointwise convolution
+    /// attention derivatives, AT/BT derivative products, BF16 NN activation
+    /// gradients in mixed trials, and pointwise convolution
     /// input gradients, subject to the caller's whole-program accuracy and timing
     /// gates. Explicit precision pins are never bypassed.
     #[default]
@@ -3667,7 +3668,8 @@ pub enum CoopPolicy {
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
     /// and can overflow or lose gradient range. Measured search also considers
     /// device-qualified typed F16/BF16 candidates for eligible forward products,
-    /// AT/BT derivatives and pointwise convolution input gradients,
+    /// AT/BT derivatives, BF16 NN activation gradients in mixed trials, and
+    /// pointwise convolution input gradients,
     /// subject to the caller's whole-program accuracy and timing gates.
     AllowF16,
 }
