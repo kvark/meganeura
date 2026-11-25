@@ -85,7 +85,28 @@ pub struct PointwiseDAG {
     pub output: u16,
 }
 
+/// Scalar `erf(x)` helper emitted at module scope when a [`PointwiseDAG`] uses
+/// [`Pw::Erf`]. Uses a Taylor series near zero (where `1 - erfc` loses relative
+/// precision) and Numerical Recipes' Chebyshev fit of `erfc` elsewhere.
+pub(crate) const ERF_WGSL: &str = "\
+fn erf_f32(x: f32) -> f32 {
+    let z = abs(x);
+    let s = x * x;
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let c = t * exp(-s + -1.26551223 + t * (1.00002368 + t * (0.37409196 + \
+t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + \
+t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+    let p = x * (1.1283792 + s * (-0.37612639 + s * (0.11283792 + \
+s * (-0.026866172 + s * (0.0052239776 + s * -0.00085483270)))));
+    return select(sign(x) * (1.0 - c), p, z < 0.5);
+}
+";
+
 impl PointwiseDAG {
+    /// Whether this DAG contains any [`Pw::Erf`] node requiring [`ERF_WGSL`].
+    pub(crate) fn uses_erf(&self) -> bool {
+        self.ops.iter().any(|op| matches!(op, Pw::Erf(_)))
+    }
     /// Stable content hash — suitable as a pipeline-cache key.
     pub fn hash_key(&self) -> u64 {
         let mut h = DefaultHasher::new();
@@ -201,31 +222,24 @@ impl PointwiseDAG {
         load: impl Fn(u8) -> String,
         broadcast: impl Fn(u8, u32, u32) -> String,
     ) -> String {
+        self.emit_body_impl(load, broadcast, false)
+    }
+
+    fn emit_body_impl(
+        &self,
+        load: impl Fn(u8) -> String,
+        broadcast: impl Fn(u8, u32, u32) -> String,
+        vec4: bool,
+    ) -> String {
+        let lit = |s: &str| -> String {
+            if vec4 {
+                format!("vec4<f32>({s})")
+            } else {
+                s.to_string()
+            }
+        };
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
-            if let Pw::Erf(a) = *op {
-                // A Taylor series near zero, where `1 - erfc` would lose
-                // the relative precision, and Numerical Recipes' Chebyshev
-                // fit of erfc elsewhere.
-                let _ = writeln!(
-                    out,
-                    "    let v{k}_z = abs(v{a});\n    \
-                     let v{k}_s = v{a} * v{a};\n    \
-                     let v{k}_t = 1.0 / (1.0 + 0.5 * v{k}_z);\n    \
-                     let v{k}_c = v{k}_t * exp(-v{k}_s - 1.26551223 + v{k}_t * (1.00002368 + \
-                     v{k}_t * (0.37409196 + v{k}_t * (0.09678418 + v{k}_t * (-0.18628806 + \
-                     v{k}_t * (0.27886807 + v{k}_t * (-1.13520398 + v{k}_t * (1.48851587 + \
-                     v{k}_t * (-0.82215223 + v{k}_t * 0.17087277)))))))));\n    \
-                     let v{k}_p = v{a} * (1.1283792 + v{k}_s * (-0.37612639 + v{k}_s * \
-                     (0.11283792 + v{k}_s * (-0.026866172 + v{k}_s * (0.0052239776 + \
-                     v{k}_s * -0.00085483270)))));"
-                );
-                let _ = writeln!(
-                    out,
-                    "    let v{k} = select(sign(v{a}) * (1.0 - v{k}_c), v{k}_p, v{k}_z < 0.5);"
-                );
-                continue;
-            }
             let _ = write!(out, "    let v{} = ", k);
             match *op {
                 Pw::LoadInput(idx) => {
@@ -242,15 +256,16 @@ impl PointwiseDAG {
                     // Reconstruct f32 and emit with a decimal point + `f` suffix
                     // so WGSL parses it as f32 regardless of value.
                     let v = f32::from_bits(bits);
-                    if v.is_finite() {
-                        let _ = write!(out, "{:?}f", v);
+                    let scalar = if v.is_finite() {
+                        format!("{v:?}f")
                     } else if v.is_nan() {
-                        out.push_str("bitcast<f32>(0x7fc00000u)");
+                        "bitcast<f32>(0x7fc00000u)".to_string()
                     } else if v.is_sign_positive() {
-                        out.push_str("bitcast<f32>(0x7f800000u)");
+                        "bitcast<f32>(0x7f800000u)".to_string()
                     } else {
-                        out.push_str("bitcast<f32>(0xff800000u)");
-                    }
+                        "bitcast<f32>(0xff800000u)".to_string()
+                    };
+                    let _ = write!(out, "{}", lit(&scalar));
                 }
                 Pw::Add(a, b) => {
                     let _ = write!(out, "v{} + v{}", a, b);
@@ -271,13 +286,20 @@ impl PointwiseDAG {
                     let _ = write!(out, "max(v{}, v{})", a, b);
                 }
                 Pw::Greater(a, b) => {
-                    let _ = write!(out, "select(0.0, 1.0, v{} > v{})", a, b);
+                    let _ = write!(
+                        out,
+                        "select({}, {}, v{} > v{})",
+                        lit("0.0"),
+                        lit("1.0"),
+                        a,
+                        b
+                    );
                 }
                 Pw::Neg(a) => {
                     let _ = write!(out, "-v{}", a);
                 }
                 Pw::Recip(a) => {
-                    let _ = write!(out, "1.0 / v{}", a);
+                    let _ = write!(out, "{} / v{}", lit("1.0"), a);
                 }
                 Pw::Exp(a) => {
                     let _ = write!(out, "exp(v{})", a);
@@ -295,15 +317,24 @@ impl PointwiseDAG {
                     let _ = write!(out, "inverseSqrt(v{})", a);
                 }
                 Pw::Relu(a) => {
-                    let _ = write!(out, "max(v{}, 0.0)", a);
+                    let _ = write!(out, "max(v{}, {})", a, lit("0.0"));
                 }
                 Pw::Sigmoid(a) => {
-                    let _ = write!(out, "1.0 / (1.0 + exp(-v{}))", a);
+                    let _ = write!(out, "{} / ({} + exp(-v{}))", lit("1.0"), lit("1.0"), a);
                 }
                 Pw::Silu(a) => {
-                    let _ = write!(out, "v{} / (1.0 + exp(-v{}))", a, a);
+                    let _ = write!(out, "v{} / ({} + exp(-v{}))", a, lit("1.0"), a);
                 }
-                Pw::Erf(_) => unreachable!("emitted above"),
+                Pw::Erf(a) => {
+                    if vec4 {
+                        let _ = write!(
+                            out,
+                            "vec4<f32>(erf_f32(v{a}.x), erf_f32(v{a}.y), erf_f32(v{a}.z), erf_f32(v{a}.w))"
+                        );
+                    } else {
+                        let _ = write!(out, "erf_f32(v{a})");
+                    }
+                }
                 Pw::Sin(a) => {
                     let _ = write!(out, "sin(v{a})");
                 }
@@ -311,18 +342,29 @@ impl PointwiseDAG {
                     let _ = write!(out, "cos(v{a})");
                 }
                 Pw::U32ToF32(a) => {
-                    let _ = write!(out, "f32(bitcast<u32>(v{a}))");
+                    if vec4 {
+                        let _ = write!(out, "vec4<f32>(bitcast<vec4<u32>>(v{a}))");
+                    } else {
+                        let _ = write!(out, "f32(bitcast<u32>(v{a}))");
+                    }
                 }
                 Pw::F32ToU32(a) => {
-                    let _ = write!(out, "bitcast<f32>(u32(max(v{a}, 0.0)))");
+                    if vec4 {
+                        let _ = write!(
+                            out,
+                            "bitcast<vec4<f32>>(vec4<u32>(max(v{a}, vec4<f32>(0.0))))"
+                        );
+                    } else {
+                        let _ = write!(out, "bitcast<f32>(u32(max(v{a}, 0.0)))");
+                    }
                 }
                 Pw::Tanh(a) => {
                     // Saturated outside ±10 (exactly ±1 in f32): some drivers
                     // evaluate tanh through exp(2x), which overflows to NaN.
                     let _ = write!(
                         out,
-                        "select(tanh(v{a}), sign(v{a}), abs(v{a}) > 10.0)",
-                        a = a
+                        "select(tanh(v{a}), sign(v{a}), abs(v{a}) > {})",
+                        lit("10.0")
                     );
                 }
             }
@@ -331,27 +373,66 @@ impl PointwiseDAG {
         out
     }
 
-    /// Binding names for each input stream, chosen to match the existing
-    /// hand-written shaders so generated modules plug into the same
-    /// runtime data layouts:
-    ///   - n=1 → ["src"]                        (matches `UnaryData`)
-    ///   - n=2 → ["src_a", "src_b"]             (matches `BinaryData`)
-    ///   - n=3 → ["src_a", "src_b", "src_c"]    (matches `TernaryData`)
-    ///
-    /// Panics for n>3 — the runtime does not currently plumb a wider
-    /// data layout (see `runtime::pointwise_data_layout`). The fusion
-    /// pass caps output arity at 3.
-    fn input_binding_names(n: u8) -> Vec<String> {
-        match n {
-            1 => vec!["src".to_string()],
-            2 => vec!["src_a".to_string(), "src_b".to_string()],
-            3 => vec![
-                "src_a".to_string(),
-                "src_b".to_string(),
-                "src_c".to_string(),
-            ],
-            n => panic!("PointwiseDAG arity {} has no binding layout", n),
+    /// Per-input vectorization classification for a 4-wide (`vec4<f32>`)
+    /// pointwise kernel. Returns `Some(is_vec4)` when every input can be
+    /// declared either as `array<vec4<f32>>` (`true`: contiguous loads or
+    /// `divisor == 1` with `modulus % 4 == 0`) or as scalar `array<f32>`
+    /// (`false`: channel broadcasts with `divisor % 4 == 0` where all 4 lanes
+    /// read the same element). Returns `None` if storage is narrowed, `len` is
+    /// not a positive multiple of 4, or any input has mixed/unaligned access.
+    pub fn vec4_input_kinds(&self, storage: PointwiseStorage, len: u32) -> Option<Vec<bool>> {
+        if storage != PointwiseStorage::default() || len < 4 || !len.is_multiple_of(4) {
+            return None;
         }
+        let mut kinds: Vec<Option<bool>> = vec![None; self.n_inputs as usize];
+        for op in &self.ops {
+            match *op {
+                Pw::LoadInput(idx) => {
+                    let slot = kinds.get_mut(idx as usize)?;
+                    if *slot == Some(false) {
+                        return None;
+                    }
+                    *slot = Some(true);
+                }
+                Pw::LoadBroadcast {
+                    input,
+                    divisor,
+                    modulus,
+                } => {
+                    let slot = kinds.get_mut(input as usize)?;
+                    let is_vec4 = if divisor == 1 && modulus >= 4 && modulus.is_multiple_of(4) {
+                        true
+                    } else if divisor >= 4 && divisor.is_multiple_of(4) && modulus > 0 {
+                        false
+                    } else {
+                        return None;
+                    };
+                    if let Some(prev) = *slot
+                        && prev != is_vec4
+                    {
+                        return None;
+                    }
+                    *slot = Some(is_vec4);
+                }
+                _ => {}
+            }
+        }
+        // Require every declared input to be referenced so we never retype an
+        // unused short buffer as `array<vec4<f32>>`.
+        kinds.into_iter().collect()
+    }
+
+    /// Whether this pointwise DAG can safely execute 4 elements per thread via
+    /// `vec4<f32>` loads and stores.
+    pub fn can_vectorize(&self, storage: PointwiseStorage, len: u32) -> bool {
+        self.vec4_input_kinds(storage, len).is_some()
+    }
+
+    /// Binding names for each input stream:
+    ///   - n=1 → `["src"]`
+    ///   - n=2..=MAX_POINTWISE_INPUTS → `["src_a", "src_b", ..., "src_g"][..n]`
+    fn input_binding_names(n: u8) -> Vec<&'static str> {
+        pointwise_input_binding_names(n)
     }
 
     /// Whether any input is read through a broadcast index rather than at
@@ -647,6 +728,34 @@ pub struct ReductionKernel {
     /// Empty is equivalent to all factors being one.
     #[serde(default)]
     pub input_row_repeats: Vec<u32>,
+    /// Keep the scalar shared-memory tree reduction order (disable subgroup
+    /// reduction and `vec4` lane grouping). Set by emitters whose late-fused
+    /// counterpart or debug-mode parity depends on the exact scalar tree
+    /// summation order (currently `RmsNorm` vs `rms_norm_add.wgsl`).
+    #[serde(default)]
+    pub preserve_tree_order: bool,
+}
+
+/// Maximum number of input streams supported by a fused [`PointwiseDAG`].
+/// Capped at 7 inputs + 1 output = 8 storage buffers so fused kernels fit
+/// devices exposing an 8-storage-buffer-per-stage limit (and stay within the
+/// 8-bit [`PointwiseStorage::bf16_inputs`] mask).
+pub const MAX_POINTWISE_INPUTS: u8 = 7;
+
+/// Static binding names for `n` pointwise (or per-element reduction) input
+/// streams. Preserves `src` / `src_a`..`src_c` for `n <= 3` and extends to
+/// `src_g` for wider fused DAGs.
+pub(crate) fn pointwise_input_binding_names(n: u8) -> Vec<&'static str> {
+    const NAMES: [&str; MAX_POINTWISE_INPUTS as usize] = [
+        "src_a", "src_b", "src_c", "src_d", "src_e", "src_f", "src_g",
+    ];
+    match n {
+        1 => vec!["src"],
+        2..=MAX_POINTWISE_INPUTS => NAMES[..n as usize].to_vec(),
+        _ => panic!(
+            "PointwiseDAG arity {n} has no binding layout (supported: 1..={MAX_POINTWISE_INPUTS})"
+        ),
+    }
 }
 
 impl ReductionKernel {
@@ -657,9 +766,61 @@ impl ReductionKernel {
         h.finish()
     }
 
+    /// Whether this reduction can safely execute using subgroup intrinsics
+    /// instead of a shared-memory tree reduction.
+    pub fn can_use_subgroups(&self, subgroup_size: u32) -> bool {
+        !self.preserve_tree_order
+            && subgroup_size > 0
+            && self.rows_per_workgroup == 1
+            && self.workgroup_size > 1
+    }
+
+    /// Whether this reduction can safely execute 4 elements per thread via
+    /// `vec4<f32>` loads (and stores when it has an F32 epilogue).
+    ///
+    /// Narrow packed rows (`lanes_per_row == 1`) stay scalar to preserve exact
+    /// sequential column summation order, `preserve_tree_order` keeps scalar
+    /// tree order, and `ArgMax` stays scalar because it tracks per-column
+    /// indices.
+    pub fn can_vectorize(&self, storage: PointwiseStorage, inner: u32) -> bool {
+        !self.preserve_tree_order
+            && self.op != ReduceOp::ArgMax
+            && self.workgroup_size > self.rows_per_workgroup
+            && storage == PointwiseStorage::default()
+            && inner >= 4
+            && inner.is_multiple_of(4)
+    }
+
     /// Keep reduction arithmetic and scratch F32; optionally narrow its map result.
+    #[cfg(test)]
     pub(crate) fn lower_with_storage(&self, storage: PointwiseStorage) -> ShaderModule {
-        lower_with_storage(&self.to_template(), storage)
+        self.lower_with_options(storage, false, false)
+    }
+
+    /// Lower with optional subgroup reduction and 4-wide (`vec4<f32>`) loads/stores.
+    pub(crate) fn lower_with_options(
+        &self,
+        storage: PointwiseStorage,
+        use_subgroups: bool,
+        vec4: bool,
+    ) -> ShaderModule {
+        lower_reduction(
+            self.op,
+            &self.prologue,
+            &self.extra_prologues,
+            self.epilogue.as_ref(),
+            self.n_per_elem,
+            self.n_per_row,
+            &self.gather_elem,
+            &self.input_row_repeats,
+            self.rows_per_workgroup,
+            GridShape {
+                workgroup_size: self.workgroup_size,
+            },
+            storage,
+            use_subgroups,
+            vec4,
+        )
     }
 
     /// Lower to the template form consumed by `lower`.
@@ -728,6 +889,8 @@ fn lower_with_storage(t: &KernelTemplate, storage: PointwiseStorage) -> ShaderMo
             rows_per_workgroup,
             grid,
             storage,
+            false,
+            false,
         ),
     }
 }
@@ -747,7 +910,33 @@ pub fn lower_pointwise_storage(
     grid: GridShape,
     storage: PointwiseStorage,
 ) -> ShaderModule {
-    assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
+    lower_pointwise_with_options(dag, grid, storage, None)
+}
+
+/// Lower a `vec4<f32>`-vectorized pointwise kernel (`4` F32 elements per
+/// thread). `input_is_vec4` comes from [`PointwiseDAG::vec4_input_kinds`].
+pub fn lower_pointwise_vec4(
+    dag: &PointwiseDAG,
+    grid: GridShape,
+    input_is_vec4: &[bool],
+) -> ShaderModule {
+    lower_pointwise_with_options(dag, grid, PointwiseStorage::default(), Some(input_is_vec4))
+}
+
+fn lower_pointwise_with_options(
+    dag: &PointwiseDAG,
+    grid: GridShape,
+    storage: PointwiseStorage,
+    vec4_inputs: Option<&[bool]>,
+) -> ShaderModule {
+    assert!(
+        dag.n_inputs <= MAX_POINTWISE_INPUTS,
+        "PointwiseDAG arity {} exceeds max {MAX_POINTWISE_INPUTS}",
+        dag.n_inputs
+    );
+    if dag.n_inputs < 8 {
+        assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
+    }
     assert!(!(storage.bf16_output && storage.f16_output));
     assert!(
         dag.n_inputs >= 1,
@@ -757,6 +946,10 @@ pub fn lower_pointwise_storage(
         (dag.output as usize) < dag.ops.len(),
         "PointwiseDAG.output is out of range"
     );
+    if let Some(kinds) = vec4_inputs {
+        assert_eq!(storage, PointwiseStorage::default());
+        assert_eq!(kinds.len(), dag.n_inputs as usize);
+    }
 
     let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
 
@@ -768,18 +961,25 @@ pub fn lower_pointwise_storage(
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
+    if dag.uses_erf() {
+        src.push_str(ERF_WGSL);
+    }
     src.push_str(
         "struct Params {\n    len: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
     );
     for (i, name) in input_names.iter().enumerate() {
-        let ty = if storage.bf16_inputs & (1 << i) != 0 {
+        let ty = if let Some(kinds) = vec4_inputs {
+            if kinds[i] { "vec4<f32>" } else { "f32" }
+        } else if storage.bf16_inputs & (1 << i) != 0 {
             "bf16"
         } else {
             "f32"
         };
         let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
     }
-    let ty = if storage.bf16_output {
+    let ty = if vec4_inputs.is_some() {
+        "vec4<f32>"
+    } else if storage.bf16_output {
         "bf16"
     } else if storage.f16_output {
         "f16"
@@ -795,31 +995,51 @@ pub fn lower_pointwise_storage(
         POINTWISE_ENTRY
     );
     src.push_str("    let i = gid.x;\n");
-    src.push_str("    if i >= params.len { return; }\n");
-    let load = |idx: u8, index: String| {
-        let value = format!("{}[{index}]", input_names[idx as usize]);
-        if storage.bf16_inputs & (1 << idx) != 0 {
-            format!("f32({value})")
-        } else {
-            value
-        }
-    };
-    src.push_str(&dag.emit_body_with(
-        |idx| load(idx, "i".into()),
-        |idx, divisor, modulus| load(idx, format!("(i / {divisor}u) % {modulus}u")),
-    ));
-    if storage.bf16_output {
-        let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
-    } else if storage.f16_output {
-        let _ = writeln!(src, "    dst[i] = f16(v{});", dag.output);
-    } else {
+    if let Some(kinds) = vec4_inputs {
+        src.push_str("    if i >= params.len / 4u { return; }\n");
+        src.push_str(&dag.emit_body_impl(
+            |idx| format!("{}[i]", input_names[idx as usize]),
+            |idx, divisor, modulus| {
+                let name = input_names[idx as usize];
+                if kinds[idx as usize] {
+                    debug_assert_eq!(divisor, 1);
+                    debug_assert!(modulus.is_multiple_of(4));
+                    format!("{name}[i % {}u]", modulus / 4)
+                } else {
+                    format!("vec4<f32>({name}[(i * 4u / {divisor}u) % {modulus}u])")
+                }
+            },
+            true,
+        ));
         let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+    } else {
+        src.push_str("    if i >= params.len { return; }\n");
+        let load = |idx: u8, index: String| {
+            let value = format!("{}[{index}]", input_names[idx as usize]);
+            if storage.bf16_inputs & (1 << idx) != 0 {
+                format!("f32({value})")
+            } else {
+                value
+            }
+        };
+        src.push_str(&dag.emit_body_with(
+            |idx| load(idx, "i".into()),
+            |idx, divisor, modulus| load(idx, format!("(i / {divisor}u) % {modulus}u")),
+        ));
+        if storage.bf16_output {
+            let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
+        } else if storage.f16_output {
+            let _ = writeln!(src, "    dst[i] = f16(v{});", dag.output);
+        } else {
+            let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+        }
     }
     src.push_str("}\n");
 
     ShaderModule::with_hint(src, "pointwise")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_reduction(
     op: ReduceOp,
     prologue: &PointwiseDAG,
@@ -832,6 +1052,8 @@ fn lower_reduction(
     rows_per_workgroup: u32,
     grid: GridShape,
     storage: PointwiseStorage,
+    use_subgroups: bool,
+    vec4: bool,
 ) -> ShaderModule {
     assert_eq!(storage.bf16_inputs, 0, "reduction inputs remain F32");
     assert!(!(storage.bf16_output && storage.f16_output));
@@ -906,6 +1128,16 @@ fn lower_reduction(
         );
     }
 
+    let wg = grid.workgroup_size;
+    let lanes_per_row = wg / rows_per_workgroup;
+    let use_subgroups = use_subgroups && rows_per_workgroup == 1 && wg > 1;
+    let vec4 = vec4
+        && op != ReduceOp::ArgMax
+        && lanes_per_row > 1
+        && storage == PointwiseStorage::default();
+    let elem_ty = if vec4 { "vec4<f32>" } else { "f32" };
+    let inner_expr = if vec4 { "inner_len" } else { "params.inner" };
+
     let per_elem_names = PointwiseDAG::input_binding_names(n_per_elem);
     let per_row_names = per_row_binding_names(n_per_row);
     let per_col_names: Vec<String> = epilogue
@@ -933,19 +1165,24 @@ fn lower_reduction(
                 // gathered axis IS the reduced axis (table stride == inner).
                 // An index past the table reads its last row.
                 format!(
-                    "{0}[min({0}_idx[{1}], params.table_rows - 1u) * params.inner + {2}]",
+                    "{0}[min({0}_idx[{1}], params.table_rows - 1u) * {inner_expr} + {2}]",
                     per_elem_names[i], source_row, col_var
                 )
             } else if repeat == 1 {
                 format!("{}[row_offset + {}]", per_elem_names[i], col_var)
             } else {
                 format!(
-                    "{}[(row / {repeat}u) * params.inner + {}]",
+                    "{}[(row / {repeat}u) * {inner_expr} + {}]",
                     per_elem_names[i], col_var
                 )
             }
         } else if i < per_row_end {
-            format!("{}[row]", per_row_names[i - per_elem_end])
+            let expr = format!("{}[row]", per_row_names[i - per_elem_end]);
+            if vec4 {
+                format!("vec4<f32>({expr})")
+            } else {
+                expr
+            }
         } else {
             assert!(in_epilogue, "prologue cannot reference per-col or reduced");
             let per_col_end = per_row_end + epilogue.map_or(0, |e| e.n_per_col_inputs as usize);
@@ -953,7 +1190,12 @@ fn lower_reduction(
                 format!("{}[{}]", per_col_names[i - per_row_end], col_var)
             } else {
                 // Reduced scalars occupy the tail positions in order.
-                format!("reduced_{}", i - per_col_end)
+                let expr = format!("reduced_{}", i - per_col_end);
+                if vec4 {
+                    format!("vec4<f32>({expr})")
+                } else {
+                    expr
+                }
             }
         }
     };
@@ -966,23 +1208,31 @@ fn lower_reduction(
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
+    if prologue.uses_erf()
+        || extra_prologues.iter().any(PointwiseDAG::uses_erf)
+        || epilogue.is_some_and(|e| e.dag.uses_erf())
+    {
+        src.push_str(ERF_WGSL);
+    }
     src.push_str(
         "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
     );
     for (i, name) in per_elem_names.iter().enumerate() {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+        let _ = writeln!(src, "var<storage> {name}: array<{elem_ty}>;");
         if is_gather(i) {
             // u32 indices buffer for this gather stream.
-            let _ = writeln!(src, "var<storage> {}_idx: array<u32>;", name);
+            let _ = writeln!(src, "var<storage> {name}_idx: array<u32>;");
         }
     }
     for name in &per_row_names {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+        let _ = writeln!(src, "var<storage> {name}: array<f32>;");
     }
     for name in &per_col_names {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+        let _ = writeln!(src, "var<storage> {name}: array<{elem_ty}>;");
     }
-    let output_type = if storage.f16_output {
+    let output_type = if epilogue.is_some() && vec4 {
+        "vec4<f32>"
+    } else if storage.f16_output {
         "f16"
     } else if storage.bf16_output {
         "bf16"
@@ -991,41 +1241,63 @@ fn lower_reduction(
     };
     let _ = writeln!(src, "var<storage, read_write> dst: array<{output_type}>;");
     src.push_str("var<uniform> params: Params;\n");
-    let wg = grid.workgroup_size;
-    let lanes_per_row = wg / rows_per_workgroup;
-    for k in 0..n_reduced {
-        let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
-        if op == ReduceOp::ArgMax {
-            let _ = writeln!(src, "var<workgroup> wg_index_{k}: array<u32, {wg}>;");
+    if lanes_per_row > 1 {
+        for k in 0..n_reduced {
+            let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
+            if op == ReduceOp::ArgMax {
+                let _ = writeln!(src, "var<workgroup> wg_index_{k}: array<u32, {wg}>;");
+            }
         }
     }
     src.push('\n');
     let _ = writeln!(src, "@compute @workgroup_size({})", wg);
-    let _ = writeln!(
-        src,
-        "fn {}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{",
-        REDUCTION_ENTRY
-    );
-    src.push_str("    let tid = lid.x;\n");
-    let _ = writeln!(src, "    let row_slot = tid / {}u;", lanes_per_row);
-    let _ = writeln!(src, "    let lane = tid % {}u;", lanes_per_row);
-    let _ = writeln!(
-        src,
-        "    let row = wgid.x * {}u + row_slot;",
-        rows_per_workgroup
-    );
-    src.push_str("    let row_valid = row < params.outer;\n");
-    src.push_str("    let row_offset = row * params.inner;\n");
+    if use_subgroups {
+        let _ = writeln!(
+            src,
+            "fn {REDUCTION_ENTRY}(\n    @builtin(workgroup_id) wgid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(subgroup_invocation_id) sg_id: u32,\n    @builtin(subgroup_id) wave_id: u32,\n    @builtin(subgroup_size) wave_size: u32,\n) {{"
+        );
+        src.push_str("    let row = wgid.x;\n");
+        src.push_str("    if row >= params.outer { return; }\n");
+        src.push_str("    let lane = lid.x;\n");
+        src.push_str("    let row_valid = true;\n");
+    } else {
+        let _ = writeln!(
+            src,
+            "fn {}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{",
+            REDUCTION_ENTRY
+        );
+        src.push_str("    let tid = lid.x;\n");
+        let _ = writeln!(src, "    let row_slot = tid / {}u;", lanes_per_row);
+        let _ = writeln!(src, "    let lane = tid % {}u;", lanes_per_row);
+        let _ = writeln!(
+            src,
+            "    let row = wgid.x * {}u + row_slot;",
+            rows_per_workgroup
+        );
+        src.push_str("    let row_valid = row < params.outer;\n");
+    }
+    if vec4 {
+        src.push_str("    let inner_len = params.inner / 4u;\n");
+    }
+    let _ = writeln!(src, "    let row_offset = row * {inner_expr};");
     for k in 0..n_reduced {
-        let _ = writeln!(src, "    var acc_{k}: f32 = {};", op.identity_wgsl());
-        if op == ReduceOp::ArgMax {
-            let _ = writeln!(src, "    var index_{k}: u32 = 0xffffffffu;");
+        if vec4 {
+            let _ = writeln!(
+                src,
+                "    var acc_v_{k}: vec4<f32> = vec4<f32>({});",
+                op.identity_wgsl()
+            );
+        } else {
+            let _ = writeln!(src, "    var acc_{k}: f32 = {};", op.identity_wgsl());
+            if op == ReduceOp::ArgMax {
+                let _ = writeln!(src, "    var index_{k}: u32 = 0xffffffffu;");
+            }
         }
     }
     src.push_str("    var col = lane;\n");
     src.push_str("    if row_valid {\n");
     src.push_str("        loop {\n");
-    src.push_str("            if col >= params.inner { break; }\n");
+    let _ = writeln!(src, "            if col >= {inner_expr} {{ break; }}");
     // Prologue bodies: `col` is the per-element index variable. Each
     // accumulator's DAG is evaluated in its own block so the `let vN`
     // value names don't collide.
@@ -1034,7 +1306,11 @@ fn lower_reduction(
         .enumerate()
     {
         src.push_str("            {\n");
-        let body = dag.emit_body(|idx| load_expr(idx, "col", false));
+        let body = dag.emit_body_impl(
+            |idx| load_expr(idx, "col", false),
+            |_, _, _| panic!("broadcast loads are only valid in flat pointwise kernels"),
+            vec4,
+        );
         for line in body.lines() {
             src.push_str("                ");
             src.push_str(line.trim_start_matches(' '));
@@ -1049,7 +1325,11 @@ fn lower_reduction(
         } else {
             format!("v{}", dag.output)
         };
-        let acc = format!("acc_{k}");
+        let acc = if vec4 {
+            format!("acc_v_{k}")
+        } else {
+            format!("acc_{k}")
+        };
         let combine = if op == ReduceOp::ArgMax {
             combine_argmax(&acc, &format!("index_{k}"), &prologue_value, "col")
         } else {
@@ -1061,46 +1341,190 @@ fn lower_reduction(
     let _ = writeln!(src, "            col += {}u;", lanes_per_row);
     src.push_str("        }\n");
     src.push_str("    }\n");
-    for k in 0..n_reduced {
-        let _ = writeln!(src, "    wg_data_{k}[tid] = acc_{k};");
-        if op == ReduceOp::ArgMax {
-            let _ = writeln!(src, "    wg_index_{k}[tid] = index_{k};");
-        }
-    }
-    src.push_str("    workgroupBarrier();\n");
-    // Independent tree reductions within each packed row's lane group.
-    let mut stride = lanes_per_row / 2;
-    src.push_str("    // packed per-row tree reduction\n");
-    while stride > 0 {
-        let _ = writeln!(src, "    if lane < {}u {{", stride);
+    if vec4 {
         for k in 0..n_reduced {
-            let (acc, value) = (
-                format!("wg_data_{k}[tid]"),
-                format!("wg_data_{k}[tid + {stride}u]"),
-            );
-            let combined = if op == ReduceOp::ArgMax {
-                let index = format!("wg_index_{k}[tid]");
-                let column = format!("wg_index_{k}[tid + {stride}u]");
-                combine_argmax(&acc, &index, &value, &column)
-            } else {
-                op.combine_wgsl(&acc, &value)
+            let reduced = match op {
+                ReduceOp::Sum => {
+                    format!("(acc_v_{k}.x + acc_v_{k}.y) + (acc_v_{k}.z + acc_v_{k}.w)")
+                }
+                ReduceOp::Max => {
+                    format!("max(max(acc_v_{k}.x, acc_v_{k}.y), max(acc_v_{k}.z, acc_v_{k}.w))")
+                }
+                ReduceOp::ArgMax => unreachable!("ArgMax stays scalar"),
             };
-            let _ = writeln!(src, "        {}", combined);
+            let _ = writeln!(src, "    let acc_{k}: f32 = {reduced};");
         }
-        src.push_str("    }\n");
-        src.push_str("    workgroupBarrier();\n");
-        stride /= 2;
     }
+
+    if lanes_per_row == 1 {
+        // One lane owns the entire row — no shared memory or barriers needed.
+        for k in 0..n_reduced {
+            let value = if op == ReduceOp::ArgMax {
+                format!("f32(index_{k})")
+            } else {
+                format!("acc_{k}")
+            };
+            let _ = writeln!(src, "    let reduced_{k} = {value};");
+        }
+    } else if use_subgroups {
+        // Subgroup reduction: zero barriers when the whole workgroup fits in
+        // one subgroup, and one barrier otherwise (down from log2(wg) + 1).
+        let _ = writeln!(src, "    let waves = ({wg}u + wave_size - 1u) / wave_size;");
+        for k in 0..n_reduced {
+            match op {
+                ReduceOp::Sum => {
+                    let _ = writeln!(src, "    let wave_val_{k} = subgroupAdd(acc_{k});");
+                }
+                ReduceOp::Max => {
+                    let _ = writeln!(src, "    let wave_val_{k} = subgroupMax(acc_{k});");
+                }
+                ReduceOp::ArgMax => {
+                    // Match the scalar tree path and f64 reference across all
+                    // NaN patterns without feeding NaNs into `subgroupMax`
+                    // (whose NaN result is undefined in SPIR-V):
+                    // - If column 0 (owned by lane 0) is NaN, nothing compares
+                    //   greater so column 0 wins with a NaN sentinel value.
+                    // - Otherwise, mask NaNs to `-inf` before `subgroupMax`;
+                    //   waves with no non-NaN active lanes emit `0xffffffffu`
+                    //   so they are skipped by the cross-wave combine.
+                    let _ = writeln!(
+                        src,
+                        "    let is_nan_{k} = (bitcast<u32>(acc_{k}) & 0x7fffffffu) > 0x7f800000u;"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let lane0_nan_{k} = subgroupAny((lane == 0u) & is_nan_{k});"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let any_non_nan_{k} = subgroupAny((index_{k} != 0xffffffffu) & !is_nan_{k});"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_max_{k} = subgroupMax(select(bitcast<f32>(0xff800000u), acc_{k}, !is_nan_{k}));"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_val_{k} = select(bitcast<f32>(0x7fc00000u), wave_max_{k}, !lane0_nan_{k} & any_non_nan_{k});"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_match_{k} = subgroupMin(select(0xffffffffu, index_{k}, (index_{k} != 0xffffffffu) & (acc_{k} == wave_val_{k})));"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_first_{k} = subgroupMin(select(0xffffffffu, index_{k}, !is_nan_{k}));"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_idx_{k} = select(select(wave_match_{k}, wave_first_{k}, wave_match_{k} == 0xffffffffu), 0u, lane0_nan_{k});"
+                    );
+                }
+            }
+        }
+        src.push_str("    if waves > 1u {\n");
+        src.push_str("        if sg_id == subgroupBroadcastFirst(sg_id) {\n");
+        for k in 0..n_reduced {
+            let _ = writeln!(src, "            wg_data_{k}[wave_id] = wave_val_{k};");
+            if op == ReduceOp::ArgMax {
+                let _ = writeln!(src, "            wg_index_{k}[wave_id] = wave_idx_{k};");
+            }
+        }
+        src.push_str("        }\n");
+        src.push_str("        workgroupBarrier();\n");
+        src.push_str("    }\n");
+        for k in 0..n_reduced {
+            let _ = writeln!(src, "    var total_{k}: f32 = wave_val_{k};");
+            if op == ReduceOp::ArgMax {
+                let _ = writeln!(src, "    var total_idx_{k}: u32 = wave_idx_{k};");
+            }
+        }
+        if epilogue.is_none() {
+            src.push_str("    if lane == 0u && waves > 1u {\n");
+        } else {
+            src.push_str("    if waves > 1u {\n");
+        }
+        for k in 0..n_reduced {
+            let _ = writeln!(src, "        total_{k} = {};", op.identity_wgsl());
+            if op == ReduceOp::ArgMax {
+                let _ = writeln!(src, "        total_idx_{k} = 0xffffffffu;");
+            }
+        }
+        src.push_str("        for (var w = 0u; w < waves; w += 1u) {\n");
+        for k in 0..n_reduced {
+            let combined = if op == ReduceOp::ArgMax {
+                combine_argmax(
+                    &format!("total_{k}"),
+                    &format!("total_idx_{k}"),
+                    &format!("wg_data_{k}[w]"),
+                    &format!("wg_index_{k}[w]"),
+                )
+            } else {
+                op.combine_wgsl(&format!("total_{k}"), &format!("wg_data_{k}[w]"))
+            };
+            let _ = writeln!(src, "            {combined}");
+        }
+        src.push_str("        }\n");
+        src.push_str("    }\n");
+        for k in 0..n_reduced {
+            let value = if op == ReduceOp::ArgMax {
+                format!("f32(total_idx_{k})")
+            } else {
+                format!("total_{k}")
+            };
+            let _ = writeln!(src, "    let reduced_{k} = {value};");
+        }
+    } else {
+        for k in 0..n_reduced {
+            let _ = writeln!(src, "    wg_data_{k}[tid] = acc_{k};");
+            if op == ReduceOp::ArgMax {
+                let _ = writeln!(src, "    wg_index_{k}[tid] = index_{k};");
+            }
+        }
+        src.push_str("    workgroupBarrier();\n");
+        // Independent tree reductions within each packed row's lane group.
+        let mut stride = lanes_per_row / 2;
+        src.push_str("    // packed per-row tree reduction\n");
+        while stride > 0 {
+            let _ = writeln!(src, "    if lane < {}u {{", stride);
+            for k in 0..n_reduced {
+                let (acc, value) = (
+                    format!("wg_data_{k}[tid]"),
+                    format!("wg_data_{k}[tid + {stride}u]"),
+                );
+                let combined = if op == ReduceOp::ArgMax {
+                    let index = format!("wg_index_{k}[tid]");
+                    let column = format!("wg_index_{k}[tid + {stride}u]");
+                    combine_argmax(&acc, &index, &value, &column)
+                } else {
+                    op.combine_wgsl(&acc, &value)
+                };
+                let _ = writeln!(src, "        {}", combined);
+            }
+            src.push_str("    }\n");
+            src.push_str("    workgroupBarrier();\n");
+            stride /= 2;
+        }
+        for k in 0..n_reduced {
+            let slot = if epilogue.is_none() {
+                "tid".to_string()
+            } else {
+                format!("row_slot * {lanes_per_row}u")
+            };
+            let value = reduced_value(op, k, &slot);
+            let _ = writeln!(src, "    let reduced_{k} = {value};");
+        }
+    }
+
     match epilogue {
         None => {
             // K reduced scalars per row, stored interleaved: dst[row*K + k].
             src.push_str("    if lane == 0u && row_valid {\n");
             for k in 0..n_reduced {
-                let value = reduced_value(op, k, "tid");
                 if n_reduced == 1 {
-                    let _ = writeln!(src, "        dst[row] = {value};");
+                    let _ = writeln!(src, "        dst[row] = reduced_{k};");
                 } else {
-                    let _ = writeln!(src, "        dst[row * {n_reduced}u + {k}u] = {value};");
+                    let _ = writeln!(src, "        dst[row * {n_reduced}u + {k}u] = reduced_{k};");
                 }
             }
             src.push_str("    }\n");
@@ -1108,15 +1532,15 @@ fn lower_reduction(
         Some(epi) => {
             // Reduce-then-map: broadcast the reduced values and write a
             // transformed element back for every col.
-            for k in 0..n_reduced {
-                let value = reduced_value(op, k, &format!("row_slot * {lanes_per_row}u"));
-                let _ = writeln!(src, "    let reduced_{k} = {value};");
-            }
             src.push_str("    var wcol = lane;\n");
             src.push_str("    if row_valid {\n");
             src.push_str("        loop {\n");
-            src.push_str("            if wcol >= params.inner { break; }\n");
-            let body = epi.dag.emit_body(|idx| load_expr(idx, "wcol", true));
+            let _ = writeln!(src, "            if wcol >= {inner_expr} {{ break; }}");
+            let body = epi.dag.emit_body_impl(
+                |idx| load_expr(idx, "wcol", true),
+                |_, _, _| panic!("broadcast loads are only valid in flat pointwise kernels"),
+                vec4,
+            );
             for line in body.lines() {
                 src.push_str("            ");
                 src.push_str(line.trim_start_matches(' '));
@@ -1138,7 +1562,12 @@ fn lower_reduction(
     }
     src.push_str("}\n");
 
-    ShaderModule::with_hint(src, "reduction")
+    let module = ShaderModule::with_hint(src, "reduction");
+    if use_subgroups {
+        module.with_subgroup(0, [wg, 1, 1])
+    } else {
+        module
+    }
 }
 
 /// Binding names for per-row broadcast inputs used by the reduction
@@ -1432,7 +1861,8 @@ mod tests {
         // Identity for sum is 0.
         assert!(sm.source.contains("var acc_0: f32 = 0.0f"));
         // Dst writes one scalar per row.
-        assert!(sm.source.contains("dst[row] = wg_data_0[tid]"));
+        assert!(sm.source.contains("let reduced_0 = wg_data_0[tid];"));
+        assert!(sm.source.contains("dst[row] = reduced_0;"));
     }
 
     #[test]
@@ -1849,5 +2279,131 @@ mod tests {
                 panic!("naga validation failed: {:?}\n{}", e, sm.source);
             });
         }
+    }
+
+    #[test]
+    fn wide_arity_and_vec4_pointwise_validate_to_spirv() {
+        // 6-input DAG exercising wider-than-3 stack-backed DynPointwiseData bindings,
+        // broadcasts, and all special vec4 op lowerings (Erf, Tanh, Greater, U32ToF32, F32ToU32).
+        let dag = PointwiseDAG {
+            n_inputs: 6,
+            ops: vec![
+                Pw::LoadInput(0),
+                Pw::LoadInput(1),
+                Pw::LoadBroadcast {
+                    input: 2,
+                    divisor: 1,
+                    modulus: 16,
+                },
+                Pw::LoadBroadcast {
+                    input: 3,
+                    divisor: 16,
+                    modulus: 8,
+                },
+                Pw::LoadInput(4),
+                Pw::LoadInput(5),
+                Pw::Add(0, 1),
+                Pw::Add(6, 2),
+                Pw::Mul(7, 3),
+                Pw::Erf(8),
+                Pw::Tanh(9),
+                Pw::Greater(10, 4),
+                Pw::F32ToU32(11),
+                Pw::U32ToF32(12),
+                Pw::Silu(13),
+                Pw::Sub(14, 5),
+                Pw::const_f32(0.25),
+                Pw::Add(15, 16),
+            ],
+            output: 17,
+        };
+        let kinds = dag
+            .vec4_input_kinds(PointwiseStorage::default(), 64)
+            .expect("aligned broadcasts should vectorize");
+        assert_eq!(kinds, vec![true, true, true, false, true, true]);
+        assert!(!dag.can_vectorize(PointwiseStorage::default(), 62));
+
+        let mut sm = lower_pointwise_vec4(&dag, GridShape::default(), &kinds);
+        assert!(sm.source.contains("var<storage> src_f: array<vec4<f32>>;"));
+        assert!(sm.source.contains("var<storage> src_d: array<f32>;"));
+        crate::codegen::validate_shader_for_test(
+            &mut sm.module,
+            naga::valid::Capabilities::all(),
+            (1, 3),
+        )
+        .unwrap_or_else(|e| panic!("vec4 pointwise spirv failed: {e:?}\n{}", sm.source));
+    }
+
+    #[test]
+    fn subgroup_and_vec4_reductions_validate_to_spirv() {
+        let rms = ReductionKernel {
+            op: ReduceOp::Sum,
+            prologue: square_prologue(),
+            extra_prologues: vec![],
+            epilogue: Some(ReductionEpilogue {
+                dag: PointwiseDAG {
+                    n_inputs: 3,
+                    ops: vec![
+                        Pw::LoadInput(0),
+                        Pw::LoadInput(1),
+                        Pw::LoadInput(2),
+                        Pw::const_f32(1e-5),
+                        Pw::Add(2, 3),
+                        Pw::Rsqrt(4),
+                        Pw::Mul(0, 5),
+                        Pw::Mul(6, 1),
+                    ],
+                    output: 7,
+                },
+                n_per_col_inputs: 1,
+            }),
+            n_per_elem: 1,
+            n_per_row: 0,
+            workgroup_size: 256,
+            rows_per_workgroup: 1,
+            gather_elem: vec![],
+            input_row_repeats: vec![],
+            preserve_tree_order: false,
+        };
+        assert!(rms.can_vectorize(PointwiseStorage::default(), 64));
+        assert!(!rms.can_vectorize(PointwiseStorage::default(), 62));
+
+        for (op, with_epi, vec4) in [
+            (ReduceOp::Sum, false, false),
+            (ReduceOp::Sum, false, true),
+            (ReduceOp::Sum, true, true),
+            (ReduceOp::Max, false, true),
+            (ReduceOp::ArgMax, false, false),
+        ] {
+            let mut k = rms.clone();
+            k.op = op;
+            if !with_epi {
+                k.epilogue = None;
+                k.prologue = identity_prologue();
+            }
+            let mut sm = k.lower_with_options(PointwiseStorage::default(), true, vec4);
+            assert!(sm.source.contains("subgroup"));
+            assert_eq!(
+                sm.source.matches("workgroupBarrier()").count(),
+                1,
+                "subgroup reduction should use at most 1 barrier:\n{}",
+                sm.source
+            );
+            crate::codegen::validate_shader_for_test(
+                &mut sm.module,
+                naga::valid::Capabilities::all(),
+                (1, 3),
+            )
+            .unwrap_or_else(|e| panic!("reduction spirv failed: {e:?}\n{}", sm.source));
+        }
+
+        // Packed single-lane rows emit zero barriers and zero shared arrays.
+        let mut packed = rms.clone();
+        packed.epilogue = None;
+        packed.prologue = identity_prologue();
+        packed.rows_per_workgroup = 256;
+        let sm = packed.lower_with_options(PointwiseStorage::default(), true, false);
+        assert_eq!(sm.source.matches("workgroupBarrier()").count(), 0);
+        assert!(!sm.source.contains("var<workgroup>"));
     }
 }

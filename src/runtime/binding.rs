@@ -5,7 +5,7 @@ use super::{
     CachedAttentionData, CachedAttentionParams, CachedBlockAttentionCombineData,
     CachedBlockAttentionData, ChunkedRelativeAttentionData, ChunkedRelativeAttentionParams,
     Conv2dData, Conv2dDwData, Conv2dDwParams, Conv2dGradInputData, Conv2dGradWeightData,
-    Conv2dParams, CrossEntropyData, DynReductionData, EmbeddingData, FourBufData,
+    Conv2dParams, CrossEntropyData, DynPointwiseData, DynReductionData, EmbeddingData, FourBufData,
     FusedMatMulAddData, GlobalAvgPoolData, GlobalAvgPoolParams, GroupNormApplyData, GroupNormData,
     GroupNormGradData, GroupNormParams, GroupNormStatsData, HorizMatMulData, LayerNormData,
     MatMulData, MatMulParams, MatMulPrologue2Data, MatMulRmsNormData, MatMulRmsNormParams,
@@ -156,52 +156,34 @@ impl Session {
             }
             return;
         }
-        // Schedule-template pointwise dispatches route by DAG arity, not
-        // by the dummy `shader` entry — arity may be 3 after fusion, which
-        // no ShaderEntry variant represents.
-        if let Some(dag) = dispatch.pointwise() {
+        // Schedule-template pointwise dispatches bind through `DynPointwiseData`
+        // (stack-backed, up to `MAX_POINTWISE_INPUTS` inputs + dst + params).
+        if dispatch.pointwise().is_some() {
             let params = UnaryParams {
                 len: dispatch.params[0],
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
             };
-            match dag.n_inputs {
-                1 => {
-                    pc.bind(
-                        0,
-                        &UnaryData {
-                            src: buf(dispatch.input_buffers[0]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                2 => {
-                    pc.bind(
-                        0,
-                        &BinaryData {
-                            src_a: buf(dispatch.input_buffers[0]),
-                            src_b: buf(dispatch.input_buffers[1]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                3 => {
-                    pc.bind(
-                        0,
-                        &TernaryData {
-                            src_a: buf(dispatch.input_buffers[0]),
-                            src_b: buf(dispatch.input_buffers[1]),
-                            src_c: buf(dispatch.input_buffers[2]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                n => panic!("pointwise arity {} has no runtime data layout", n),
+            let dst = buf(dispatch.output_buffer);
+            let n = dispatch.input_buffers.len();
+            assert!(
+                n <= crate::schedule::MAX_POINTWISE_INPUTS as usize,
+                "pointwise arity {n} exceeds MAX_POINTWISE_INPUTS"
+            );
+            let mut buffers = [dst; crate::schedule::MAX_POINTWISE_INPUTS as usize + 1];
+            for (slot, &r) in dispatch.input_buffers.iter().enumerate() {
+                buffers[slot] = buf(r);
             }
+            buffers[n] = dst;
+            pc.bind(
+                0,
+                &DynPointwiseData {
+                    buffers,
+                    count: n + 1,
+                    params,
+                },
+            );
             return;
         }
         // Prologue-fused coop matmul: 2-factor prologue (RmsNorm rsqrt + w_norm).

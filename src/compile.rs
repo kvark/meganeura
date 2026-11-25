@@ -2225,12 +2225,10 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 {
                     continue;
                 }
-                // Arity cap: the runtime binds pointwise pipelines via
-                // UnaryData (n=1), BinaryData (n=2), or TernaryData (n=3).
-                // A higher-arity fused DAG would need a wider layout we
-                // don't plumb yet.
+                // Arity cap: dynamic pointwise binding supports up to
+                // `MAX_POINTWISE_INPUTS` streams (matching `PointwiseStorage::bf16_inputs`).
                 let new_arity = p.input_buffers.len() + c.input_buffers.len() - 1;
-                if new_arity > 3 {
+                if new_arity > crate::schedule::MAX_POINTWISE_INPUTS as usize {
                     continue;
                 }
                 candidate = Some((slot_idx as u8, pi));
@@ -2260,14 +2258,9 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             consumer_d.input_buffers = new_inputs;
             consumer_d.kernel = Kernel::Pointwise(fused_dag);
             consumer_d.origin.extend(producer_d.origin.iter().copied());
-            // The consumer now reads from more buffers; its ShaderEntry
-            // (used only to pick the data layout) must reflect the new
-            // arity. The runtime binds via UnaryData for n=1, BinaryData
-            // for n=2; arities >2 would need a wider layout we don't yet
-            // plumb. Guard against that.
-            // Update the sentinel `shader` so the (legacy) pipeline
-            // lookup still resolves — actual binding/pipeline come from
-            // the `pointwise` DAG's arity.
+            // Update the sentinel `shader` so legacy lookup paths resolve —
+            // actual binding and pipeline layout come from `DynPointwiseData`
+            // and the fused `PointwiseDAG` arity (up to `MAX_POINTWISE_INPUTS`).
             consumer_d.shader = ShaderEntry::Generated;
 
             // Drop the producer dispatch.
@@ -2753,10 +2746,14 @@ fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
         rows_per_workgroup,
         gather_elem: Vec::new(),
         input_row_repeats: Vec::new(),
+        // Preserve scalar tree reduction order so debug sessions
+        // (`fuse_dispatches=false`), prologue-fused RmsNorm, and
+        // `fuse_rmsnorm_into_add` (`rms_norm_add.wgsl`) match identically.
+        preserve_tree_order: true,
     }
 }
 
-fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
+pub(crate) fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
     // The canonical generated norm only: after pointwise or gather fusion
     // the reduction differs, and a dedicated runtime shader cannot replace it.
     dispatch.input_buffers.len() == 2
