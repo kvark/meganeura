@@ -10,6 +10,7 @@
   compile and names `Graph::materialize`: the replaced cache as a graph
   output, a node that reads it and also depends on the result, or a second
   write to it.
+
 - A GPU observation that failed no longer counts as a result. The ordinary
   cooperative-matmul probe compared each element with "error above the
   tolerance", which NaN never is, so a kernel that produced NaN qualified;

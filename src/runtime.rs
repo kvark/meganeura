@@ -1547,11 +1547,17 @@ fn run_matmul_probe(
 /// The first element of a probe's `result` that is not within `tolerance`
 /// of `expected`. An element that is NaN or infinite is never within it.
 fn first_probe_mismatch(result: &[f32], expected: &[f32], tolerance: f32) -> Option<usize> {
-    result.iter().zip(expected).position(|(got, want)| {
-        // NaN compares false to everything, so ask what passes.
-        let agrees = (got - want).abs() <= tolerance;
-        !agrees
-    })
+    let compared = result.len().min(expected.len());
+    result
+        .iter()
+        .zip(expected)
+        .position(|(got, want)| {
+            // NaN compares false to everything, so ask what passes.
+            let agrees = (got - want).abs() <= tolerance;
+            !agrees
+        })
+        // A result of another length has an element with nothing to agree with.
+        .or((result.len() != expected.len()).then_some(compared))
 }
 
 /// One 32x32 output block over two K steps. A mixes subnormal (2^-15 and
@@ -1683,6 +1689,10 @@ mod precision_requirement_tests {
     fn failed_observations_do_not_pass() {
         let expected = [1.0f32, -2.0, 3.0, 0.5];
         assert_eq!(super::first_probe_mismatch(&expected, &expected, 0.1), None);
+        assert_eq!(
+            super::first_probe_mismatch(&expected[..3], &expected, 0.1),
+            Some(3)
+        );
         assert_eq!(
             super::first_probe_mismatch(&[1.05, -2.0, 3.0, 0.45], &expected, 0.1),
             None
