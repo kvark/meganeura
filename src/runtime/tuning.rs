@@ -565,17 +565,9 @@ pub(super) fn tile_module(
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 let types = super::checked_matrix_types(dispatch)
                     .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
-                let epilogue = dispatch.matmul_epilogue.as_ref().filter(|_| {
-                    super::workgroup_matmul_epilogue_supported(
-                        shape,
-                        dispatch.matmul_epilogue.as_ref(),
-                    )
-                });
+                let epilogue = dispatch.matmul_epilogue.as_ref();
                 assert!(
-                    super::workgroup_matmul_epilogue_supported(
-                        shape,
-                        dispatch.matmul_epilogue.as_ref()
-                    ),
+                    super::workgroup_matmul_epilogue_supported(shape, epilogue),
                     "unsupported epilogue on workgroup cooperative product"
                 );
                 let (native, subgroup) =
@@ -5026,6 +5018,21 @@ mod tests {
             ..Default::default()
         };
 
+        let assert_subgroup_matches_wg = |name: &str, m: &crate::codegen::ShaderModule| {
+            let req = m
+                .subgroup
+                .unwrap_or_else(|| panic!("{name}: expected SubgroupRequirement"));
+            assert_eq!(
+                req.workgroup_size, m.module.entry_points[0].workgroup_size,
+                "{name}: declared SubgroupRequirement workgroup_size must match WGSL @workgroup_size"
+            );
+            assert_eq!(
+                required_full_subgroup_size(&caps, m.subgroup),
+                Some(32),
+                "{name}: expected full_subgroup_size 32"
+            );
+        };
+
         // Subgroup GEMV carries explicit [threads * column_groups, 1, 1].
         let sg_gemv = GemvShape {
             threads: 128,
@@ -5045,7 +5052,7 @@ mod tests {
                 workgroup_size: [128, 1, 1],
             })
         );
-        assert_eq!(required_full_subgroup_size(&caps, m_sg.subgroup), Some(32));
+        assert_subgroup_matches_wg("gemv_subgroup", &m_sg);
 
         // Tree GEMV does not request full subgroups.
         let tree_gemv = GemvShape {
@@ -5061,14 +5068,11 @@ mod tests {
         assert_eq!(required_full_subgroup_size(&caps, m_tree.subgroup), None);
 
         // WinogradMatmul, CoopTyped (including Conv2dBF16), FlashAttention
-        // subgroup tiles, and LayerNormSubgroup all carry explicit metadata.
+        // subgroup tiles, and LayerNormSubgroup all carry explicit metadata
+        // matching their real WGSL `@workgroup_size`.
         let m_wino =
             crate::codegen::winograd::matmul(crate::DType::F16, [16, 16, 16], [32, 32], 32);
-        assert!(m_wino.subgroup.is_some());
-        assert_eq!(
-            required_full_subgroup_size(&caps, m_wino.subgroup),
-            Some(32)
-        );
+        assert_subgroup_matches_wg("winograd_matmul", &m_wino);
 
         let m_typed = crate::codegen::generate_module_coop_typed_with_subgroup(
             ShaderGroup::MatMul,
@@ -5077,11 +5081,7 @@ mod tests {
             Default::default(),
             32,
         );
-        assert!(m_typed.subgroup.is_some());
-        assert_eq!(
-            required_full_subgroup_size(&caps, m_typed.subgroup),
-            Some(32)
-        );
+        assert_subgroup_matches_wg("coop_typed", &m_typed);
 
         let m_flash_sg = crate::codegen::generate_flash_attention_module_for_device(
             64,
@@ -5090,11 +5090,7 @@ mod tests {
             false,
             true,
         );
-        assert!(m_flash_sg.subgroup.is_some());
-        assert_eq!(
-            required_full_subgroup_size(&caps, m_flash_sg.subgroup),
-            Some(32)
-        );
+        assert_subgroup_matches_wg("flash_attention_subgroup", &m_flash_sg);
 
         let m_flash_tree = crate::codegen::generate_flash_attention_module_for_device(
             64,
@@ -5106,6 +5102,6 @@ mod tests {
         assert_eq!(m_flash_tree.subgroup, None);
 
         let m_ln = crate::codegen::generate_layer_norm_subgroup();
-        assert_eq!(required_full_subgroup_size(&caps, m_ln.subgroup), Some(32));
+        assert_subgroup_matches_wg("layer_norm_subgroup", &m_ln);
     }
 }

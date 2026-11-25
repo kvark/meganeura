@@ -1423,6 +1423,7 @@ fn run_matmul_probe(
 ) -> Option<Vec<f32>> {
     use blade_graphics as bg;
 
+    let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
     let shader = match create_gen_shader(gpu, module) {
         Ok(shader) => shader,
         Err(error) => {
@@ -1431,8 +1432,13 @@ fn run_matmul_probe(
         }
     };
     let layout = shader_data_layout(&ShaderEntry::MatMul);
-    let mut pipeline =
-        create_profiled_pipeline(gpu, probe.pipeline.to_string(), &layout, shader.at("main"));
+    let mut pipeline = create_profiled_pipeline_with_subgroup(
+        gpu,
+        probe.pipeline.to_string(),
+        &layout,
+        shader.at("main"),
+        full_subgroup_size,
+    );
     let len = (probe.params.m * probe.params.n) as usize;
     let buffer = |name, bytes: usize| {
         gpu.create_buffer(bg::BufferDesc {
