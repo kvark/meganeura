@@ -82,7 +82,7 @@ impl Graph {
             outputs: Vec::new(),
             new_nodes_require_full_precision: false,
             new_nodes_are_derivatives: false,
-            num_param_grad_outputs: 0,
+            grad_params: Vec::new(),
             derived_params: self.derived_params.clone(),
         };
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
@@ -118,7 +118,7 @@ impl Graph {
         out.new_nodes_require_full_precision = self.new_nodes_require_full_precision;
         out.new_nodes_are_derivatives = self.new_nodes_are_derivatives;
         out.outputs = self.outputs.iter().map(|&o| map[o as usize]).collect();
-        out.num_param_grad_outputs = self.num_param_grad_outputs;
+        out.grad_params = self.grad_params.iter().map(|&p| map[p as usize]).collect();
         Some(out)
     }
 

@@ -4831,9 +4831,10 @@ mod tests {
 
     #[test]
     fn frozen_parameter_is_excluded_from_param_grad_pairs() {
+        // One element each: no size sets a frozen parameter apart.
         let mut g = Graph::new();
-        let trained = g.parameter("trained", &[8]);
-        let frozen = g.parameter("frozen", &[8]);
+        let trained = g.parameter("trained", &[1]);
+        let frozen = g.parameter("frozen", &[1]);
         let frozen = g.stop_gradient(frozen);
         let sum = g.add(trained, frozen);
         let loss = g.mean_all(sum);

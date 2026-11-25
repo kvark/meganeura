@@ -588,7 +588,7 @@ pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
 /// forward graph before autodiff, then optimize the combined forward/backward
 /// graph. Optimizing only after autodiff can pack two source parameters into
 /// one derived parameter while leaving the original two gradient outputs in
-/// place, breaking the positional parameter/gradient contract in the plan.
+/// place, so the plan would train parameters the forward pass no longer reads.
 /// Useful for testing compilation in environments without GPU access.
 pub fn compile_training_graph(
     forward_graph: &Graph,
@@ -675,7 +675,7 @@ mod tests {
 
         // The original gate/up buffers remain loadable sources for the
         // derived packed parameter, but their consumers were replaced before
-        // autodiff and they must not receive scalar placeholder gradients.
+        // autodiff, so they have no gradients.
         assert_eq!(plan.param_buffers.len(), 4);
         assert_eq!(plan.param_grad_pairs.len(), 2);
         assert!(

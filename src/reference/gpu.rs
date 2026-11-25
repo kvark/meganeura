@@ -1,9 +1,12 @@
 //! Run a graph on the GPU and compare it with the reference.
 
 use super::{Comparison, Error, Feeds, Report, Tensor, Tolerance, check, error_scales, evaluate};
-use crate::graph::{DType, Graph, Op};
+use crate::graph::{DType, Graph, NodeId, Op};
 use crate::train::{Mode, SessionConfig, build};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 /// How to build the session under test.
 #[derive(Clone, Debug)]
@@ -221,18 +224,24 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
         });
     }
 
-    let params: Vec<_> = graph
-        .nodes()
-        .iter()
-        .filter_map(|n| match n.op {
-            Op::Parameter { ref name } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    let grads = &backward.outputs()[backward.num_user_outputs()..];
-    assert_eq!(params.len(), grads.len(), "missing reference gradients");
-    for (name, &grad_id) in params.into_iter().zip(grads) {
-        if let Some(got) = packed_gradient(&session, &name) {
+    // Differentiation keeps the forward node ids.
+    let grads: HashMap<NodeId, NodeId> = backward.param_grads().collect();
+    for node in graph.nodes() {
+        let Op::Parameter { ref name } = node.op else {
+            continue;
+        };
+        let Some(&grad_id) = grads.get(&node.id) else {
+            // The loss does not reach this parameter, so nothing may
+            // train it on the device either.
+            if session.has_param_grad(name) {
+                report.comparisons.push(Comparison {
+                    what: format!("gradient of {name} exists without a derivative"),
+                    result: check(&[f32::NAN], &[0.0], &[0.0], options.tolerance),
+                });
+            }
+            continue;
+        };
+        if let Some(got) = packed_gradient(&session, name) {
             let (want, magnitude) = (&values[grad_id as usize], &scales[grad_id as usize]);
             report.comparisons.push(Comparison {
                 what: format!("gradient of {name} (packed)"),
@@ -240,9 +249,9 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
             });
             continue;
         }
-        if !session.has_param_grad(&name) {
-            // The compiler omits gradients of parameters that do not reach
-            // the loss. The reference must agree they are zero.
+        if !session.has_param_grad(name) {
+            // The optimized graph can lose a path the written one has. The
+            // reference must agree that its gradient is zero.
             let want = &values[grad_id as usize];
             report.comparisons.push(Comparison {
                 what: format!("gradient of {name} (absent on device)"),
@@ -257,7 +266,7 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
         }
         let (want, magnitude) = (&values[grad_id as usize], &scales[grad_id as usize]);
         let mut got = vec![0.0f32; want.len()];
-        session.read_param_grad(&name, &mut got);
+        session.read_param_grad(name, &mut got);
         report.comparisons.push(Comparison {
             what: format!("gradient of {name}"),
             result: check(&got, &want.data, magnitude, options.tolerance),

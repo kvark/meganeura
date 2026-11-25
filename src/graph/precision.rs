@@ -34,8 +34,8 @@ impl Graph {
     }
 
     fn into_bf16_selected(self, select: impl Fn(&Op) -> bool) -> Self {
-        assert_eq!(
-            self.num_param_grad_outputs, 0,
+        assert!(
+            self.grad_params.is_empty(),
             "cast forward graphs before autodiff"
         );
         let sorted = self.into_toposort();

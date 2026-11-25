@@ -9,6 +9,7 @@
 
 use super::{Comparison, Error, Feeds, Report, Rng, Tolerance, check_f64, evaluate};
 use crate::graph::{Graph, NodeId, Op};
+use std::collections::HashMap;
 
 /// Finite-difference settings.
 #[derive(Clone, Copy, Debug)]
@@ -60,24 +61,25 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
             _ => None,
         })
         .collect();
-    let grad_ids = &backward.outputs()[backward.num_user_outputs()..];
-    assert_eq!(params.len(), grad_ids.len(), "missing reference gradients");
+    // Differentiation keeps the forward node ids.
+    let grad_ids: HashMap<NodeId, NodeId> = backward.param_grads().collect();
     let mut analytic = Vec::with_capacity(params.len());
-    for (&(ref name, param), &grad) in params.iter().zip(grad_ids) {
+    for &(ref name, param) in &params {
         let n = graph.node(param).ty.num_elements();
+        // A parameter that cannot reach the loss has no gradient, which
+        // finite differences see as zero.
+        let Some(&grad) = grad_ids.get(&param) else {
+            analytic.push(vec![0.0; n]);
+            continue;
+        };
         let g = &values[grad as usize];
-        // A parameter that cannot reach the loss gets a scalar zero.
-        let g = if g.len() == n {
-            g.data.clone()
-        } else if g.data.iter().all(|&v| v == 0.0) {
-            vec![0.0; n]
-        } else {
+        if g.len() != n {
             return Err(Error::Invalid {
                 node: grad,
                 reason: format!("gradient of {name} has {} values for {n}", g.len()),
             });
-        };
-        analytic.push(g);
+        }
+        analytic.push(g.data.clone());
     }
 
     let mut report = Report::default();

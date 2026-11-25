@@ -1018,11 +1018,12 @@ pub struct Graph {
     /// Explicit precision policy inherited by newly appended nodes.
     new_nodes_require_full_precision: bool,
     new_nodes_are_derivatives: bool,
-    /// Number of trailing entries in `outputs` that are parameter gradients
-    /// appended by autodiff (positionally aligned with `param_buffers` in the
-    /// compiled plan). The leading `outputs.len() - num_param_grad_outputs`
-    /// entries are user-facing outputs supplied via `set_outputs`.
-    num_param_grad_outputs: usize,
+    /// The `Parameter` node behind each trailing entry of `outputs`, which
+    /// autodiff appends as that parameter's gradient. Only parameters the
+    /// loss reaches are listed, so a parameter without a gradient has no
+    /// entry at all. The leading `outputs.len() - grad_params.len()` entries
+    /// are user-facing outputs supplied via `set_outputs`.
+    grad_params: Vec<NodeId>,
     /// Parameters created by the optimizer from concatenating original params.
     pub derived_params: Vec<DerivedParam>,
 }
@@ -1034,7 +1035,7 @@ impl Graph {
             outputs: Vec::new(),
             new_nodes_require_full_precision: false,
             new_nodes_are_derivatives: false,
-            num_param_grad_outputs: 0,
+            grad_params: Vec::new(),
             derived_params: Vec::new(),
         }
     }
@@ -1059,7 +1060,7 @@ impl Graph {
             outputs,
             new_nodes_require_full_precision,
             new_nodes_are_derivatives,
-            num_param_grad_outputs,
+            grad_params,
             derived_params,
         } = self;
 
@@ -1150,12 +1151,18 @@ impl Graph {
                 ),
             }
         }
+        let grad_params = grad_params
+            .into_iter()
+            .map(|param| {
+                old_to_new[param as usize].expect("toposort: a trained parameter was removed")
+            })
+            .collect();
         Graph {
             nodes: new_nodes,
             outputs: new_outputs,
             new_nodes_require_full_precision,
             new_nodes_are_derivatives,
-            num_param_grad_outputs,
+            grad_params,
             derived_params,
         }
     }
@@ -1183,24 +1190,37 @@ impl Graph {
     /// The remaining `num_param_grad_outputs()` entries are parameter
     /// gradients appended by autodiff.
     pub fn num_user_outputs(&self) -> usize {
-        self.outputs.len() - self.num_param_grad_outputs
+        self.outputs.len() - self.grad_params.len()
     }
 
     /// Number of trailing outputs that are param gradients (appended by autodiff).
     pub fn num_param_grad_outputs(&self) -> usize {
-        self.num_param_grad_outputs
+        self.grad_params.len()
+    }
+
+    /// Each parameter the loss reaches with the node holding its gradient,
+    /// in the order of the trailing outputs. A parameter that is missing
+    /// here has no gradient and is not trained.
+    pub fn param_grads(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+        let gradients = &self.outputs[self.num_user_outputs()..];
+        self.grad_params
+            .iter()
+            .copied()
+            .zip(gradients.iter().copied())
     }
 
     pub fn set_outputs(&mut self, outputs: Vec<NodeId>) {
         self.outputs = outputs;
-        self.num_param_grad_outputs = 0;
+        self.grad_params.clear();
     }
 
-    /// Append parameter-gradient outputs after user outputs. Only called by
-    /// autodiff. `num_grads` must equal the number of entries appended.
-    pub fn append_param_grad_outputs(&mut self, grads: &[NodeId]) {
-        self.outputs.extend_from_slice(grads);
-        self.num_param_grad_outputs += grads.len();
+    /// Append `(parameter, gradient)` pairs after the user outputs. Only
+    /// called by autodiff, with the parameters that have a gradient.
+    pub fn append_param_grads(&mut self, pairs: &[(NodeId, NodeId)]) {
+        for &(param, gradient) in pairs {
+            self.grad_params.push(param);
+            self.outputs.push(gradient);
+        }
     }
 
     pub fn add_raw_node(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType) -> NodeId {
@@ -1265,7 +1285,7 @@ impl Graph {
             outputs: self.outputs.clone(),
             new_nodes_require_full_precision: self.new_nodes_require_full_precision,
             new_nodes_are_derivatives: self.new_nodes_are_derivatives,
-            num_param_grad_outputs: self.num_param_grad_outputs,
+            grad_params: self.grad_params.clone(),
             derived_params: self.derived_params.clone(),
         }
     }

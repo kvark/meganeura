@@ -20,9 +20,9 @@ fn gradient_operand(
 /// Build the backward (gradient) graph from a forward graph.
 ///
 /// Given a graph ending in a scalar loss, appends gradient nodes for each
-/// parameter. Returns a new graph containing both forward and backward passes,
-/// with outputs being the parameter gradients (in the same order as parameters
-/// appear in the original graph).
+/// parameter the loss reaches. Returns a new graph containing both forward
+/// and backward passes. Its outputs are the forward outputs followed by those
+/// gradients, and [`Graph::param_grads`] names the parameter of each.
 pub fn differentiate(forward: &Graph) -> Graph {
     differentiate_impl(forward, false)
 }
@@ -1283,25 +1283,17 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
     }
 
     // Preserve all user-supplied outputs (loss + any extras observed during
-    // training) and append one gradient-output entry per Parameter node.
-    // Every Parameter gets an output entry (even dead ones with no gradient)
-    // to maintain positional alignment with param_buffers in compile.rs.
+    // training) and append the gradient of every parameter that has one.
+    // A dead or explicitly frozen parameter has none and is left out, so
+    // no value can stand in for a gradient that does not exist.
     graph.set_outputs(forward.outputs().to_vec());
-    let mut grad_outputs = Vec::new();
-    for node in forward.nodes() {
-        if let Op::Parameter { .. } = node.op {
-            if let Some(&grad_id) = grads.get(&node.id) {
-                grad_outputs.push(grad_id);
-            } else {
-                // Dead or explicitly frozen parameter — use a scalar-zero
-                // sentinel so positions remain aligned. The compiler omits
-                // shape-mismatched sentinels from `param_grad_pairs`.
-                let zero = graph.scalar(0.0);
-                grad_outputs.push(zero);
-            }
-        }
-    }
-    graph.append_param_grad_outputs(&grad_outputs);
+    let param_grads: Vec<(NodeId, NodeId)> = forward
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.op, Op::Parameter { .. }))
+        .filter_map(|node| Some((node.id, *grads.get(&node.id)?)))
+        .collect();
+    graph.append_param_grads(&param_grads);
 
     graph
 }
