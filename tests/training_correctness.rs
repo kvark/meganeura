@@ -72,11 +72,6 @@ fn verify_training_decreases_loss(
 
 #[test]
 fn smollm2_training_loss_decreases() {
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
-        return;
-    }
-
     use meganeura::models::smollm2;
 
     let config = smollm2::Config::small_test();
@@ -169,11 +164,6 @@ fn inference_parameters_load_into_training() {
 
 #[test]
 fn smolvla_training_loss_decreases() {
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
-        return;
-    }
-
     use meganeura::models::smolvla;
 
     let config = smolvla::Config::small_test();
@@ -219,11 +209,6 @@ fn smolvla_training_loss_decreases() {
 
 #[test]
 fn sd_unet_training_loss_decreases() {
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
-        return;
-    }
-
     use meganeura::models::sd_unet;
 
     let config = sd_unet::Config::tiny();

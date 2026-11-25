@@ -63,10 +63,8 @@ jobs:
         include:
           - name: Linux (lavapipe)
             os: ubuntu-latest
-            skip_backprop: "1"
           - name: macOS (Metal)
             os: macos-latest
-            skip_backprop: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -127,9 +125,6 @@ jobs:
             cargo test --tests --all-features -- --test-threads=4
           fi
         env:
-          # MHA backward shaders produce numerically unstable gradients on
-          # lavapipe and on CI Metal runners (grad_k divergence on M-series).
-          MEGANEURA_SKIP_BACKPROP: ${{ matrix.skip_backprop }}
           MEGANEURA_SKIP_BIT_EXACT: "1"
 
       # A test binary that dies on a signal takes its remaining tests with
@@ -165,7 +160,7 @@ jobs:
             --json --summary-only --output-path target/llvm-cov/summary.json
           cargo llvm-cov report --ignore-filename-regex '(^|/)(tests|examples|bench)/' \
             --html
-          jq -r '.data[0].totals | "Rust host coverage: lines \(.lines.percent)%, functions \(.functions.percent)%, regions \(.regions.percent)%. WGSL execution is not instrumented; CI backprop/bit-exact skips apply."' \
+          jq -r '.data[0].totals | "Rust host coverage: lines \(.lines.percent)%, functions \(.functions.percent)%, regions \(.regions.percent)%. WGSL execution is not instrumented; CI bit-exact skips apply."' \
             target/llvm-cov/summary.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Retain coverage by revision
