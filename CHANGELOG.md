@@ -23,6 +23,11 @@
   `ScalarMatmulShape` gains `vector_fragments`, and the kernel memo revision
   moves to 18.
 
+- Measured search can try F16 for dense products that write parameter gradients
+  and BF16 for activation gradients, including NN products. The two uniform
+  trials still cover AT/BT only. Convolutions can try F16 weight gradients
+  with BF16 input gradients. Mixed trials follow the early search choices.
+
 - Measured construction accepts `BuildSearchOptions::qualification_runs` to
   check repeated executions of each candidate outside timing. Persistent
   writes and representative inputs are restored before every qualification
