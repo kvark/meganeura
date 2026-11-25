@@ -188,30 +188,79 @@ fn eight_input_pointwise_respects_eight_storage_buffer_cap() {
     }
 }
 
-/// Subgroup `argmax_inner` over an all-NaN row must return a valid column
-/// index (0.0) rather than the empty-index sentinel `0xffffffff` (4294967296.0).
+/// Subgroup `argmax_inner` over all-NaN and column-0-NaN rows must match the
+/// scalar tree path and f64 reference (returning column 0.0, never `0xffffffff`).
 #[test]
 fn subgroup_argmax_all_nan_row_returns_valid_column_index() {
     let mut g = Graph::new();
-    let x = g.input("x", &[2, 64]);
+    let x = g.input("x", &[4, 64]);
     let y = g.argmax_inner(x);
     g.set_outputs(vec![y]);
 
     let mut config = crate::support::gpu::inference_config();
     config.tune = false;
     let mut session = meganeura::build(&g, config).0;
-    let mut data = vec![f32::NAN; 2 * 64];
+    let caps = crate::support::gpu::gpu().capabilities();
+    if caps.subgroup_size > 0 {
+        let keys = session.dispatch_pipeline_keys();
+        assert!(
+            keys.iter().any(|k| k.contains(":sg")),
+            "expected subgroup reduction pipeline when subgroup_size > 0: {keys:?}"
+        );
+    }
+
+    let mut data = vec![f32::NAN; 4 * 64];
+    // Row 0: all NaN -> 0.0.
+    // Row 1: col 0 is NaN, rest finite -> 0.0 (matches tree path & f64 reference).
+    for c in 1..64 {
+        data[64 + c] = if c == 1 { 5.0 } else { 1.0 };
+    }
+    // Row 2: wave 0 finite (max at col 3), wave 1 all NaN -> 3.0.
+    for c in 0..32 {
+        data[2 * 64 + c] = if c == 3 { 4.0 } else { 1.0 };
+    }
+    // Row 3: all finite -> 37.0.
     for c in 0..64 {
-        data[64 + c] = if c == 37 { 10.0 } else { c as f32 * 0.01 };
+        data[3 * 64 + c] = if c == 37 { 10.0 } else { c as f32 * 0.01 };
     }
     session.set_input("x", &data);
     session.step();
     session.wait();
-    let got = session.read_output(2);
+    let got = session.read_output(4);
     assert_eq!(
         got[0], 0.0,
         "all-NaN row must return column 0, got {}",
         got[0]
     );
-    assert_eq!(got[1], 37.0, "finite row must still return argmax 37");
+    assert_eq!(
+        got[1], 0.0,
+        "column-0 NaN row must match tree/f64 reference and return 0, got {}",
+        got[1]
+    );
+    assert_eq!(
+        got[2], 3.0,
+        "finite wave 0 with all-NaN wave 1 must return col 3, got {}",
+        got[2]
+    );
+    assert_eq!(got[3], 37.0, "finite row must still return argmax 37");
+
+    // Plain and fused-prologue RmsNorm both stay on the scalar tree path (no :sg/:v4)
+    // so debug sessions and `rms_norm.wgsl` preserve identical reduction order.
+    let mut norm_g = Graph::new();
+    let a = norm_g.input("a", &[4, 128]);
+    let b = norm_g.input("b", &[4, 128]);
+    let w = norm_g.parameter("w", &[128]);
+    let plain = norm_g.rms_norm(a, w, 1e-5);
+    let sum = norm_g.add(a, b);
+    let fused = norm_g.rms_norm(sum, w, 1e-5);
+    norm_g.set_outputs(vec![plain, fused]);
+    let mut cfg = crate::support::gpu::inference_config();
+    cfg.tune = false;
+    let norm_session = meganeura::build(&norm_g, cfg).0;
+    for key in norm_session.dispatch_pipeline_keys() {
+        assert!(
+            !key.contains(":sg") && !key.contains(":v4"),
+            "RmsNorm reductions must stay on scalar tree order: {key}"
+        );
+    }
 }

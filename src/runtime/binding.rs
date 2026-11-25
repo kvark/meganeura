@@ -157,8 +157,7 @@ impl Session {
             return;
         }
         // Schedule-template pointwise dispatches bind through `DynPointwiseData`
-        // (`BufferListData<UnaryParams>`) for any fused DAG arity up to
-        // `MAX_POINTWISE_INPUTS`.
+        // (stack-backed, up to `MAX_POINTWISE_INPUTS` inputs + dst + params).
         if dispatch.pointwise().is_some() {
             let params = UnaryParams {
                 len: dispatch.params[0],

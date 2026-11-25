@@ -2653,16 +2653,28 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
-            // Keep plain RmsNorm on the scalar tree path so debug sessions and
-            // `fuse_rmsnorm_into_add` (`rms_norm.wgsl`) preserve identical
+            // Keep RmsNorm-rooted reductions (plain and fused-prologue alike)
+            // on the scalar tree path so debug sessions (`fuse_dispatches=false`)
+            // and `fuse_rmsnorm_into_add` (`rms_norm.wgsl`) preserve identical
             // floating-point reduction order.
-            let plain_rmsnorm = crate::compile::is_plain_rmsnorm(dispatch);
-            let use_subgroups = !plain_rmsnorm
+            let is_rmsnorm = crate::compile::is_plain_rmsnorm(dispatch)
+                || (kernel.op == crate::schedule::ReduceOp::Sum
+                    && kernel.extra_prologues.is_empty()
+                    && kernel.n_per_row == 0
+                    && kernel.epilogue.as_ref().is_some_and(|epi| {
+                        epi.n_per_col_inputs == 1
+                            && epi
+                                .dag
+                                .ops
+                                .iter()
+                                .any(|op| matches!(op, crate::schedule::Pw::Rsqrt(_)))
+                    }));
+            let use_subgroups = !is_rmsnorm
                 && caps.subgroup_size > 0
                 && kernel.rows_per_workgroup == 1
                 && kernel.workgroup_size > 1;
             let inner = dispatch.params.get(1).copied().unwrap_or(0);
-            let vec4 = !plain_rmsnorm && kernel.can_vectorize(dispatch.pointwise_storage, inner);
+            let vec4 = !is_rmsnorm && kernel.can_vectorize(dispatch.pointwise_storage, inner);
             if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
                 return Variant::Reduction(kernel.hash_key(), use_subgroups, vec4);
             }

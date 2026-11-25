@@ -439,7 +439,7 @@ impl PointwiseDAG {
 
     /// Binding names for each input stream:
     ///   - n=1 → `["src"]`
-    ///   - n=2..=8 → `["src_a", "src_b", ..., "src_h"][..n]`
+    ///   - n=2..=MAX_POINTWISE_INPUTS → `["src_a", "src_b", ..., "src_g"][..n]`
     fn input_binding_names(n: u8) -> Vec<&'static str> {
         pointwise_input_binding_names(n)
     }
@@ -1362,15 +1362,45 @@ fn lower_reduction(
                     let _ = writeln!(src, "    let wave_val_{k} = subgroupMax(acc_{k});");
                 }
                 ReduceOp::ArgMax => {
-                    let _ = writeln!(src, "    let wave_val_{k} = subgroupMax(acc_{k});");
+                    // Match the scalar tree path and f64 reference across all
+                    // NaN patterns without feeding NaNs into `subgroupMax`
+                    // (whose NaN result is undefined in SPIR-V):
+                    // - If column 0 (owned by lane 0) is NaN, nothing compares
+                    //   greater so column 0 wins with a NaN sentinel value.
+                    // - Otherwise, mask NaNs to `-inf` before `subgroupMax`;
+                    //   waves with no non-NaN active lanes emit `0xffffffffu`
+                    //   so they are skipped by the cross-wave combine.
                     let _ = writeln!(
                         src,
-                        "    let wave_match_{k} = subgroupMin(select(0xffffffffu, index_{k}, index_{k} != 0xffffffffu && acc_{k} == wave_val_{k}));"
+                        "    let is_nan_{k} = (bitcast<u32>(acc_{k}) & 0x7fffffffu) > 0x7f800000u;"
                     );
-                    let _ = writeln!(src, "    let wave_first_{k} = subgroupMin(index_{k});");
                     let _ = writeln!(
                         src,
-                        "    let wave_idx_{k} = select(wave_match_{k}, wave_first_{k}, wave_match_{k} == 0xffffffffu);"
+                        "    let lane0_nan_{k} = subgroupAny((lane == 0u) & is_nan_{k});"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let any_non_nan_{k} = subgroupAny((index_{k} != 0xffffffffu) & !is_nan_{k});"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_max_{k} = subgroupMax(select(bitcast<f32>(0xff800000u), acc_{k}, !is_nan_{k}));"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_val_{k} = select(bitcast<f32>(0x7fc00000u), wave_max_{k}, !lane0_nan_{k} & any_non_nan_{k});"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_match_{k} = subgroupMin(select(0xffffffffu, index_{k}, (index_{k} != 0xffffffffu) & (acc_{k} == wave_val_{k})));"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_first_{k} = subgroupMin(select(0xffffffffu, index_{k}, !is_nan_{k}));"
+                    );
+                    let _ = writeln!(
+                        src,
+                        "    let wave_idx_{k} = select(select(wave_match_{k}, wave_first_{k}, wave_match_{k} == 0xffffffffu), 0u, lane0_nan_{k});"
                     );
                 }
             }
@@ -2231,8 +2261,8 @@ mod tests {
 
     #[test]
     fn wide_arity_and_vec4_pointwise_validate_to_spirv() {
-        // 6-input DAG exercising wider-than-3 BufferListData bindings, broadcasts,
-        // and all special vec4 op lowerings (Erf, Tanh, Greater, U32ToF32, F32ToU32).
+        // 6-input DAG exercising wider-than-3 stack-backed DynPointwiseData bindings,
+        // broadcasts, and all special vec4 op lowerings (Erf, Tanh, Greater, U32ToF32, F32ToU32).
         let dag = PointwiseDAG {
             n_inputs: 6,
             ops: vec![
