@@ -1054,12 +1054,6 @@ impl Graph {
         self.deep_clone().into_toposort()
     }
 
-    /// Consuming variant of [`Graph::toposort`].
-    ///
-    /// Node-owned payloads such as constants are moved into the sorted graph
-    /// instead of cloned. This materially lowers construction peaks for large
-    /// differentiated graphs while producing the same remapped IR.
-    #[track_caller]
     /// Return the forward attention node referenced by `MultiHeadAttnGrad*`,
     /// if any. Attention gradients read the forward node's output and LSE
     /// through this field rather than `node.inputs`, so liveness and
@@ -1073,6 +1067,12 @@ impl Graph {
         }
     }
 
+    /// Consuming variant of [`Graph::toposort`].
+    ///
+    /// Node-owned payloads such as constants are moved into the sorted graph
+    /// instead of cloned. This materially lowers construction peaks for large
+    /// differentiated graphs while producing the same remapped IR.
+    #[track_caller]
     pub(crate) fn into_toposort(self) -> Graph {
         let Graph {
             nodes,

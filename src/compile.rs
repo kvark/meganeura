@@ -5789,4 +5789,59 @@ mod tests {
             group_of(tok_idx)
         );
     }
+
+    #[test]
+    fn topological_sorts_order_attention_fwd_node_before_lower_id_grad() {
+        // Hand-built graph where `MultiHeadAttnGradQ` has a LOWER node ID than
+        // its `fwd_node` (`CausalAttention`) and shares the exact same inputs.
+        // Removing the `fwd_node` edge from either `compile::topological_order`
+        // or `Graph::into_toposort` would order GradQ before its forward node.
+        let mut g = Graph::new();
+        let q = g.input("q", &[16, 32]);
+        let k = g.input("k", &[16, 32]);
+        let v = g.input("v", &[16, 32]);
+        let d_out = g.input("d_out", &[16, 32]);
+        let ty = g.node(q).ty.clone();
+        // Reserve GradQ first (lower ID), pointing at the forward attention
+        // node that will be appended at the next ID.
+        let fwd_id = (g.nodes().len() + 1) as NodeId;
+        let grad_q = g.add_raw_node(
+            Op::MultiHeadAttnGradQ {
+                fwd_node: fwd_id,
+                num_heads: 2,
+                num_kv_heads: 2,
+                head_dim: 16,
+                is_cross: false,
+            },
+            vec![d_out, q, k, v],
+            ty.clone(),
+        );
+        let fwd = g.causal_attention(q, k, v, 2, 2, 16);
+        assert_eq!(fwd, fwd_id);
+        assert!(grad_q < fwd);
+        g.set_outputs(vec![grad_q]);
+
+        // 1) compile::topological_order must place `fwd` strictly before `grad_q`.
+        let order = topological_order(&g);
+        let fwd_pos = order.iter().position(|&id| id == fwd).unwrap();
+        let grad_pos = order.iter().position(|&id| id == grad_q).unwrap();
+        assert!(
+            fwd_pos < grad_pos,
+            "compile::topological_order placed GradQ ({grad_pos}) before fwd_node ({fwd_pos})"
+        );
+
+        // 2) Graph::into_toposort must likewise assign `fwd` a lower ID than `grad_q`.
+        let sorted = g.toposort();
+        let grad_node = sorted
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::MultiHeadAttnGradQ { .. }))
+            .expect("GradQ in sorted graph");
+        let remapped_fwd = Graph::attn_fwd_node(&grad_node.op).unwrap();
+        assert!(
+            remapped_fwd < grad_node.id,
+            "Graph::into_toposort placed GradQ (id {}) before fwd_node (id {remapped_fwd})",
+            grad_node.id
+        );
+    }
 }

@@ -2040,13 +2040,13 @@ mod tests {
             let k = g.matmul(h, wk);
             let v = g.matmul(h, wv);
             let attn = g.causal_attention(q, k, v, 2, 2, 16);
+            g.nodes_mut()[attn as usize].name = Some(format!("l{l}.attn"));
             let proj = g.matmul(attn, wo);
             h = g.add(h, proj);
         }
         let loss = g.mean_all(h);
         g.set_outputs(vec![loss]);
 
-        let forward_len = g.nodes().len() as NodeId;
         let diff = differentiate_checkpointed(&g);
         let mut remapped_attn_grads = 0usize;
         for node in diff.nodes() {
@@ -2054,11 +2054,16 @@ mod tests {
             | Op::MultiHeadAttnGradK { fwd_node, .. }
             | Op::MultiHeadAttnGradV { fwd_node, .. } = node.op
             {
+                let target = diff.node(fwd_node);
                 assert!(
-                    matches!(diff.node(fwd_node).op, Op::CausalAttention { .. }),
+                    matches!(target.op, Op::CausalAttention { .. }),
                     "fwd_node {fwd_node} must point to a CausalAttention node"
                 );
-                if fwd_node >= forward_len {
+                if target
+                    .name
+                    .as_deref()
+                    .is_some_and(|s| s.ends_with(".attn.remat"))
+                {
                     remapped_attn_grads += 1;
                 }
             }
@@ -2146,14 +2151,17 @@ mod tests {
     fn checkpointing_prunes_unread_remat_nodes_without_optimize() {
         // In an MLP block `up = matmul(h, w1); act = silu(up); down = matmul(act, w2);
         // h = add(h, down)`, backward never reads `down` (only `act`, `up`, `h`),
-        // so `down` should not be cloned even before `optimize` runs.
+        // so `down` should not be cloned even before `optimize` runs. Use 12
+        // layers so the repeated region exceeds `outline::MIN_COVERAGE` (32).
         let mut g = Graph::new();
         let mut h = g.input("x", &[16, 32]);
-        for l in 0..4 {
+        for l in 0..12 {
             let w1 = g.parameter(&format!("l{l}.w1"), &[32, 64]);
             let w2 = g.parameter(&format!("l{l}.w2"), &[64, 32]);
             let up = g.matmul(h, w1);
+            g.nodes_mut()[up as usize].name = Some(format!("l{l}.up"));
             let act = g.silu(up);
+            g.nodes_mut()[act as usize].name = Some(format!("l{l}.act"));
             let down = g.matmul(act, w2);
             g.nodes_mut()[down as usize].name = Some(format!("l{l}.down"));
             h = g.add(h, down);
@@ -2162,6 +2170,16 @@ mod tests {
         g.set_outputs(vec![loss]);
 
         let diff = differentiate_checkpointed(&g);
+        assert!(
+            diff.nodes().iter().any(|n| matches!(n.op, Op::Depend)),
+            "12-layer MLP must actually trigger checkpointing"
+        );
+        assert!(
+            diff.nodes()
+                .iter()
+                .any(|n| n.name.as_deref().is_some_and(|s| s.ends_with(".up.remat"))),
+            "needed internal `up` matmul must be rematerialized"
+        );
         assert!(
             !diff.nodes().iter().any(|n| n
                 .name
