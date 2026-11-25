@@ -789,21 +789,65 @@ fn translate_node(
                 let axis = axis as usize;
                 let dim = out_shape[axis] as i64;
                 // Negative bounds count from the end; both clamp to the axis.
-                let clamp = |v: i64| (if v < 0 { v + dim } else { v }).clamp(0, dim) as u32;
+                let clamp = |v: i64| (if v < 0 { v + dim } else { v }).clamp(0, dim) as usize;
                 let (start, end) = (clamp(start), clamp(end).max(clamp(start)));
-                let outer = out_shape[..axis].iter().product::<usize>() as u32;
-                let inner = out_shape[axis + 1..].iter().product::<usize>() as u32;
-                let dim = dim as u32;
-                // Drop the leading `start`, then keep the first `end - start`.
-                if start > 0 {
-                    out = graph.split_b(out, outer, start, dim - start, inner);
-                }
-                if end < dim {
-                    out = graph.split_a(out, outer, end - start, dim - end, inner);
-                }
-                out_shape[axis] = (end - start) as usize;
+                out = narrow(graph, out, &out_shape, axis, start..end);
+                out_shape[axis] = end - start;
             }
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
+        }
+
+        "Split" => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let rank = x_shape.len() as i64;
+            let axis = attrs.i("axis", 0);
+            let axis = if axis < 0 { axis + rank } else { axis };
+            if !(0..rank).contains(&axis) {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': Split axis {axis} of {x_shape:?}",
+                    node.name
+                )));
+            }
+            let axis = axis as usize;
+            let dim = x_shape[axis];
+            // Sizes are an attribute before opset 13 and an input after.
+            let mut sizes: Vec<i64> = attrs.ints("split").to_vec();
+            if let Some(&id) = node.inputs.get(1).and_then(|name| name_to_id.get(name)) {
+                let Some(values) = constant_values(graph, id, weights) else {
+                    return Err(OnnxError::UnsupportedOp(
+                        "Split: the sizes must be constants".into(),
+                    ));
+                };
+                sizes = values.iter().map(|&v| v as i64).collect();
+            }
+            // Without sizes the parts are even, and the last takes what is left.
+            if sizes.is_empty() {
+                let parts = attrs.i("num_outputs", node.outputs.len() as i64).max(1) as usize;
+                let chunk = dim.div_ceil(parts) as i64;
+                sizes = vec![chunk; parts];
+                if let Some(last) = sizes.last_mut() {
+                    *last = dim as i64 - chunk * (parts as i64 - 1);
+                }
+            }
+            if sizes.len() != node.outputs.len()
+                || sizes.iter().any(|&size| !(1..=dim as i64).contains(&size))
+                || sizes.iter().sum::<i64>() != dim as i64
+            {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': Split of {x_shape:?} on axis {axis} into {sizes:?}",
+                    node.name
+                )));
+            }
+            let mut start = 0;
+            for (slot, &size) in sizes.iter().enumerate() {
+                let end = start + size as usize;
+                let out = narrow(graph, x, &x_shape, axis, start..end);
+                let mut out_shape = x_shape.clone();
+                out_shape[axis] = size as usize;
+                register_output(node, slot, out, &out_shape, name_to_id, shapes);
+                start = end;
+            }
         }
 
         // --- GroupNorm ---
@@ -1346,6 +1390,28 @@ fn window(
         }
     }
     Ok((stride, pads))
+}
+
+/// The `range` of `x` along `axis` of its `shape`.
+fn narrow(
+    graph: &mut Graph,
+    x: NodeId,
+    shape: &[usize],
+    axis: usize,
+    range: std::ops::Range<usize>,
+) -> NodeId {
+    let outer = shape[..axis].iter().product::<usize>() as u32;
+    let inner = shape[axis + 1..].iter().product::<usize>() as u32;
+    let (dim, start, end) = (shape[axis] as u32, range.start as u32, range.end as u32);
+    // Drop the leading `start`, then keep the first `end - start`.
+    let mut out = x;
+    if start > 0 {
+        out = graph.split_b(out, outer, start, dim - start, inner);
+    }
+    if end < dim {
+        out = graph.split_a(out, outer, end - start, dim - end, inner);
+    }
+    out
 }
 
 /// `x` of `shape` broadcast to `out_shape` by one broadcast; the ranks
@@ -1988,5 +2054,39 @@ mod tests {
             load_onnx_bytes(&bytes, None),
             Err(OnnxError::UnsupportedOp(_))
         ));
+    }
+
+    /// Each output of `Split` is its run of columns, the middle one too.
+    #[test]
+    fn split_outputs_are_column_ranges() {
+        let nodes = [build_node_proto(
+            "Split",
+            &["x", "sizes"],
+            &["a", "b", "c"],
+            &[("axis", -1)],
+            &[],
+        )];
+        let bytes = build_onnx_model(
+            &nodes,
+            &[build_tensor_proto("sizes", &[3], &[1.0, 3.0, 2.0])],
+            &[
+                build_value_info("x", &[2, 6]),
+                build_value_info("sizes", &[3]),
+            ],
+            &["a", "b", "c"].map(|name| build_value_info(name, &[])),
+        );
+        let model = load_onnx_bytes(&bytes, None).unwrap();
+        let x: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let mut feeds = crate::reference::Feeds::new();
+        feeds.set("x", &x);
+        feeds.set("sizes", &model.weights["sizes"]);
+        let got = crate::reference::evaluate_outputs(&model.graph, &feeds).unwrap();
+        let got: Vec<Vec<f64>> = got.into_iter().map(|t| t.data).collect();
+        let want = [
+            vec![0.0, 6.0],
+            vec![1.0, 2.0, 3.0, 7.0, 8.0, 9.0],
+            vec![4.0, 5.0, 10.0, 11.0],
+        ];
+        assert_eq!(got, want);
     }
 }

@@ -25,7 +25,8 @@
   added per channel, `BatchNormalization` folds into per-channel constants,
   and `MaxPool` strides default to 1 as the spec says. Windows honour
   `auto_pad` and per-axis padding; grouped, dilated and asymmetrically
-  padded windows are refused with an error.
+  padded windows are refused with an error. `Split` imports, with its sizes
+  from an input, the `split` attribute, or `num_outputs`.
 
 - Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
 
