@@ -657,3 +657,74 @@ fn tune_tiled_and_split_native_f32_sequences() {
         }
     }
 }
+
+#[test]
+fn unary_epilogue_matmul_qualifies_during_tuning() {
+    let (m, n, k) = (128usize, 128usize, 64usize);
+    let mut g = Graph::new();
+    let a = g.input("a", &[m, k]);
+    let b = g.input("b", &[k, n]);
+    let prod = g.matmul(a, b);
+    let y = g.relu(prod);
+    g.set_outputs(vec![y]);
+
+    let (mut session, _) = build(
+        &g,
+        SessionConfig {
+            gpu: Some(crate::support::gpu::gpu()),
+            mode: Mode::Inference,
+            runtime: SessionOptions {
+                coop: CoopPolicy::Disabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .any(|d| d.matmul_epilogue.is_some()),
+        "matmul + relu should fuse into a unary matmul epilogue"
+    );
+    let report = session
+        .tune_with(TuneOptions {
+            max_time: Duration::from_secs(10),
+            ..crate::support::sequential_tuning()
+        })
+        .unwrap();
+    assert!(
+        !report.outcomes.is_empty(),
+        "unary-epilogue matmul should enter tuning"
+    );
+    for outcome in &report.outcomes {
+        assert!(outcome.class.epilogue.is_some());
+        assert!(
+            outcome.qualified && outcome.decision != TuneDecision::InvalidOutput,
+            "unary-epilogue matmul should qualify cleanly: {outcome:?}"
+        );
+    }
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+    session.set_input("a", &a_data);
+    session.set_input("b", &b_data);
+    session.step();
+    session.wait();
+    let got = session.read_output(m * n);
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f64;
+            for inner in 0..k {
+                sum += f64::from(a_data[row * k + inner]) * f64::from(b_data[inner * n + col]);
+            }
+            let expected = sum.max(0.0);
+            let actual = f64::from(got[row * n + col]);
+            assert!(
+                (actual - expected).abs() <= 1e-4 * (1.0 + expected.abs()),
+                "[{row}, {col}]: {actual} != {expected}"
+            );
+        }
+    }
+}

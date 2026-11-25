@@ -765,3 +765,15 @@ fn decomposed_rms_norm_reaches_plan_fusions() {
     assert!(!off.1, "the optimizer is off");
     assert!(off.0 > named.0, "{off:?} should run the primitives");
 }
+
+#[test]
+fn fill_constant_matches_reference_in_forward_and_training() {
+    let build = |g: &mut Graph| {
+        let x = g.parameter("x", &[5, 7]);
+        let bias = g.fill(0.375, &[5, 7]);
+        let shifted = g.add(x, bias);
+        g.relu(shifted)
+    };
+    inference_case("fill", build, |_| {});
+    grad_case("fill", build, |_| {});
+}

@@ -1489,6 +1489,10 @@ pub struct ExecutionPlan {
     pub input_types: HashMap<BufferRef, crate::graph::TensorType>,
     /// Constant buffers with their initial data (uploaded once at session creation).
     pub constant_buffers: Vec<(BufferRef, Vec<f32>)>,
+    /// Uniform F32 constants (`Op::Fill`): initialized in place on upload without
+    /// storing a dense `Vec<f32>` in the graph, plan, or RON cache.
+    #[serde(default)]
+    pub uniform_constants: Vec<(BufferRef, f32)>,
     /// The dispatch sequence. For a training graph, this includes
     /// forward, backward, and parameter update dispatches.
     pub dispatches: Vec<Dispatch>,
@@ -1626,13 +1630,31 @@ impl ExecutionPlan {
             value.hash(&mut h);
             h.finish()
         }
+        fn hash_constant_bits(len: usize, bits: impl IntoIterator<Item = u32>) -> u64 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            "constant".hash(&mut h);
+            len.hash(&mut h);
+            for b in bits {
+                b.hash(&mut h);
+            }
+            h.finish()
+        }
         let mut current: HashMap<BufferRef, u64> = HashMap::new();
         for &(ref name, buf) in self.param_buffers.iter().chain(&self.input_buffers) {
             current.insert(buf, hash(("leaf", name)));
         }
         for &(buf, ref data) in &self.constant_buffers {
-            let bits: Vec<u32> = data.iter().map(|v| v.to_bits()).collect();
-            current.insert(buf, hash(("constant", bits)));
+            current.insert(
+                buf,
+                hash_constant_bits(data.len(), data.iter().map(|v| v.to_bits())),
+            );
+        }
+        for &(buf, value) in &self.uniform_constants {
+            let elems = self.logical_buffer_bytes(buf) / 4;
+            current.insert(
+                buf,
+                hash_constant_bits(elems, std::iter::repeat_n(value.to_bits(), elems)),
+            );
         }
         for &(buf, ref sources, ref transform) in &self.derived_params {
             current.insert(buf, hash(("derived", sources, structural_key(transform))));
@@ -1703,10 +1725,17 @@ impl ExecutionPlan {
 
     fn attach_borrowed_constant_buffers(&mut self, graph: &Graph) {
         for node in graph.nodes() {
-            if let Op::Constant { ref data } = node.op {
-                let buffer = self.node_buffer(node.id);
-                self.constant_buffers
-                    .push((buffer, constant_words(data.clone(), node.ty.dtype)));
+            match node.op {
+                Op::Constant { ref data } => {
+                    let buffer = self.node_buffer(node.id);
+                    self.constant_buffers
+                        .push((buffer, constant_words(data.clone(), node.ty.dtype)));
+                }
+                Op::Fill { value } => {
+                    let buffer = self.node_buffer(node.id);
+                    self.uniform_constants.push((buffer, value));
+                }
+                _ => {}
             }
         }
     }
@@ -1715,10 +1744,17 @@ impl ExecutionPlan {
         for node in graph.nodes_mut() {
             let node_id = node.id;
             let dtype = node.ty.dtype;
-            if let Op::Constant { ref mut data } = node.op {
-                let buffer = self.node_buffer(node_id);
-                self.constant_buffers
-                    .push((buffer, constant_words(std::mem::take(data), dtype)));
+            match node.op {
+                Op::Constant { ref mut data } => {
+                    let buffer = self.node_buffer(node_id);
+                    self.constant_buffers
+                        .push((buffer, constant_words(std::mem::take(data), dtype)));
+                }
+                Op::Fill { value } => {
+                    let buffer = self.node_buffer(node_id);
+                    self.uniform_constants.push((buffer, value));
+                }
+                _ => {}
             }
         }
     }
@@ -1741,6 +1777,7 @@ impl ExecutionPlan {
         visible.extend(self.derived_params.iter().map(|entry| entry.0));
         visible.extend(self.input_buffers.iter().map(|entry| entry.1));
         visible.extend(self.constant_buffers.iter().map(|entry| entry.0));
+        visible.extend(self.uniform_constants.iter().map(|entry| entry.0));
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
         for dispatch in &self.dispatches {
             visible.extend(dispatch.extra_outputs.iter().copied());
@@ -2059,6 +2096,11 @@ fn fold_uniform_constants(plan: &mut ExecutionPlan) {
                 .all(|value| value.to_bits() == bits)
                 .then_some((buffer, bits))
         })
+        .chain(
+            plan.uniform_constants
+                .iter()
+                .map(|&(buffer, value)| (buffer, value.to_bits())),
+        )
         .collect();
     if uniform.is_empty() {
         return;
@@ -4684,8 +4726,12 @@ mod tests {
         g.set_outputs(vec![loss]);
         let diff = crate::autodiff::differentiate(&g);
         let plan = compile(&diff);
-        let constants: std::collections::HashSet<_> =
-            plan.constant_buffers.iter().map(|entry| entry.0).collect();
+        let constants: std::collections::HashSet<_> = plan
+            .constant_buffers
+            .iter()
+            .map(|entry| entry.0)
+            .chain(plan.uniform_constants.iter().map(|entry| entry.0))
+            .collect();
         for dispatch in plan.dispatches.iter().filter(|d| d.pointwise().is_some()) {
             assert!(
                 dispatch
@@ -5566,5 +5612,28 @@ mod tests {
         assert_eq!(8202 % chunks, 0);
         assert_eq!(large.dispatches[0].workgroups[0], 8 * chunks);
         assert_eq!(large.dispatches[0].params, large.dispatches[1].params);
+    }
+
+    #[test]
+    fn dataflow_digest_matches_fill_and_uniform_constant() {
+        let mut g_fill = Graph::new();
+        let x1 = g_fill.input("x", &[32]);
+        let c1 = g_fill.fill(0.25, &[32]);
+        let y1 = g_fill.concat(x1, c1, 1, 4, 4, 8);
+        g_fill.set_outputs(vec![y1]);
+
+        let mut g_const = Graph::new();
+        let x2 = g_const.input("x", &[32]);
+        let c2 = g_const.constant(vec![0.25; 32], &[32]);
+        let y2 = g_const.concat(x2, c2, 1, 4, 4, 8);
+        g_const.set_outputs(vec![y2]);
+
+        let p_fill = compile(&g_fill);
+        let p_const = compile(&g_const);
+        assert_eq!(
+            p_fill.dataflow_digest(),
+            p_const.dataflow_digest(),
+            "Fill and bit-identical uniform Constant must produce the same dataflow digest"
+        );
     }
 }

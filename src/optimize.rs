@@ -752,7 +752,7 @@ fn named_constructor(op: &Op) -> Option<&'static str> {
 
 fn node_to_egglog_expr(node: &Node) -> String {
     match node.op {
-        Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } => {
+        Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Fill { .. } => {
             format!("(Leaf {})", node.id)
         }
         Op::RoPE {

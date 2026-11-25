@@ -92,4 +92,5 @@ pub(crate) fn matmul(
             ("$C_TILE", &format!("coop_mat{n}x{m}<f32, C>")),
         ],
     ))
+    .with_subgroup(0, [threads, 1, 1])
 }

@@ -1423,6 +1423,7 @@ fn run_matmul_probe(
 ) -> Option<Vec<f32>> {
     use blade_graphics as bg;
 
+    let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
     let shader = match create_gen_shader(gpu, module) {
         Ok(shader) => shader,
         Err(error) => {
@@ -1431,8 +1432,13 @@ fn run_matmul_probe(
         }
     };
     let layout = shader_data_layout(&ShaderEntry::MatMul);
-    let mut pipeline =
-        create_profiled_pipeline(gpu, probe.pipeline.to_string(), &layout, shader.at("main"));
+    let mut pipeline = create_profiled_pipeline_with_subgroup(
+        gpu,
+        probe.pipeline.to_string(),
+        &layout,
+        shader.at("main"),
+        full_subgroup_size,
+    );
     let len = (probe.params.m * probe.params.n) as usize;
     let buffer = |name, bytes: usize| {
         gpu.create_buffer(bg::BufferDesc {
@@ -1791,11 +1797,76 @@ fn create_gen_shader(
     .map_err(|error| error.to_string())
 }
 
+/// Resolve the explicit subgroup requirement carried by a generated
+/// [`crate::codegen::ShaderModule`] against the device's full-subgroup
+/// capabilities.
+///
+/// Shaders with `req.size > 0` hardcode that exact subgroup width in WGSL
+/// (for example `subgroup-matmul`) and always pin `required_full_subgroup_size`
+/// when the device supports it. Shaders with `req.size == 0` adapt to
+/// `@builtin(subgroup_size)` dynamically: they pin `caps.subgroup_size` on
+/// fixed-width devices (`min_size == max_size`, such as NVIDIA/Metal) so every
+/// subgroup is full, but return `None` on variable-width devices (`min_size !=
+/// max_size`, such as Intel Xe2 `[16, 32]`) because Vulkan's
+/// `requiredSubgroupSize` overrides the driver's register-pressure heuristic
+/// and can force SIMD32 spilling on register-heavy kernels like FlashAttention
+/// backward.
+fn required_full_subgroup_size(
+    caps: &blade_graphics::Capabilities,
+    req: Option<crate::codegen::SubgroupRequirement>,
+) -> Option<u32> {
+    let req = req?;
+    let fs = caps.full_subgroups?;
+    let size = if req.size == 0 {
+        if fs.min_size != fs.max_size {
+            return None;
+        }
+        caps.subgroup_size
+    } else {
+        req.size
+    };
+    if size == 0 {
+        return None;
+    }
+    fs.supports(size, req.workgroup_size).then_some(size)
+}
+
+/// Shared workgroup-cooperative tile resolution used by both `Pipelines::compile`
+/// and `tuning::tile_module`.
+pub(super) fn workgroup_matmul_shape_and_subgroup(
+    shape: crate::codegen::WorkgroupMatmulShape,
+    types: crate::codegen::MatrixTypes,
+    caps: &blade_graphics::Capabilities,
+) -> Option<([u32; 3], u32)> {
+    if shape.subgroup_rows != 0 {
+        crate::codegen::native_subgroup_shape(caps, types.multiply)
+    } else {
+        Some(([16, 16, 16], 32))
+    }
+}
+
+pub(super) fn workgroup_matmul_epilogue_supported(
+    shape: crate::codegen::WorkgroupMatmulShape,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
+) -> bool {
+    epilogue.is_none_or(|epi| shape.subgroup_rows != 0 && epi.inputs.is_empty())
+}
+
 fn create_profiled_pipeline(
     gpu: &Gpu,
     name: String,
     layout: &blade_graphics::ShaderDataLayout,
     compute: blade_graphics::ShaderFunction<'_>,
+) -> blade_graphics::ComputePipeline {
+    create_profiled_pipeline_with_subgroup(gpu, name, layout, compute, None)
+}
+
+fn create_profiled_pipeline_with_subgroup(
+    gpu: &Gpu,
+    name: String,
+    layout: &blade_graphics::ShaderDataLayout,
+    compute: blade_graphics::ShaderFunction<'_>,
+    full_subgroup_size: Option<u32>,
 ) -> blade_graphics::ComputePipeline {
     let _span = tracing::info_span!(
         "pipeline",
@@ -1807,7 +1878,7 @@ fn create_profiled_pipeline(
         name: &name,
         data_layouts: &[layout],
         compute,
-        full_subgroup_size: None,
+        full_subgroup_size,
     })
 }
 
@@ -2075,19 +2146,12 @@ impl Pipelines {
                 }) {
                     return Err("unsupported workgroup cooperative product".to_owned());
                 }
-                if let Some(ref epi) = *epilogue {
-                    if shape.subgroup_rows == 0 || !epi.inputs.is_empty() {
-                        return Err(
-                            "unsupported epilogue on workgroup cooperative product".to_owned()
-                        );
-                    }
+                if !workgroup_matmul_epilogue_supported(shape, epilogue.as_ref()) {
+                    return Err("unsupported epilogue on workgroup cooperative product".to_owned());
                 }
-                let (native, subgroup) = if shape.subgroup_rows != 0 {
-                    crate::codegen::native_subgroup_shape(&capabilities, types.multiply)
-                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?
-                } else {
-                    ([16, 16, 16], 32)
-                };
+                let (native, subgroup) =
+                    workgroup_matmul_shape_and_subgroup(shape, types, &capabilities)
+                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
                 crate::codegen::generate_workgroup_matmul_for_device(
                     group,
                     shape,
@@ -2149,13 +2213,17 @@ impl Pipelines {
             Variant::Weight(_, format) => {
                 crate::codegen::generate_module_weighted(group, format, matmul_knobs)
             }
-            Variant::WeightSmall(..) => {
-                tuning::tile_module(dispatch, crate::tune::MatmulTile::Tile32, matmul_knobs)
-            }
+            Variant::WeightSmall(..) => tuning::tile_module(
+                dispatch,
+                crate::tune::MatmulTile::Tile32,
+                matmul_knobs,
+                &gpu.capabilities(),
+            ),
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
+                &gpu.capabilities(),
             ),
             Variant::SplitMatmul(_, _, shape, splits) => crate::codegen::generate_split_matmul(
                 group,
@@ -2167,7 +2235,7 @@ impl Pipelines {
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
-                tuning::tile_module(dispatch, tile, matmul_knobs)
+                tuning::tile_module(dispatch, tile, matmul_knobs, &gpu.capabilities())
             }
             Variant::Gemv(_, _, shape)
             | Variant::GemvIntDot(_, _, shape)
@@ -2176,7 +2244,12 @@ impl Pipelines {
                 if dispatch.gemv_rmsnorm.is_some() {
                     layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
                 }
-                tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
+                tuning::tile_module(
+                    dispatch,
+                    crate::tune::MatmulTile::Gemv(shape),
+                    matmul_knobs,
+                    &gpu.capabilities(),
+                )
             }
             Variant::Coop(..) => {
                 let config = cooperative();
@@ -2366,10 +2439,11 @@ impl Pipelines {
         if let Some(dir) = dump_dir {
             module.dump(dir);
         }
+        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
         let shared_key = SharedPipelineKey {
             context: Arc::as_ptr(gpu) as usize,
             entry_point,
-            layout: format!("{:?}", layout.bindings),
+            layout: format!("{:?}:sg={:?}", layout.bindings, full_subgroup_size),
             source: module.source.clone(),
         };
         if let Some(pipeline) = SharedPipelines::get(&shared_key) {
@@ -2378,7 +2452,13 @@ impl Pipelines {
         let shader = create_gen_shader(gpu, module)?;
         let pipeline = Arc::new(SharedPipeline {
             gpu: Arc::clone(gpu),
-            raw: create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point)),
+            raw: create_profiled_pipeline_with_subgroup(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(entry_point),
+                full_subgroup_size,
+            ),
         });
         SharedPipelines::insert(shared_key, &pipeline);
         Ok(pipeline)
@@ -3505,6 +3585,9 @@ pub struct Session {
     /// rewritten when it changes, so a step recorded while an earlier one is
     /// in flight does not touch memory the GPU may be reading.
     optimizer_table: Vec<optimizer::Segment>,
+    /// Cached optimizer dispatch units for `(accumulating, units)`. Invalidated
+    /// whenever a buffer binding, LR multiplier, or accumulator changes.
+    cached_optimizer_units: Option<(bool, std::sync::Arc<[optimizer::Unit]>)>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
     /// this diagnostic does not require another dispatch or shader variant.
@@ -4056,6 +4139,7 @@ impl Session {
             {
                 if plan.input_buffers.iter().any(|entry| entry.1 == buffer)
                     || plan.constant_buffers.iter().any(|entry| entry.0 == buffer)
+                    || plan.uniform_constants.iter().any(|entry| entry.0 == buffer)
                     || plan.loss_buffer == Some(buffer)
                     || !plan.buffers[buffer.0 as usize].is_multiple_of(4)
                     || plan
@@ -4337,7 +4421,7 @@ impl Session {
         {
             let _span = tracing::info_span!(
                 "buffer_constants",
-                buffers = plan.constant_buffers.len(),
+                buffers = plan.constant_buffers.len() + plan.uniform_constants.len(),
                 trace_min_duration_us = 1_000u64,
             )
             .entered();
@@ -4346,6 +4430,23 @@ impl Session {
                 unsafe {
                     let ptr = buffer.data() as *mut f32;
                     std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                }
+            }
+            for &(buf_ref, value) in &plan.uniform_constants {
+                let buffer = &buffers[buf_ref.0 as usize];
+                let logical_bytes = plan.logical_buffer_bytes(buf_ref);
+                let physical_bytes = plan.buffers[buf_ref.0 as usize];
+                let elems = logical_bytes / std::mem::size_of::<f32>();
+                unsafe {
+                    let ptr = buffer.data() as *mut f32;
+                    std::slice::from_raw_parts_mut(ptr, elems).fill(value);
+                    if physical_bytes > logical_bytes {
+                        std::ptr::write_bytes(
+                            buffer.data().add(logical_bytes),
+                            0,
+                            physical_bytes - logical_bytes,
+                        );
+                    }
                 }
             }
         }
@@ -4485,6 +4586,9 @@ impl Session {
         for &(b, _) in &plan.constant_buffers {
             written[b.0 as usize] = true;
         }
+        for &(b, _) in &plan.uniform_constants {
+            written[b.0 as usize] = true;
+        }
         for d in &plan.derived_params {
             written[d.0.0 as usize] = true;
         }
@@ -4530,6 +4634,7 @@ impl Session {
             optimizer_chunks,
             optimizer_segments: None,
             optimizer_table: Vec::new(),
+            cached_optimizer_units: None,
             adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
@@ -4759,6 +4864,7 @@ impl Session {
             self.invariants_cacheable = false;
         }
         self.buffers[index] = physical.handle.at(offset as u64);
+        self.cached_optimizer_units = None;
         let target = self
             .alias
             .rebind(index, self.plan.buffers[index], offset, device_local);
@@ -6787,12 +6893,14 @@ impl Session {
         } else {
             self.lr_multipliers.push((name_prefix.to_string(), mul));
         }
+        self.cached_optimizer_units = None;
     }
 
     /// Clear all per-parameter LR multipliers (returns all params to
     /// the base learning rate).
     pub fn clear_lr_multipliers(&mut self) {
         self.lr_multipliers.clear();
+        self.cached_optimizer_units = None;
     }
 
     /// Internal: longest-prefix-match lookup. Static helper so it can
@@ -7000,6 +7108,7 @@ impl Session {
             let mut device_bufs = Vec::new();
             let accumulators = optimizer::ChunkBuffers::new(self, "grad_accum", &mut device_bufs);
             self.grad_accum = Some(accumulators);
+            self.cached_optimizer_units = None;
             self.zero_optimizer_buffers(&device_bufs, "zero_grad_accum");
         }
         self.grad_accum_scale = Some(1.0 / micro_batches as f32);

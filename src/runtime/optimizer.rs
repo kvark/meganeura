@@ -134,7 +134,7 @@ pub(super) struct Segment {
 
 /// What one dispatch of a pass covers: a whole chunk, or one pair that left
 /// its chunk.
-struct Unit {
+pub(super) struct Unit {
     chunk: usize,
     /// Byte offset of the unit within the chunk's moments and accumulators.
     base: usize,
@@ -288,7 +288,12 @@ impl Session {
     /// Split the chunks into dispatch units and write their segment table.
     /// The table is host-visible, so when it changes (after a parameter is
     /// rebound, for instance) the GPU must be idle.
-    fn optimizer_units(&mut self, accumulating: bool) -> Vec<Unit> {
+    fn optimizer_units(&mut self, accumulating: bool) -> std::sync::Arc<[Unit]> {
+        if let Some((cached_accumulating, ref units)) = self.cached_optimizer_units
+            && cached_accumulating == accumulating
+        {
+            return std::sync::Arc::clone(units);
+        }
         struct Plan {
             chunk: usize,
             base: usize,
@@ -396,7 +401,7 @@ impl Session {
         }
         let segments = self.optimizer_segments.unwrap();
         let accumulators = self.grad_accum.as_ref().filter(|_| accumulating);
-        units
+        let built: std::sync::Arc<[Unit]> = units
             .into_iter()
             .map(|(plan, start, groups, slot)| Unit {
                 chunk: plan.chunk,
@@ -411,7 +416,9 @@ impl Session {
                 groups,
                 slot,
             })
-            .collect()
+            .collect();
+        self.cached_optimizer_units = Some((accumulating, std::sync::Arc::clone(&built)));
+        built
     }
 
     /// Record the passes that follow backward: gradient accumulation, then
@@ -431,7 +438,7 @@ impl Session {
             {
                 let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
                 let mut pass = self.encoder.compute("grad_accum");
-                for unit in &units {
+                for unit in units.iter() {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -472,7 +479,7 @@ impl Session {
             Some(Update::Sgd { lr }) => {
                 let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
                 let mut pass = self.encoder.compute("sgd_update");
-                for unit in &units {
+                for unit in units.iter() {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,
@@ -516,7 +523,7 @@ impl Session {
                     };
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
                 let mut pass = self.encoder.compute("adam_update");
-                for unit in &units {
+                for unit in units.iter() {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
                         0,

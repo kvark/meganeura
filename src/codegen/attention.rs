@@ -412,14 +412,19 @@ fn generate_flash_attention(
             ("$BKV", &shape.keys.to_string()),
         ],
     );
-    attention_module(
+    let module = attention_module(
         source,
         if cached {
             "cached_query_attention"
         } else {
             "flash_attention"
         },
-    )
+    );
+    if subgroup_tiles {
+        module.with_subgroup(0, [threads, 1, 1])
+    } else {
+        module
+    }
 }
 
 /// Inference F16 QK/PV products with F32 online softmax and accumulation.
@@ -444,6 +449,7 @@ pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> Shad
         ),
         "flash_attention_products",
     )
+    .with_subgroup(0, [64, 1, 1])
 }
 
 /// Cooperative forward attention: QKᵀ uses f16 matrix operands, while softmax
@@ -464,7 +470,7 @@ fn generate_flash_attention_coop(head_dim: u32, use_f16: bool) -> ShaderModule {
             ("$INPUT_TYPE", if use_f16 { "f16" } else { "f32" }),
         ],
     );
-    generate_coop_attention(&source, head_dim, "flash_attention_coop")
+    generate_coop_attention(&source, head_dim, "flash_attention_coop", 64)
 }
 
 /// Scaled F16 cooperative dQ, with 32 query rows per workgroup.
@@ -527,6 +533,7 @@ pub fn generate_flash_grad_kv_coop_f32_module_with_tile(head_dim: u32, tile: u32
         ),
         "flash_grad_kv_coop_f32",
     )
+    .with_subgroup(0, [128, 1, 1])
 }
 
 pub(crate) const FLASH_GRAD_COOP_F32_SHARED_BYTES: u32 = (4 * 1024 + 2 * 256 + 3 * 16) * 4;
@@ -574,6 +581,7 @@ pub fn generate_flash_grad_q_coop_f32_module_with_tile(head_dim: u32, tile: u32)
         ),
         "flash_grad_q_coop_f32",
     )
+    .with_subgroup(0, [128, 1, 1])
 }
 
 /// Binary-scaled F16 gradient products, with F32 accumulation.
@@ -596,10 +604,15 @@ pub fn generate_flash_grad_f16_module(
             ("$SCALE", include_str!("../shaders/attention_scale.wgsl")),
         ],
     );
-    generate_coop_attention(&source, head_dim, "flash_grad_scaled_f16")
+    generate_coop_attention(&source, head_dim, "flash_grad_scaled_f16", 128)
 }
 
-fn generate_coop_attention(template: &str, head_dim: u32, hint: &'static str) -> ShaderModule {
+fn generate_coop_attention(
+    template: &str,
+    head_dim: u32,
+    hint: &'static str,
+    threads: u32,
+) -> ShaderModule {
     assert!(
         head_dim >= 16 && head_dim.is_multiple_of(16),
         "{hint} requires head_dim multiple of 16, got {head_dim}"
@@ -614,7 +627,7 @@ fn generate_coop_attention(template: &str, head_dim: u32, hint: &'static str) ->
             ("$TILE_ELEMENTS", &(head_dim * 16).to_string()),
         ],
     );
-    attention_module(source, hint)
+    attention_module(source, hint).with_subgroup(0, [threads, 1, 1])
 }
 
 fn backward_attention_tile(head_dim: u32, threads: u32) -> u32 {
@@ -847,7 +860,12 @@ pub fn generate_flash_grad_module(
         Part::Q => "flash_grad_q",
         Part::KV => "flash_grad_kv",
     };
-    attention_module(preprocess(fragment("main"), &vars), hint)
+    let module = attention_module(preprocess(fragment("main"), &vars), hint);
+    if subgroup {
+        module.with_subgroup(0, [threads, 1, 1])
+    } else {
+        module
+    }
 }
 
 // ---------------------------------------------------------------------------

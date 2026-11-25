@@ -261,6 +261,7 @@ pub fn eval_node(
     let data = match node.op {
         Op::Parameter { ref name } | Op::Input { ref name } => leaf(node, name, feeds)?,
         Op::Constant { ref data } => data.iter().map(|&v| f64::from(v)).collect(),
+        Op::Fill { value } => vec![f64::from(value); node.ty.num_elements()],
 
         Op::MatMul
         | Op::MatMulAT

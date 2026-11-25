@@ -220,6 +220,17 @@ fn template_section<'a>(source: &'a str, name: &str) -> &'a str {
         .map_or(rest, |(section, _)| section)
 }
 
+/// Explicit subgroup-size metadata for pipelines that rely on full subgroups
+/// at a known workgroup geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubgroupRequirement {
+    /// Subgroup width the kernel was specialized for, or `0` to request the
+    /// device's reported `caps.subgroup_size`.
+    pub size: u32,
+    /// Entry-point `@workgroup_size(x, y, z)`.
+    pub workgroup_size: [u32; 3],
+}
+
 /// Generated WGSL source and its diagnostic name.
 pub struct ShaderModule {
     /// Parsed only in unit-test builds so validation tests can inspect the IR.
@@ -227,6 +238,7 @@ pub struct ShaderModule {
     pub(crate) module: naga::Module,
     pub source: String,
     pub hint: &'static str,
+    pub subgroup: Option<SubgroupRequirement>,
 }
 
 impl ShaderModule {
@@ -242,7 +254,16 @@ impl ShaderModule {
             }),
             source,
             hint,
+            subgroup: None,
         }
+    }
+
+    pub(crate) fn with_subgroup(mut self, size: u32, workgroup_size: [u32; 3]) -> Self {
+        self.subgroup = Some(SubgroupRequirement {
+            size,
+            workgroup_size,
+        });
+        self
     }
 
     /// Dump WGSL source into the configured directory.
@@ -789,6 +810,7 @@ impl ShaderGroup {
 /// Subgroup-reduction LayerNorm for devices advertising non-zero subgroup size.
 pub(crate) fn generate_layer_norm_subgroup() -> ShaderModule {
     ShaderModule::new(include_str!("shaders/layer_norm_subgroup.wgsl"))
+        .with_subgroup(0, [128, 1, 1])
 }
 
 pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
@@ -1467,7 +1489,11 @@ fn matmul_module(
             ],
         ));
     }
-    ShaderModule::new(&source)
+    let module = ShaderModule::new(&source);
+    match coop_threads {
+        Some(wg) => module.with_subgroup(0, [wg, 1, 1]),
+        None => module,
+    }
 }
 
 /// Generate WGSL source for a shader group.
@@ -2727,7 +2753,12 @@ fn generate_gemv(
             ),
         ],
     );
-    ShaderModule::new(&specialize_gemv(&source, shape, shape.column_groups))
+    let module = ShaderModule::new(&specialize_gemv(&source, shape, shape.column_groups));
+    if shape.reduction == GemvReduction::Subgroup {
+        module.with_subgroup(0, [shape.threads * shape.column_groups, 1, 1])
+    } else {
+        module
+    }
 }
 
 /// The Q8_1-activation, integer-dot GEMV at an explicit shape.
@@ -2818,7 +2849,12 @@ pub(crate) fn generate_module_gemv_int_dot(
             ("$BLOCK_DOT", block_dot),
         ],
     );
-    ShaderModule::new(&specialize_gemv(&source, shape, 1))
+    let module = ShaderModule::new(&specialize_gemv(&source, shape, 1));
+    if shape.reduction == GemvReduction::Subgroup {
+        module.with_subgroup(0, [shape.threads, 1, 1])
+    } else {
+        module
+    }
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -3563,7 +3599,8 @@ fn gen_matmul_coop_stored(
                     "@compute @workgroup_size(64) fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32)",
                 ),
             ],
-        ));
+        ))
+        .with_subgroup(0, [64, 1, 1]);
     }
     matmul_module(&src, &b_storage, Some(wg_size), copies)
 }

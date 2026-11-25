@@ -115,7 +115,7 @@ impl ExecutionPlan {
         let mut budget = 32 * 1024 * 1024;
         for index in (0..self.dispatches.len()).rev() {
             let dispatch = &self.dispatches[index];
-            if dispatch.use_coop() {
+            if dispatch.use_coop() || dispatch.matmul_epilogue.is_some() {
                 continue;
             }
             let Some(class) = TuneClass::from_dispatch(dispatch, None)

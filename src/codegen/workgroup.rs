@@ -592,7 +592,7 @@ pub(crate) fn generate_workgroup_matmul_for_device(
         );
     }
     source += "}\n";
-    ShaderModule::with_hint(source, "workgroup-matmul")
+    ShaderModule::with_hint(source, "workgroup-matmul").with_subgroup(0, [threads, 1, 1])
 }
 
 fn conv_split_images(split: bool, batch: u32) -> Images {
@@ -2250,7 +2250,7 @@ workgroupBarrier();"
         s += &staged;
     }
     s += "}\n";
-    ShaderModule::with_hint(s, "subgroup-matmul")
+    ShaderModule::with_hint(s, "subgroup-matmul").with_subgroup(subgroup, [threads, 1, 1])
 }
 
 #[cfg(test)]

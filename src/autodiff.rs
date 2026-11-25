@@ -266,7 +266,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 // fused into the ReLU.
                 let x = node.inputs[0];
                 let y = node.id;
-                let zero = graph.constant(vec![0.0; node.ty.num_elements()], &node.ty.shape);
+                let zero = graph.fill(0.0, &node.ty.shape);
                 let mask = graph.greater(y, zero);
                 let grad_x = graph.mul(grad_output, mask);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -274,7 +274,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
             Op::Sigmoid => {
                 // dL/dx = dL/dy * y * (1 - y)
                 let y = node.id;
-                let one = graph.constant(vec![1.0; node.ty.num_elements()], &node.ty.shape);
+                let one = graph.fill(1.0, &node.ty.shape);
                 let neg_y = graph.neg(y);
                 let one_minus_y = graph.add(one, neg_y);
                 let dy = graph.mul(y, one_minus_y);
@@ -284,7 +284,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
             Op::Tanh => {
                 // dL/dx = dL/dy * (1 - y^2)
                 let y = node.id;
-                let one = graph.constant(vec![1.0; node.ty.num_elements()], &node.ty.shape);
+                let one = graph.fill(1.0, &node.ty.shape);
                 let y_sq = graph.mul(y, y);
                 let neg_y_sq = graph.neg(y_sq);
                 let one_minus_y_sq = graph.add(one, neg_y_sq);
@@ -335,13 +335,13 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let n = pred_shape.iter().product::<usize>();
                 let neg_labels = graph.neg(labels);
                 let diff = graph.add(pred, neg_labels);
-                let ones = graph.constant(vec![1.0; n], &pred_shape);
+                let ones = graph.fill(1.0, &pred_shape);
                 let neg_pred = graph.neg(pred);
                 let one_minus_pred = graph.add(ones, neg_pred);
                 let denom = graph.mul(pred, one_minus_pred);
                 let denom = graph.clamp(denom, 1e-12, f32::MAX);
                 let recip_denom = graph.recip(denom);
-                let inv_n = graph.constant(vec![1.0 / n as f32; n], &pred_shape);
+                let inv_n = graph.fill(1.0 / n as f32, &pred_shape);
                 let grad_pred = graph.mul(diff, recip_denom);
                 let grad_pred = graph.mul(grad_pred, inv_n);
                 // Chain with upstream grad_output.
@@ -365,7 +365,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let n = x_shape.iter().product::<usize>();
                 let scale = 1.0 / n as f32;
                 let go_broadcast = broadcast_scalar(&mut graph, grad_output, &x_shape);
-                let scale_const = graph.constant(vec![scale; n], &x_shape);
+                let scale_const = graph.fill(scale, &x_shape);
                 let grad_x = graph.mul(go_broadcast, scale_const);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
@@ -378,7 +378,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let n = x_ty.shape[1];
                 // Backward broadcasts [N] gradient back to [M, N].
                 // BiasAdd(zeros[M,N], grad_output[N]) = grad_output broadcast to [M, N].
-                let zeros = graph.constant(vec![0.0; m * n], &[m, n]);
+                let zeros = graph.fill(0.0, &[m, n]);
                 let grad_broadcast = graph.bias_add(zeros, grad_output);
                 accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
             }
@@ -495,12 +495,11 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 // sign(x) = 2*(x > 0) - 1
                 let x = node.inputs[0];
                 let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let n = x_shape.iter().product();
-                let zero = graph.constant(vec![0.0; n], x_shape);
+                let zero = graph.fill(0.0, x_shape);
                 let pos_mask = graph.greater(x, zero);
-                let two = graph.constant(vec![2.0; n], x_shape);
+                let two = graph.fill(2.0, x_shape);
                 let sign = graph.mul(pos_mask, two);
-                let ones = graph.constant(vec![1.0; n], x_shape);
+                let ones = graph.fill(1.0, x_shape);
                 let neg_ones = graph.neg(ones);
                 let sign = graph.add(sign, neg_ones);
                 let grad_x = graph.mul(grad_output, sign);
@@ -578,9 +577,8 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 // the range, as `Clamp`'s reference derivative has it.
                 let x = node.inputs[0];
                 let shape = forward.nodes()[x as usize].ty.shape.clone();
-                let n = shape.iter().product();
-                let lo = graph.constant(vec![min; n], &shape);
-                let hi = graph.constant(vec![max; n], &shape);
+                let lo = graph.fill(min, &shape);
+                let hi = graph.fill(max, &shape);
                 let above = graph.greater(x, lo);
                 let below = graph.greater(hi, x);
                 let inside = graph.mul(above, below);
@@ -824,6 +822,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
             Op::Input { .. }
             | Op::Parameter { .. }
             | Op::Constant { .. }
+            | Op::Fill { .. }
             | Op::Greater
             | Op::ArgMaxInner
             | Op::StopGradient => {}
@@ -1139,7 +1138,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let grad_out_size = forward.nodes()[node.id as usize].ty.num_elements() as u32;
                 let batch = grad_out_size / (channels_a * spatial);
                 let zeros_b_size = batch as usize * channels_b as usize * spatial as usize;
-                let zeros_b = graph.constant(vec![0.0; zeros_b_size], &[zeros_b_size]);
+                let zeros_b = graph.fill(0.0, &[zeros_b_size]);
                 let grad_x =
                     graph.concat(grad_output, zeros_b, batch, channels_a, channels_b, spatial);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -1156,7 +1155,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let grad_out_size = forward.nodes()[node.id as usize].ty.num_elements() as u32;
                 let batch = grad_out_size / (channels_b * spatial);
                 let zeros_a_size = batch as usize * channels_a as usize * spatial as usize;
-                let zeros_a = graph.constant(vec![0.0; zeros_a_size], &[zeros_a_size]);
+                let zeros_a = graph.fill(0.0, &[zeros_a_size]);
                 let grad_x =
                     graph.concat(zeros_a, grad_output, batch, channels_a, channels_b, spatial);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -1434,7 +1433,7 @@ fn gelu_derivative(graph: &mut Graph, x: NodeId) -> NodeId {
     // This is 0.5·(1 + tanh u) + 0.5·x·sech²u·u' without the cancellation
     // of 1 + tanh u, which flushes the derivative to zero for negative x.
     let shape = graph.node(x).ty.shape.clone();
-    let one = graph.constant(vec![1.0; shape.iter().product()], &shape);
+    let one = graph.fill(1.0, &shape);
     let square = graph.mul(x, x);
     let cubic = graph.mul(square, x);
     let cubic_term = graph.scale(cubic, 0.044715);

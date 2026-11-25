@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 43 adds ExecutionPlan::uniform_constants (Op::Fill).
 // Version 42 adds ExecutionPlan::logical_buffers and full target fingerprinting.
 // Version 41 adds subgroup-tiled Winograd and convolution grids, WorkgroupMatmulShape
 // subgroup_rows/prefetch, and ScalarMatmulShape vector_fragments.
@@ -57,7 +58,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 42;
+const CACHE_FORMAT_VERSION: u32 = 43;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

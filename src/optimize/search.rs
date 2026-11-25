@@ -395,7 +395,9 @@ fn segment_candidates(
     {
         let node = &graph.nodes()[id];
         match node.op {
-            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } => continue,
+            Op::Input { .. } | Op::Parameter { .. } | Op::Constant { .. } | Op::Fill { .. } => {
+                continue;
+            }
             Op::CacheWrite | Op::CacheWritePrefix | Op::ScatterAdd { .. } => {
                 return Err("stateful regions need an explicit mutation contract".into());
             }

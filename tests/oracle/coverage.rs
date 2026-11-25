@@ -15,6 +15,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("Parameter", Covered(".parameter(")),
     ("Input", Covered(".input(")),
     ("Constant", Covered(".constant(")),
+    ("Fill", Covered(".fill(")),
     ("MatMul", Covered(".matmul(")),
     ("MatMulAT", Covered(".matmul_at(")),
     ("MatMulBT", Covered(".matmul_bt(")),

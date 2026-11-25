@@ -16,6 +16,7 @@ pub(crate) fn persistent_writes(plan: &ExecutionPlan) -> Vec<BufferRef> {
         .chain(&plan.param_buffers)
         .map(|entry| entry.1)
         .chain(plan.constant_buffers.iter().map(|entry| entry.0))
+        .chain(plan.uniform_constants.iter().map(|entry| entry.0))
         .filter(|b| writes.contains(b))
         .collect();
     buffers.sort_unstable_by_key(|b| b.0);

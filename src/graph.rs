@@ -203,6 +203,11 @@ pub enum Op {
     Constant {
         data: Vec<f32>,
     },
+    /// Uniform scalar value broadcast to the node's shape without allocating a
+    /// dense host `Vec<f32>`.
+    Fill {
+        value: f32,
+    },
 
     // Binary
     MatMul,
@@ -1432,6 +1437,14 @@ impl Graph {
         assert_eq!(data.len(), shape.iter().product::<usize>());
         let ty = TensorType::f32(shape.to_vec());
         self.add_node(Op::Constant { data }, vec![], ty)
+    }
+
+    /// A uniform F32 constant tensor filled with `value` without allocating a
+    /// dense host buffer.
+    #[track_caller]
+    pub fn fill(&mut self, value: f32, shape: &[usize]) -> NodeId {
+        let ty = TensorType::f32(shape.to_vec());
+        self.add_node(Op::Fill { value }, vec![], ty)
     }
 
     /// A constant of `U32` indices, below 2²⁴ so they convert exactly.

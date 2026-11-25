@@ -752,13 +752,50 @@ impl Session {
     /// with the same bitwise payload. Such aliases remain readable because no
     /// step can replace their contents with a later value.
     pub(super) fn buffer_has_equivalent_constant_aliases(&self, buf: BufferRef) -> bool {
+        #[derive(Clone, Copy)]
+        enum ConstRef<'a> {
+            Dense(&'a [f32]),
+            Uniform { len: usize, bits: u32 },
+        }
+        impl ConstRef<'_> {
+            fn same_as(self, other: ConstRef<'_>) -> bool {
+                match (self, other) {
+                    (ConstRef::Dense(a), ConstRef::Dense(b)) => {
+                        a.len() == b.len()
+                            && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
+                    }
+                    (
+                        ConstRef::Uniform { len: la, bits: ba },
+                        ConstRef::Uniform { len: lb, bits: bb },
+                    ) => la == lb && ba == bb,
+                    (ConstRef::Dense(d), ConstRef::Uniform { len, bits })
+                    | (ConstRef::Uniform { len, bits }, ConstRef::Dense(d)) => {
+                        d.len() == len && d.iter().all(|v| v.to_bits() == bits)
+                    }
+                }
+            }
+        }
+        let lookup = |target: BufferRef| -> Option<ConstRef<'_>> {
+            if let Some(data) = self
+                .plan
+                .constant_buffers
+                .iter()
+                .find_map(|&(buffer, ref data)| (buffer == target).then_some(data.as_slice()))
+            {
+                return Some(ConstRef::Dense(data));
+            }
+            self.plan
+                .uniform_constants
+                .iter()
+                .find_map(|&(buffer, value)| {
+                    (buffer == target).then_some(ConstRef::Uniform {
+                        len: self.plan.logical_buffer_bytes(buffer) / std::mem::size_of::<f32>(),
+                        bits: value.to_bits(),
+                    })
+                })
+        };
         let phys = self.alias.map[buf.0 as usize];
-        let Some(reference) = self
-            .plan
-            .constant_buffers
-            .iter()
-            .find_map(|&(buffer, ref data)| (buffer == buf).then_some(data))
-        else {
+        let Some(reference) = lookup(buf) else {
             return false;
         };
         let tenant_count = (0..self.alias.map.len())
@@ -768,17 +805,21 @@ impl Session {
             })
             .count();
         let mut constant_count = 0usize;
-        for &(buffer, ref data) in &self.plan.constant_buffers {
+        for buffer in self
+            .plan
+            .constant_buffers
+            .iter()
+            .map(|&(b, _)| b)
+            .chain(self.plan.uniform_constants.iter().map(|&(b, _)| b))
+        {
             if self.alias.map[buffer.0 as usize] != phys {
                 continue;
             }
             constant_count += 1;
-            if data.len() != reference.len()
-                || !data
-                    .iter()
-                    .zip(reference)
-                    .all(|(left, right)| left.to_bits() == right.to_bits())
-            {
+            let Some(other) = lookup(buffer) else {
+                return false;
+            };
+            if !reference.same_as(other) {
                 return false;
             }
         }

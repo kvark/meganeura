@@ -504,6 +504,7 @@ pub(super) fn generate_with_params(
             ("$TILE_K", &k.to_string()),
         ],
     ))
+    .with_subgroup(0, [threads, 1, 1])
 }
 
 #[cfg(test)]
