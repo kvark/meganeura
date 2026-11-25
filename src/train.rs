@@ -437,7 +437,7 @@ fn compile_for_target(
 /// The plan [`build`] compiles for `forward_graph` under `cfg`, against
 /// the same target, without creating a session or reading a plan cache.
 /// Session construction then picks implementations (see
-/// `runtime::select_variants`), which this does not apply.
+/// `compile::lower::select_variants`), which this does not apply.
 pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::ExecutionPlan {
     let gpu = cfg.gpu.clone().unwrap_or_else(runtime::default_gpu_context);
     let mut options = cfg.options.clone();

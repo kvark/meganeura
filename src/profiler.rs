@@ -807,7 +807,7 @@ fn capture_windows(
             forward_dispatch_count,
             backward_dispatch_count,
             barrier_group_count: session.num_groups(),
-            logical_buffer_bytes: memory.total_buffer_bytes,
+            logical_buffer_bytes: session.plan().total_logical_buffer_bytes(),
             allocated_buffer_bytes: memory.allocated_buffer_bytes,
             resident_buffer_bytes: memory.total_allocated_bytes(),
             adam_state_bytes: memory.adam_state_bytes,

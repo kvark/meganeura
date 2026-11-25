@@ -81,6 +81,8 @@ pub fn save_plan(plan: &ExecutionPlan, forward_graph: &Graph, path: &Path) -> io
     save_plan_impl(plan, forward_graph, 0, path)
 }
 
+static NEXT_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn save_plan_impl(
     plan: &ExecutionPlan,
     forward_graph: &Graph,
@@ -88,8 +90,7 @@ fn save_plan_impl(
     path: &Path,
 ) -> io::Result<()> {
     use std::io::Write as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
 
     let cached = CachedPlan {
         format_version: CACHE_FORMAT_VERSION,
@@ -99,26 +100,46 @@ fn save_plan_impl(
     };
     let ron_str = ron::ser::to_string_pretty(&cached, ron::ser::PrettyConfig::default())
         .map_err(io::Error::other)?;
-    if let Some(parent) = path.parent()
+    // Follow an existing symlink so atomic rename updates the link target
+    // rather than replacing the symlink with a regular file.
+    let dest = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(parent) = dest.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        NEXT_SAVE.fetch_add(1, Ordering::Relaxed),
-    ));
-    let write_result = (|| -> io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(ron_str.as_bytes())?;
-        file.sync_all()
-    })();
+    let file_name = dest.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache path needs a file name")
+    })?;
+    // Keep the temporary beside the destination for an atomic rename, using
+    // `create_new(true)` so we never truncate a sibling file or another writer.
+    let (tmp, mut file) = loop {
+        let mut name = file_name.to_os_string();
+        name.push(format!(
+            ".{}-{}.partial",
+            std::process::id(),
+            NEXT_SAVE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let candidate = dest.with_file_name(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let write_result = file
+        .write_all(ron_str.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
     if let Err(err) = write_result {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
-    if let Err(err) = std::fs::rename(&tmp, path) {
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
@@ -735,5 +756,37 @@ mod cache_format_tests {
         std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
         assert!(load_plan(&graph, &path).unwrap().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn save_plan_does_not_clobber_preexisting_sibling_files() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[4]);
+        let y = graph.relu(x);
+        graph.set_outputs(vec![y]);
+        let plan = compile::compile(&graph);
+
+        let dir =
+            std::env::temp_dir().join(format!("meganeura-cache-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.ron");
+        // Pre-populate the exact next candidate temp file name to force a
+        // collision and verify `create_new(true)` skips it without truncating.
+        let next = NEXT_SAVE.load(std::sync::atomic::Ordering::Relaxed);
+        let collider = dir.join(format!("plan.ron.{}-{next}.partial", std::process::id()));
+        let legacy_collider = dir.join(format!("plan.tmp.{}.{next}", std::process::id()));
+        std::fs::write(&collider, b"keep-partial-sibling").unwrap();
+        std::fs::write(&legacy_collider, b"keep-legacy-sibling").unwrap();
+
+        save_plan(&plan, &graph, &path).unwrap();
+        assert_eq!(std::fs::read(&collider).unwrap(), b"keep-partial-sibling");
+        assert_eq!(
+            std::fs::read(&legacy_collider).unwrap(),
+            b"keep-legacy-sibling"
+        );
+        let restored = load_plan(&graph, &path).unwrap().unwrap();
+        assert_eq!(restored.dispatches, plan.dispatches);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

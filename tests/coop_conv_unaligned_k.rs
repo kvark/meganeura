@@ -4,7 +4,7 @@
 //! are unaligned and the load read across row boundaries, corrupting the
 //! tile (max abs error ~1.9, 2M/4M elements wrong) and NaN-ing the deep
 //! van-world SR model on NVIDIA. Fixed by a per-element fallback when
-//! k_total % 4 != 0 (codegen::emit_forward_weight_stage).
+//! k_total % 4 != 0 (codegen::conv_coop::emit_forward_weight_stage).
 //!
 //! The coop path runs only on GPUs that advertise cooperative matrices;
 //! on f16-only GPUs it is opt-in (overflow-unsafe for large activations).

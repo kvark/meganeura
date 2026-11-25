@@ -3301,7 +3301,6 @@ pub struct SessionOptions {
     pub wgsl_dump_dir: Option<String>,
 }
 
-/// How cooperative-matrix hardware may be used for ordinary F32 graphs.
 /// Why [`Session::read_node`] could not return a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadNodeError {
@@ -3427,6 +3426,7 @@ impl DebugStepReport {
     }
 }
 
+/// A compiled, ready-to-execute GPU session for a computation graph.
 pub struct Session {
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its

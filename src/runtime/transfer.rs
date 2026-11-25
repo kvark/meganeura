@@ -84,11 +84,10 @@ impl Session {
                                 self.restage_packed_concat(derived_buf, name, &packed, sources);
                             } else {
                                 // f32: direct copy into GPU buffer
-                                let buf_f32 =
-                                    self.plan.param_types.get(&derived_buf).map_or(
-                                        self.plan.buffers[derived_buf.0 as usize] / 4,
-                                        |ty| ty.num_elements(),
-                                    );
+                                let buf_f32 = self.plan.param_types.get(&derived_buf).map_or_else(
+                                    || self.plan.logical_buffer_bytes(derived_buf) / 4,
+                                    |ty| ty.num_elements(),
+                                );
                                 let rows = buf_f32.checked_div(total_cols).unwrap_or(0);
                                 let mut col_offset = 0usize;
                                 for src in sources {
@@ -350,7 +349,7 @@ impl Session {
                     return None;
                 }
                 let buffer = self.buffers[buf_ref.0 as usize];
-                let size = self.plan.buffers[buf_ref.0 as usize];
+                let size = self.plan.logical_buffer_bytes(buf_ref);
                 return Some((buffer.data(), size));
             }
         }
@@ -415,12 +414,10 @@ impl Session {
             !self.step_prepared || !self.preparation.as_ref().unwrap().inputs.contains(&buffer),
             "cannot change an early input during a prepared step"
         );
-        let capacity = self.plan.buffers[buffer.0 as usize];
-        let logical = self
-            .plan
-            .input_types
-            .get(&buffer)
-            .map_or(capacity, |ty| ty.size_bytes());
+        let logical = self.plan.input_types.get(&buffer).map_or_else(
+            || self.plan.logical_buffer_bytes(buffer),
+            |ty| ty.size_bytes(),
+        );
         self.upload_padded_bytes(buffer, data, logical);
     }
 
@@ -429,12 +426,10 @@ impl Session {
             !self.step_prepared,
             "cannot change a parameter during a prepared step"
         );
-        let capacity = self.plan.buffers[buffer.0 as usize];
-        let logical = self
-            .plan
-            .param_types
-            .get(&buffer)
-            .map_or(capacity, |ty| ty.size_bytes());
+        let logical = self.plan.param_types.get(&buffer).map_or_else(
+            || self.plan.logical_buffer_bytes(buffer),
+            |ty| ty.size_bytes(),
+        );
         self.upload_padded_bytes(buffer, data, logical);
     }
 
@@ -729,7 +724,7 @@ impl Session {
         if let Some(buf_ref) = self.plan.loss_buffer {
             self.check_output_ready(buf_ref);
             let buffer = self.buffers[buf_ref.0 as usize];
-            let n = self.plan.buffers[buf_ref.0 as usize] / 4;
+            let n = self.plan.logical_buffer_bytes(buf_ref) / 4;
             if !self.logical_host_visible(buf_ref) {
                 let mut values = vec![0.0; n];
                 self.read_raw_f32(buffer, &mut values, false);
@@ -846,12 +841,13 @@ impl Session {
     }
 
     fn read_dispatch_output(&self, buf: BufferRef, dtype: crate::DType, limit: usize) -> Vec<f32> {
+        let logical_bytes = self.plan.logical_buffer_bytes(buf);
         if !matches!(dtype, crate::DType::F16 | crate::DType::BF16) {
-            let mut out = vec![0.0; (self.plan.buffers[buf.0 as usize] / 4).min(limit)];
+            let mut out = vec![0.0; (logical_bytes / 4).min(limit)];
             self.read_buffer(buf, &mut out);
             return out;
         }
-        let n = (self.plan.buffers[buf.0 as usize] / 2).min(limit);
+        let n = (logical_bytes / 2).min(limit);
         let mut packed = vec![0.0; n.div_ceil(2)];
         // Private reduced stores use owned allocations, already padded to vec4.
         // Word-sized copies also satisfy Metal's transfer alignment for odd n.
@@ -1233,8 +1229,8 @@ impl Session {
     /// `None` if the name doesn't exist.
     pub fn param_size(&self, name: &str) -> Option<usize> {
         let buf_ref = self.param_buffer(name)?;
-        Some(self.plan.param_types.get(&buf_ref).map_or(
-            self.plan.buffers[buf_ref.0 as usize] / std::mem::size_of::<f32>(),
+        Some(self.plan.param_types.get(&buf_ref).map_or_else(
+            || self.plan.logical_buffer_bytes(buf_ref) / std::mem::size_of::<f32>(),
             |ty| ty.num_elements(),
         ))
     }
@@ -1480,7 +1476,7 @@ impl Session {
         let buf_ref = self
             .param_buffer(name)
             .unwrap_or_else(|| panic!("unknown param: {}", name));
-        self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+        self.upload_parameter_bytes(buf_ref, bytemuck::cast_slice(data));
     }
 
     /// Print GPU pass timings from the last completed step.

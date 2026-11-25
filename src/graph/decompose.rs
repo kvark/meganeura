@@ -51,7 +51,23 @@ impl Graph {
     /// One pass replacing each selected composite by its one-level
     /// expansion, or `None` when there is none.
     fn expand_composites(&self, select: &impl Fn(&Node) -> bool) -> Option<Graph> {
-        let chosen = |node: &Node| node.op.class() == OpClass::Composite && select(node);
+        // Never decompose a forward attention node that a `MultiHeadAttnGrad*`
+        // points to via `fwd_node`: expanding it would remap `fwd_node` onto a
+        // primitive op with no LSE buffer.
+        let mut protected_attn_fwd = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if let Op::MultiHeadAttnGradQ { fwd_node, .. }
+            | Op::MultiHeadAttnGradK { fwd_node, .. }
+            | Op::MultiHeadAttnGradV { fwd_node, .. } = node.op
+            {
+                protected_attn_fwd.insert(fwd_node);
+            }
+        }
+        let chosen = |node: &Node| {
+            node.op.class() == OpClass::Composite
+                && !protected_attn_fwd.contains(&node.id)
+                && select(node)
+        };
         if !self.nodes.iter().any(&chosen) {
             return None;
         }
@@ -2485,5 +2501,26 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "expected attention gradient nodes");
+
+        // Full `.decompose()` on a differentiated graph must leave attention
+        // nodes referenced by `MultiHeadAttnGrad*` intact so compilation
+        // succeeds and `fwd_node` never points at a primitive op.
+        let decomposed = diff.decompose();
+        for node in decomposed.nodes() {
+            if let Op::MultiHeadAttnGradQ { fwd_node, .. }
+            | Op::MultiHeadAttnGradK { fwd_node, .. }
+            | Op::MultiHeadAttnGradV { fwd_node, .. } = node.op
+            {
+                assert!(
+                    matches!(
+                        decomposed.node(fwd_node).op,
+                        Op::CausalAttention { .. } | Op::MultiHeadAttn { .. }
+                    ),
+                    "decompose() remapped fwd_node {fwd_node} onto non-attention op {:?}",
+                    decomposed.node(fwd_node).op
+                );
+            }
+        }
+        let _plan = crate::compile::compile(&decomposed);
     }
 }

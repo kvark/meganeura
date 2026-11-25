@@ -1551,6 +1551,23 @@ impl ExecutionPlan {
             .unwrap_or(self.buffers[idx])
     }
 
+    /// Sum of unpadded logical byte sizes across all plan buffers.
+    pub fn total_logical_buffer_bytes(&self) -> usize {
+        (0..self.buffers.len())
+            .map(|i| self.logical_buffer_bytes(BufferRef(i as u32)))
+            .sum()
+    }
+
+    /// Update both physical capacity and logical byte size of `buffer` (for
+    /// non-padding resizes such as storage narrowing or split-K partial sizing).
+    pub(crate) fn set_buffer_bytes(&mut self, buffer: BufferRef, bytes: usize) {
+        let idx = buffer.0 as usize;
+        self.buffers[idx] = bytes;
+        if let Some(logical) = self.logical_buffers.get_mut(idx) {
+            *logical = bytes;
+        }
+    }
+
     /// The dispatches the plan runs, independent of their order and buffer
     /// numbering: each one's shader, kernel, parameters, grid, operand
     /// counts and fused prologue, epilogue, norm, weight format and
