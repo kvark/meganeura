@@ -1346,6 +1346,8 @@ pub enum Kernel {
         storage: crate::DType,
         tile: [u32; 2],
     },
+    /// Register-blocked implementation of the attention operation in the shader entry.
+    BlockAttention,
 }
 
 impl Dispatch {

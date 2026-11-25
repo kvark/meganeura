@@ -3865,6 +3865,7 @@ mod coop_caps_tests {
 }
 
 mod attention;
+pub(crate) mod attention_block_grad;
 mod conv_coop;
 pub use attention::*;
 pub use conv_coop::{Conv2dCoopDirection, generate_conv2d_coop_module};

@@ -2,7 +2,7 @@
 // before accumulating across blocks in F32; scales must not vary within a dot.
 // Precision is relative to the block maximum, not each row: much smaller rows
 // can lose mantissa bits or underflow. Whole-model qualification bounds the error.
-var<workgroup> scale_maxima: array<vec2<f32>, 32>;
+var<workgroup> scale_maxima: array<vec2<f32>, $SCALE_GROUPS>;
 
 fn exponent_for(maximum: f32) -> i32 {
     let bits = bitcast<u32>(maximum) & 0x7fffffffu;

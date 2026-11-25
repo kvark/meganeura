@@ -981,6 +981,7 @@ enum Variant {
     /// V stays f32: a one-key row reproduces V, and an f16 value misses the
     /// strict bound. Causal and unmasked forward share that rule.
     Attention(ShaderEntry, u32, Option<u32>, bool),
+    BlockAttention(ShaderEntry, AttentionParams),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1061,6 +1062,7 @@ impl Variant {
             Variant::StoredGate(ref e, _)
             | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
+            | Variant::BlockAttention(ref e, _)
             | Variant::Attention(ref e, _, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _, _, _)
@@ -1129,6 +1131,7 @@ impl Variant {
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
+            Variant::BlockAttention(ref e, p) => format!("{e:?}:block-{p:?}"),
             Variant::Attention(ref e, head_dim, ept, f16_tiles) => {
                 let tiles = if f16_tiles { ":f16-tiles" } else { "" };
                 format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}{tiles}")
@@ -2314,6 +2317,21 @@ impl Pipelines {
                     dispatch.weight_format,
                 )
             }
+            Variant::BlockAttention(ref entry, p) => {
+                let caps = gpu.capabilities();
+                if crate::kernels::attention::block_grid(
+                    dispatch,
+                    caps.max_compute_shared_memory_size,
+                    crate::kernels::attention::block_cooperative(
+                        &caps,
+                        auto_tune(gpu, 0).coop_caps,
+                    ),
+                ) != Some(dispatch.workgroups)
+                {
+                    return Err("unsupported attention block".into());
+                }
+                crate::codegen::block_attention(entry, p)
+            }
             Variant::Attention(_, hd, ept, f16_tiles) => match group {
                 ShaderGroup::FlashAttention => {
                     // V stays f32. A one-key row, including unmasked attention
@@ -2635,6 +2653,12 @@ impl Pipelines {
             return Variant::Pointwise(hash.finish());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
+            if dispatch.kernel == crate::compile::Kernel::BlockAttention {
+                return Variant::BlockAttention(
+                    entry,
+                    AttentionParams::from_words(&dispatch.params).expect("attention parameters"),
+                );
+            }
             let ept = match dispatch.kernel {
                 crate::compile::Kernel::AttentionBackward { ept_cap } => Some(ept_cap),
                 _ => None,
