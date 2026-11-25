@@ -318,6 +318,9 @@ pub fn matmul_epilogue_to_wgsl(epi: &crate::compile::MatMulEpilogue) -> (String,
     for (i, _) in epi.inputs.iter().enumerate() {
         decls.push(format!("var<storage> epi_buf_{}: array<f32>;", i));
     }
+    if epi.dag.uses_erf() {
+        decls.push(crate::schedule::ERF_WGSL.trim_end().to_string());
+    }
 
     let body = epi.dag.emit_body(|idx| {
         if idx == 0 {

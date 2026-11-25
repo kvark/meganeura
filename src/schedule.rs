@@ -85,7 +85,28 @@ pub struct PointwiseDAG {
     pub output: u16,
 }
 
+/// Scalar `erf(x)` helper emitted at module scope when a [`PointwiseDAG`] uses
+/// [`Pw::Erf`]. Uses a Taylor series near zero (where `1 - erfc` loses relative
+/// precision) and Numerical Recipes' Chebyshev fit of `erfc` elsewhere.
+pub(crate) const ERF_WGSL: &str = "\
+fn erf_f32(x: f32) -> f32 {
+    let z = abs(x);
+    let s = x * x;
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let c = t * exp(-s + -1.26551223 + t * (1.00002368 + t * (0.37409196 + \
+t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + \
+t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+    let p = x * (1.1283792 + s * (-0.37612639 + s * (0.11283792 + \
+s * (-0.026866172 + s * (0.0052239776 + s * -0.00085483270)))));
+    return select(sign(x) * (1.0 - c), p, z < 0.5);
+}
+";
+
 impl PointwiseDAG {
+    /// Whether this DAG contains any [`Pw::Erf`] node requiring [`ERF_WGSL`].
+    pub(crate) fn uses_erf(&self) -> bool {
+        self.ops.iter().any(|op| matches!(op, Pw::Erf(_)))
+    }
     /// Stable content hash — suitable as a pipeline-cache key.
     pub fn hash_key(&self) -> u64 {
         let mut h = DefaultHasher::new();
@@ -219,45 +240,6 @@ impl PointwiseDAG {
         };
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
-            if let Pw::Erf(a) = *op {
-                // A Taylor series near zero, where `1 - erfc` would lose
-                // the relative precision, and Numerical Recipes' Chebyshev
-                // fit of erfc elsewhere.
-                let one = lit("1.0");
-                let half = lit("0.5");
-                let c0 = lit("-1.26551223");
-                let c1 = lit("1.00002368");
-                let c2 = lit("0.37409196");
-                let c3 = lit("0.09678418");
-                let c4 = lit("-0.18628806");
-                let c5 = lit("0.27886807");
-                let c6 = lit("-1.13520398");
-                let c7 = lit("1.48851587");
-                let c8 = lit("-0.82215223");
-                let p0 = lit("1.1283792");
-                let p1 = lit("-0.37612639");
-                let p2 = lit("0.11283792");
-                let p3 = lit("-0.026866172");
-                let p4 = lit("0.0052239776");
-                let _ = writeln!(
-                    out,
-                    "    let v{k}_z = abs(v{a});\n    \
-                     let v{k}_s = v{a} * v{a};\n    \
-                     let v{k}_t = {one} / ({one} + 0.5 * v{k}_z);\n    \
-                     let v{k}_c = v{k}_t * exp(-v{k}_s + {c0} + v{k}_t * ({c1} + \
-                     v{k}_t * ({c2} + v{k}_t * ({c3} + v{k}_t * ({c4} + \
-                     v{k}_t * ({c5} + v{k}_t * ({c6} + v{k}_t * ({c7} + \
-                     v{k}_t * ({c8} + v{k}_t * 0.17087277)))))))));\n    \
-                     let v{k}_p = v{a} * ({p0} + v{k}_s * ({p1} + v{k}_s * \
-                     ({p2} + v{k}_s * ({p3} + v{k}_s * ({p4} + \
-                     v{k}_s * -0.00085483270)))));"
-                );
-                let _ = writeln!(
-                    out,
-                    "    let v{k} = select(sign(v{a}) * ({one} - v{k}_c), v{k}_p, v{k}_z < {half});"
-                );
-                continue;
-            }
             let _ = write!(out, "    let v{} = ", k);
             match *op {
                 Pw::LoadInput(idx) => {
@@ -343,7 +325,16 @@ impl PointwiseDAG {
                 Pw::Silu(a) => {
                     let _ = write!(out, "v{} / ({} + exp(-v{}))", a, lit("1.0"), a);
                 }
-                Pw::Erf(_) => unreachable!("emitted above"),
+                Pw::Erf(a) => {
+                    if vec4 {
+                        let _ = write!(
+                            out,
+                            "vec4<f32>(erf_f32(v{a}.x), erf_f32(v{a}.y), erf_f32(v{a}.z), erf_f32(v{a}.w))"
+                        );
+                    } else {
+                        let _ = write!(out, "erf_f32(v{a})");
+                    }
+                }
                 Pw::Sin(a) => {
                     let _ = write!(out, "sin(v{a})");
                 }
@@ -970,6 +961,9 @@ fn lower_pointwise_with_options(
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
+    if dag.uses_erf() {
+        src.push_str(ERF_WGSL);
+    }
     src.push_str(
         "struct Params {\n    len: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
     );
@@ -1213,6 +1207,12 @@ fn lower_reduction(
     if storage.bf16_output {
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
+    }
+    if prologue.uses_erf()
+        || extra_prologues.iter().any(PointwiseDAG::uses_erf)
+        || epilogue.is_some_and(|e| e.dag.uses_erf())
+    {
+        src.push_str(ERF_WGSL);
     }
     src.push_str(
         "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
