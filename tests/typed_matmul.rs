@@ -434,8 +434,9 @@ fn typed_partitions_tune_without_changing_precision() {
     println!("typed_partition_probes_qualified={probes}");
 }
 
-/// An unsplit ragged typed product has no candidate. Under a class limit
-/// of one, it must not keep tuning away from an ordinary product.
+/// A typed product whose columns do not fill its tiles has no candidate;
+/// ragged rows gained one with the subgroup-tiled kernels. Under a class
+/// limit of one, it must not keep tuning away from an ordinary product.
 #[test]
 fn untunable_typed_classes_leave_the_class_limit_to_others() {
     let gpu = crate::support::gpu::gpu();
@@ -445,8 +446,8 @@ fn untunable_typed_classes_leave_the_class_limit_to_others() {
     }
     crate::support::gpu::assert_protocol_headroom(&gpu);
     let mut g = Graph::new();
-    let a = g.input("a", &[513, 512]);
-    let b = g.parameter("b", &[512, 512]);
+    let a = g.input("a", &[512, 512]);
+    let b = g.parameter("b", &[512, 513]);
     let (a, b) = (g.to_bf16(a), g.to_bf16(b));
     let typed = g.matmul(a, b);
     let x = g.input("x", &[33, 17]);
