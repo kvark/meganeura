@@ -3753,8 +3753,11 @@ pub struct Session {
     /// has no gradients, and none of their inputs is shared with or
     /// imported from storage this session cannot watch.
     invariants_cacheable: bool,
-    /// Their outputs hold for the current parameters. Set once a step has
-    /// encoded them; a host write to one of their inputs clears it.
+    /// Their outputs hold for the current parameters. Set once a step the
+    /// session submits itself has run them; a host write to one of their
+    /// inputs clears it. A step recorded for the caller neither reads nor
+    /// sets it, because the session cannot tell when that recording runs,
+    /// or whether it does.
     invariants_valid: std::cell::Cell<bool>,
 }
 
@@ -6542,9 +6545,17 @@ impl Session {
 
         self.encoder.start();
         self.profiled_pass_map.clear();
-        self.encode_step(self.submission_chunks, self.profile_window.clone());
+        let skip_invariants = self.invariants_cacheable && self.invariants_valid.get();
+        self.encode_step(
+            self.submission_chunks,
+            self.profile_window.clone(),
+            skip_invariants,
+        );
         log::debug!(target: "meganeura::submission", "submit final chunk, {} dispatches", self.plan.dispatches.len());
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        if self.invariants_cacheable {
+            self.invariants_valid.set(true);
+        }
     }
 
     /// Submit only the dependencies of [`SessionOptions::prepare_outputs`].
@@ -6663,6 +6674,12 @@ impl Session {
     /// recorded work is in flight, is fine; the recorded steps execute in
     /// queue order.
     ///
+    /// A recording carries all of a step's work, including what
+    /// [`Session::step`] runs once and keeps while the parameters hold, such
+    /// as a convolution's Winograd weight transform. The session cannot tell
+    /// when a recording runs, so dropping one, or submitting it after a
+    /// later step, leaves every other step correct.
+    ///
     /// Settings baked into the recording (learning rate, Adam step count)
     /// are those current at the call. A parameter layout change, such as
     /// [`Session::share_parameter_from`], rewrites optimizer metadata on the
@@ -6697,7 +6714,7 @@ impl Session {
         // caller's encoder in its place keeps a single code path for both.
         std::mem::swap(&mut self.encoder, encoder);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.encode_step(1, None);
+            self.encode_step(1, None, false);
         }));
         std::mem::swap(&mut self.encoder, encoder);
         if let Err(panic) = result {
@@ -6718,8 +6735,14 @@ impl Session {
     /// Record forward, backward and the optimizer into `self.encoder`, which
     /// must be started. `chunks` above one submits all but the last chunk;
     /// with a `profile_window`, the dispatches in it get passes of their own.
-    fn encode_step(&mut self, chunks: usize, profile_window: Option<std::ops::Range<usize>>) {
-        let skip_invariants = self.invariants_cacheable && self.invariants_valid.get();
+    /// `skip_invariants` leaves out the parameter-invariant dispatches, whose
+    /// outputs an earlier submission of the session has already written.
+    fn encode_step(
+        &mut self,
+        chunks: usize,
+        profile_window: Option<std::ops::Range<usize>>,
+        skip_invariants: bool,
+    ) {
         if let Some(window) = profile_window {
             // Multi-pass mode: one compute pass per dispatch in the window,
             // with per-pass barriers and GPU timestamps. Enables
@@ -6785,9 +6808,6 @@ impl Session {
                 self.gpu_timing,
                 skip_invariants,
             );
-        }
-        if self.invariants_cacheable {
-            self.invariants_valid.set(true);
         }
         self.encode_training_update();
     }

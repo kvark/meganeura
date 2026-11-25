@@ -148,3 +148,66 @@ fn blended_weights_are_transformed_again() {
         "blend",
     );
 }
+
+/// A step recorded for the application runs when the application submits
+/// it: after a later step of the session's own, in another order than it
+/// was recorded, or never. Each recording therefore transforms the weights
+/// itself, and a step of the session's own does so too until one of its own
+/// has.
+#[test]
+fn recorded_steps_transform_the_weights_themselves() {
+    let gpu = crate::support::gpu::gpu();
+    let (mut winograd, mut direct) = (session(false), session(true));
+    let app_encoder = || {
+        let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+            name: "application",
+            buffer_count: 1,
+            manual_barriers: false,
+        });
+        encoder.start();
+        encoder
+    };
+    // New weights, which the transform the session keeps does not match.
+    let mut change = |winograd: &mut Session, seed: usize| {
+        winograd.set_parameter("w", &weights(seed));
+        winograd.set_input("x", &input(seed));
+        direct.set_parameter("w", &weights(seed));
+        run(&mut direct, &input(seed))
+    };
+    let own_step = |winograd: &mut Session| {
+        winograd.step();
+        winograd.wait();
+        winograd.read_output(IMAGE)
+    };
+    let submit = |winograd: &mut Session, encoder: &mut blade_graphics::CommandEncoder| {
+        let sync = gpu.submit(encoder);
+        winograd.track_submission(sync);
+        winograd.wait();
+        gpu.destroy_command_encoder(encoder);
+        winograd.read_output(IMAGE)
+    };
+    let expected = change(&mut winograd, 1);
+    assert_close(&own_step(&mut winograd), &expected, "first step");
+
+    // Held: recorded ahead of the session's own step, submitted after it.
+    let expected = change(&mut winograd, 2);
+    let mut held = app_encoder();
+    winograd.record(&mut held).unwrap();
+    assert_close(&own_step(&mut winograd), &expected, "ahead of a held one");
+    assert_close(&submit(&mut winograd, &mut held), &expected, "held");
+
+    // Discarded: recorded and never submitted.
+    let expected = change(&mut winograd, 3);
+    let mut discarded = app_encoder();
+    winograd.record(&mut discarded).unwrap();
+    gpu.destroy_command_encoder(&mut discarded);
+    assert_close(&own_step(&mut winograd), &expected, "after a discarded one");
+
+    // Reversed: two recordings, the second submitted first.
+    let expected = change(&mut winograd, 4);
+    let (mut first, mut second) = (app_encoder(), app_encoder());
+    winograd.record(&mut first).unwrap();
+    winograd.record(&mut second).unwrap();
+    assert_close(&submit(&mut winograd, &mut second), &expected, "second");
+    assert_close(&submit(&mut winograd, &mut first), &expected, "first");
+}

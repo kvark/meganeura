@@ -51,6 +51,18 @@
   `Graph::append_param_grads` replaces `append_param_grad_outputs`, and the
   plan cache format moves to 46.
 
+- A step recorded with `Session::record` transforms a 3×3 convolution's
+  Winograd weights itself. Recording used to mark that transform as done
+  before the caller had submitted anything. After a weight change, the
+  session's next `step` then skipped it and convolved with the transform of
+  the old weights until the recording ran, or for good when the recording was
+  dropped. A second recording submitted ahead of the first had the same stale
+  transform. A recording now carries every dispatch of the step and leaves the
+  session's own note of kept transforms alone, so an inference step recorded
+  for the application runs one weight transform per such convolution each
+  time. Steps the session submits itself keep the transform between steps as
+  before.
+
 - Whole-program search measures register-blocked attention for forward and backward passes. Eligible programs can use scaled F16 cooperative gradients with F32 accumulation.
 
 - `KernelMemo` revision moves to 19: decisions are now keyed by `(class, initial)`
