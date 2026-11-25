@@ -1,5 +1,13 @@
 # Unreleased
 
+- `TuningKnobs::prefer_matmul` names a dense-product path
+  (`kernels::matmul::Path`, now public) for session construction to try
+  first wherever that path admits the product, as
+  `CompileOptions::prefer_attention_grad` does for attention gradients. A
+  test sweep generated from the kernel families uses it to run every path a
+  device has against the reference at that path's own tile edges. Left
+  unset, nothing changes.
+
 - A cache write stays between the readers of the cache it was given and the
   readers of its result. `cache_write` and `cache_write_prefix` replace their
   cache in place, and a graph that also read that cache, such as

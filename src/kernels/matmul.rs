@@ -3,7 +3,7 @@
 //!
 //! F32 products start with the 64-wide scalar tile kernel. Session
 //! construction then picks among the paths here, and tuning challenges the
-//! choice by measurement; both ask [`cooperative_geometry`] whether a
+//! choice by measurement; both ask `cooperative_geometry` whether a
 //! cooperative kernel is legal, so the two cannot drift apart.
 //! Explicit reduced storage fixes a typed cooperative implementation of the
 //! same product; other candidates cannot replace its storage contract.
@@ -14,6 +14,7 @@
 use super::{Family, Rejection};
 use crate::codegen::{CoopConfig, ScalarMatmulShape, ShaderGroup};
 use crate::compile::{Dispatch, Kernel};
+use serde::{Deserialize, Serialize};
 
 /// K partitions for a checked typed product: fill a small 32×32 output grid
 /// without making each partition mostly staging work. Storage and
@@ -169,17 +170,20 @@ pub(crate) struct Target {
     /// [`CoopPolicy::AllowF16`](crate::CoopPolicy): f16 operands even for
     /// work that requires full precision.
     pub allow_raw_f16: bool,
+    /// [`TuningKnobs::prefer_matmul`](crate::TuningKnobs).
+    pub prefer: Option<Path>,
 }
 
 /// How a dispatch computes its product, most preferred first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Path {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Path {
     /// Cooperative-matrix tiles in the device's configuration.
     Cooperative,
     /// 32-wide scalar tiles, for products too small to occupy the device
     /// with 64-wide ones.
     SmallTile,
-    /// [`WIDE_TILE`], for products large enough to occupy the device with it.
+    /// 128-row by 64-column scalar tiles, for products large enough to
+    /// occupy the device with them.
     WideTile,
     /// The kernel the compiler emitted: 64-wide scalar tiles, or the
     /// schedule a measurement pinned. The fallback.
@@ -221,6 +225,19 @@ impl Family for Path {
         Path::WideTile,
         Path::Compiled,
     ];
+
+    fn preferred(target: &Target) -> Option<Self> {
+        target.prefer
+    }
+
+    fn tile(self, _: &Problem, target: &Target) -> Option<[u32; 2]> {
+        Some(match self {
+            Path::Cooperative => [target.cooperative?.matmul_output_tile(); 2],
+            Path::SmallTile => [32; 2],
+            Path::WideTile => [WIDE_TILE.rows(), WIDE_TILE.cols()],
+            Path::Compiled => [64; 2],
+        })
+    }
 
     fn admits(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
         match self {
@@ -395,6 +412,7 @@ mod tests {
         Target {
             cooperative: Some(*config),
             allow_raw_f16: false,
+            prefer: None,
         }
     }
 
@@ -403,6 +421,7 @@ mod tests {
         let bare = Target {
             cooperative: None,
             allow_raw_f16: false,
+            prefer: None,
         };
         for problem in [product(1, 1, 1), product(4096, 4096, 4096)] {
             assert_eq!(Path::Compiled.admits(&problem, &bare), Ok(()));
@@ -511,6 +530,84 @@ mod tests {
             let small = Problem::plain(layout, [32, 32, 32], false);
             assert_eq!(select(&small, &target(&F32)), Path::Compiled);
         }
+    }
+
+    impl crate::kernels::sweep::Swept for Path {
+        type Kind = Layout;
+        const KINDS: &'static [Layout] = &[
+            Layout::Plain,
+            Layout::PlainAdd,
+            Layout::TransposedA,
+            Layout::TransposedAAdd,
+            Layout::TransposedB,
+            Layout::TransposedBAdd,
+        ];
+
+        fn graph(layout: Layout, extents: [u32; 3]) -> crate::Graph {
+            use crate::graph::Op;
+            let [m, n, k] = extents.map(|extent| extent as usize);
+            let mut g = crate::Graph::new();
+            let addend = layout.has_addend().then(|| g.parameter("d", &[m, n]));
+            let (product, fused) = match layout {
+                Layout::Plain | Layout::PlainAdd => {
+                    let (a, b) = (g.parameter("a", &[m, k]), g.parameter("b", &[k, n]));
+                    (g.matmul(a, b), Op::FusedMatMulAdd)
+                }
+                Layout::TransposedA | Layout::TransposedAAdd => {
+                    let (a, b) = (g.parameter("a", &[k, m]), g.parameter("b", &[k, n]));
+                    (g.matmul_at(a, b), Op::FusedMatMulATAdd)
+                }
+                Layout::TransposedB | Layout::TransposedBAdd => {
+                    let (a, b) = (g.parameter("a", &[m, k]), g.parameter("b", &[n, k]));
+                    (g.matmul_bt(a, b), Op::FusedMatMulBTAdd)
+                }
+            };
+            if let Some(addend) = addend {
+                // The fused forms have no builder: the optimizer makes them.
+                let node = &mut g.nodes_mut()[product as usize];
+                node.op = fused;
+                node.inputs.push(addend);
+            }
+            g.set_outputs(vec![product]);
+            g
+        }
+
+        fn problem(layout: Layout, extents: [u32; 3]) -> Problem {
+            Problem::plain(layout, extents, false)
+        }
+
+        fn prefer(self, options: &mut crate::reference::gpu::Options) {
+            options.compile.knobs.prefer_matmul = Some(self);
+        }
+
+        fn target(
+            self,
+            session: &crate::Session,
+            options: &crate::reference::gpu::Options,
+        ) -> Target {
+            Target {
+                cooperative: session.coop_config(),
+                allow_raw_f16: options.coop == crate::CoopPolicy::AllowF16,
+                prefer: Some(self),
+            }
+        }
+
+        fn ran(dispatch: &Dispatch) -> Option<Option<Self>> {
+            Layout::of(dispatch.shader.shader_group())?;
+            Some(match dispatch.kernel {
+                Kernel::Cooperative => Some(Path::Cooperative),
+                Kernel::SmallTile => Some(Path::SmallTile),
+                Kernel::ScalarMatmul(shape) if shape == WIDE_TILE => Some(Path::WideTile),
+                Kernel::Default => Some(Path::Compiled),
+                _ => None,
+            })
+        }
+    }
+
+    /// Every path the device has, preferred in turn, in every layout.
+    #[test]
+    fn every_path_against_the_reference() {
+        crate::kernels::sweep::run::<Path>();
     }
 
     #[test]

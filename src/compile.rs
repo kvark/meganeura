@@ -119,6 +119,12 @@ pub struct TuningKnobs {
     /// Stagger scalar-matmul B loads across columns instead of routing a
     /// thread through consecutive ones.
     pub matmul_interleave_columns: bool,
+    /// A dense-product path to try before the usual order wherever it
+    /// admits the product, so a test or benchmark can run each path in
+    /// turn. Paths that decline fall back to the usual choice. It sits here
+    /// because session construction picks these paths from the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_matmul: Option<crate::kernels::matmul::Path>,
 }
 
 impl Default for TuningKnobs {
@@ -142,6 +148,7 @@ impl Default for TuningKnobs {
             flash_subgroup_tiles: false,
             matmul_k_stage: 32,
             matmul_interleave_columns: false,
+            prefer_matmul: None,
         }
     }
 }

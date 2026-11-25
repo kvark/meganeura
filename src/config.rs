@@ -310,6 +310,7 @@ impl TuningKnobs {
             flash_subgroup_tiles: d.flash_subgroup_tiles,
             matmul_k_stage: d.matmul_k_stage,
             matmul_interleave_columns: false,
+            prefer_matmul: None,
         }
     }
 }

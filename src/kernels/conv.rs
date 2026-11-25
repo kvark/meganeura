@@ -284,6 +284,13 @@ impl Family for Path {
     type Target = Target;
     const PREFERENCE: &'static [Self] = &[Path::Cooperative, Path::Compiled];
 
+    fn tile(self, _: &Problem, target: &Target) -> Option<[u32; 2]> {
+        Some(match self {
+            Path::Cooperative => [target.cooperative?.output_tile(); 2],
+            Path::Compiled => [64; 2],
+        })
+    }
+
     fn admits(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
         let Path::Cooperative = self else {
             return Ok(());

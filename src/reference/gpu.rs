@@ -145,6 +145,32 @@ pub fn check_inference_against(
     expected: &Expected,
     options: &Options,
 ) -> Result<Report, Error> {
+    Ok(run_inference_against(graph, feeds, expected, options)?.0)
+}
+
+/// A session for `graph` as the checks here build it, not yet run.
+#[cfg(test)]
+pub(crate) fn session(graph: &Graph, options: &Options, mode: Mode) -> crate::Session {
+    build(graph, options.session_config(mode)).0
+}
+
+/// [`check_inference`], handing back the session as well, so that a check
+/// can read the kernels its lowered plan runs.
+#[cfg(test)]
+pub(crate) fn run_inference(
+    graph: &Graph,
+    feeds: &Feeds,
+    options: &Options,
+) -> Result<(Report, crate::Session), Error> {
+    run_inference_against(graph, feeds, &Expected::inference(graph, feeds)?, options)
+}
+
+fn run_inference_against(
+    graph: &Graph,
+    feeds: &Feeds,
+    expected: &Expected,
+    options: &Options,
+) -> Result<(Report, crate::Session), Error> {
     let (values, scales) = (&expected.values, &expected.scales);
     let (mut session, _) = build(graph, options.session_config(Mode::Inference));
     upload(&mut session, graph, feeds)?;
@@ -164,7 +190,7 @@ pub fn check_inference_against(
             result: check(&got, &want.data, magnitude, options.tolerance),
         });
     }
-    Ok(report)
+    Ok((report, session))
 }
 
 /// Build a training session for `graph` (whose first output is a scalar

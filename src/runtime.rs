@@ -7303,6 +7303,13 @@ impl Session {
         &self.plan
     }
 
+    /// The cooperative configuration this session settled on, after its
+    /// policy and the device's qualification.
+    #[cfg(test)]
+    pub(crate) fn coop_config(&self) -> Option<crate::codegen::CoopConfig> {
+        self.coop_config
+    }
+
     /// Number of barrier groups (compute passes) in the dispatch sequence.
     pub fn num_groups(&self) -> usize {
         self.groups.len()

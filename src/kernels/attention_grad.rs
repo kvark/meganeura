@@ -124,6 +124,17 @@ impl Family for Path {
         Path::Rowwise,
     ];
 
+    /// Rows of one head.
+    fn tile(self, problem: &Problem, target: &Target) -> Option<[u32; 2]> {
+        let available = match self {
+            Path::Cooperative(Operands::F32) => target.cooperative_f32,
+            Path::Cooperative(Operands::F16) => target.cooperative_f16,
+            Path::Flash | Path::Rowwise => true,
+        };
+        let kernel = AttentionGrad::new(problem.part, self);
+        available.then(|| [kernel.rows_per_workgroup(problem, 256), 1])
+    }
+
     fn admits(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
         let kernel = AttentionGrad::new(problem.part, self);
         self.admits_shape(problem, target)?;
@@ -231,13 +242,18 @@ impl AttentionGrad {
 
     /// Workgroups covering `problem`. `threads` is the flash workgroup width.
     pub(crate) fn workgroups_with_threads(self, problem: &Problem, threads: u32) -> [u32; 3] {
-        let per_group = match self.path {
+        let per_group = self.rows_per_workgroup(problem, threads);
+        [problem.rows.div_ceil(per_group), problem.heads, 1]
+    }
+
+    /// Rows one workgroup covers. `threads` is the flash workgroup width.
+    fn rows_per_workgroup(self, problem: &Problem, threads: u32) -> u32 {
+        match self.path {
             Path::Cooperative(Operands::F16) => 32,
             Path::Cooperative(Operands::F32) => TILE,
             Path::Flash => flash_rows(problem.head_dim, problem.ept_cap, threads),
             Path::Rowwise => 1,
-        };
-        [problem.rows.div_ceil(per_group), problem.heads, 1]
+        }
     }
 
     /// Whether the scalar layout's elements per thread shape the module,
