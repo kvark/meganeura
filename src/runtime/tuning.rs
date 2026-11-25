@@ -5004,32 +5004,47 @@ mod tests {
     fn subgroup_requirement_metadata_covers_gemv_winograd_attention_and_coop() {
         use crate::codegen::{
             FlashAttentionShape, GemvReduction, GemvShape, MatrixTypes, ShaderGroup,
-            SubgroupRequirement,
+            SubgroupRequirement, WorkgroupMatmulShape,
         };
         use crate::compile::WeightFormat;
         use crate::runtime::required_full_subgroup_size;
-        let caps = bg::Capabilities {
+        let fixed_caps = bg::Capabilities {
+            subgroup_size: 32,
+            full_subgroups: Some(bg::FullSubgroups {
+                min_size: 32,
+                max_size: 32,
+                max_workgroup_subgroups: 32,
+            }),
+            ..Default::default()
+        };
+        let variable_caps = bg::Capabilities {
             subgroup_size: 32,
             full_subgroups: Some(bg::FullSubgroups {
                 min_size: 16,
-                max_size: 64,
-                max_workgroup_subgroups: 16,
+                max_size: 32,
+                max_workgroup_subgroups: 64,
             }),
             ..Default::default()
         };
 
-        let assert_subgroup_matches_wg = |name: &str, m: &crate::codegen::ShaderModule| {
+        let assert_dynamic_subgroup_matches_wg = |name: &str, m: &crate::codegen::ShaderModule| {
             let req = m
                 .subgroup
                 .unwrap_or_else(|| panic!("{name}: expected SubgroupRequirement"));
+            assert_eq!(req.size, 0, "{name}: expected dynamic subgroup size (0)");
             assert_eq!(
                 req.workgroup_size, m.module.entry_points[0].workgroup_size,
                 "{name}: declared SubgroupRequirement workgroup_size must match WGSL @workgroup_size"
             );
             assert_eq!(
-                required_full_subgroup_size(&caps, m.subgroup),
+                required_full_subgroup_size(&fixed_caps, m.subgroup),
                 Some(32),
-                "{name}: expected full_subgroup_size 32"
+                "{name}: expected full_subgroup_size 32 on fixed-width device"
+            );
+            assert_eq!(
+                required_full_subgroup_size(&variable_caps, m.subgroup),
+                None,
+                "{name}: dynamic subgroup shader must not pin SIMD width on variable-width device"
             );
         };
 
@@ -5052,7 +5067,7 @@ mod tests {
                 workgroup_size: [128, 1, 1],
             })
         );
-        assert_subgroup_matches_wg("gemv_subgroup", &m_sg);
+        assert_dynamic_subgroup_matches_wg("gemv_subgroup", &m_sg);
 
         // Tree GEMV does not request full subgroups.
         let tree_gemv = GemvShape {
@@ -5065,15 +5080,35 @@ mod tests {
             tree_gemv,
         );
         assert_eq!(m_tree.subgroup, None);
-        assert_eq!(required_full_subgroup_size(&caps, m_tree.subgroup), None);
+        assert_eq!(
+            required_full_subgroup_size(&fixed_caps, m_tree.subgroup),
+            None
+        );
 
-        // WinogradMatmul, CoopTyped (including Conv2dBF16), FlashAttention
-        // subgroup tiles, and LayerNormSubgroup all carry explicit metadata
-        // matching their real WGSL `@workgroup_size`.
+        // Subgroup-tiled Winograd matmul hardcodes its subgroup width (32) and
+        // pins it on both fixed- and variable-width devices.
         let m_wino =
             crate::codegen::winograd::matmul(crate::DType::F16, [16, 16, 16], [32, 32], 32);
-        assert_subgroup_matches_wg("winograd_matmul", &m_wino);
+        let wino_req = m_wino
+            .subgroup
+            .expect("winograd_matmul: expected SubgroupRequirement");
+        assert_eq!(wino_req.size, 32);
+        assert_eq!(
+            wino_req.workgroup_size,
+            m_wino.module.entry_points[0].workgroup_size
+        );
+        assert_eq!(
+            required_full_subgroup_size(&fixed_caps, m_wino.subgroup),
+            Some(32)
+        );
+        assert_eq!(
+            required_full_subgroup_size(&variable_caps, m_wino.subgroup),
+            Some(32)
+        );
 
+        // Dynamic subgroup shaders (CoopTyped, FlashAttention forward/backward,
+        // LayerNormSubgroup) match their WGSL @workgroup_size and avoid forcing
+        // SIMD32 on variable-width GPUs.
         let m_typed = crate::codegen::generate_module_coop_typed_with_subgroup(
             ShaderGroup::MatMul,
             MatrixTypes::BF16,
@@ -5081,7 +5116,7 @@ mod tests {
             Default::default(),
             32,
         );
-        assert_subgroup_matches_wg("coop_typed", &m_typed);
+        assert_dynamic_subgroup_matches_wg("coop_typed", &m_typed);
 
         let m_flash_sg = crate::codegen::generate_flash_attention_module_for_device(
             64,
@@ -5090,7 +5125,17 @@ mod tests {
             false,
             true,
         );
-        assert_subgroup_matches_wg("flash_attention_subgroup", &m_flash_sg);
+        assert_dynamic_subgroup_matches_wg("flash_attention_subgroup", &m_flash_sg);
+
+        let m_flash_grad = crate::codegen::generate_flash_grad_module(
+            crate::kernels::attention_grad::Part::KV,
+            64,
+            16,
+            32,
+            128,
+            false,
+        );
+        assert_dynamic_subgroup_matches_wg("flash_grad_kv_subgroup", &m_flash_grad);
 
         let m_flash_tree = crate::codegen::generate_flash_attention_module_for_device(
             64,
@@ -5102,6 +5147,39 @@ mod tests {
         assert_eq!(m_flash_tree.subgroup, None);
 
         let m_ln = crate::codegen::generate_layer_norm_subgroup();
-        assert_subgroup_matches_wg("layer_norm_subgroup", &m_ln);
+        assert_dynamic_subgroup_matches_wg("layer_norm_subgroup", &m_ln);
+
+        // Pinned subgroup-tiled matmul (`req.size == 16`) still pins 16 even on
+        // variable-width devices (`min_size=16, max_size=32`).
+        let sg_shape = WorkgroupMatmulShape {
+            rows: 64,
+            columns: 64,
+            k_stage: 32,
+            threads: 128,
+            stage_operands: false,
+            subgroup_rows: 2,
+            prefetch: false,
+        };
+        let m_pinned = crate::codegen::generate_workgroup_matmul_for_device(
+            ShaderGroup::MatMul,
+            sg_shape,
+            MatrixTypes::F32_AS_F16,
+            [8, 16, 16],
+            16,
+            false,
+            None,
+        );
+        let req = m_pinned
+            .subgroup
+            .expect("subgroup-matmul must declare pinned SubgroupRequirement");
+        assert_eq!(req.size, 16);
+        assert_eq!(
+            req.workgroup_size,
+            m_pinned.module.entry_points[0].workgroup_size
+        );
+        assert_eq!(
+            required_full_subgroup_size(&variable_caps, m_pinned.subgroup),
+            Some(16)
+        );
     }
 }

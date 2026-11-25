@@ -1800,12 +1800,27 @@ fn create_gen_shader(
 /// Resolve the explicit subgroup requirement carried by a generated
 /// [`crate::codegen::ShaderModule`] against the device's full-subgroup
 /// capabilities.
+///
+/// Shaders with `req.size > 0` hardcode that exact subgroup width in WGSL
+/// (for example `subgroup-matmul`) and always pin `required_full_subgroup_size`
+/// when the device supports it. Shaders with `req.size == 0` adapt to
+/// `@builtin(subgroup_size)` dynamically: they pin `caps.subgroup_size` on
+/// fixed-width devices (`min_size == max_size`, such as NVIDIA/Metal) so every
+/// subgroup is full, but return `None` on variable-width devices (`min_size !=
+/// max_size`, such as Intel Xe2 `[16, 32]`) because Vulkan's
+/// `requiredSubgroupSize` overrides the driver's register-pressure heuristic
+/// and can force SIMD32 spilling on register-heavy kernels like FlashAttention
+/// backward.
 fn required_full_subgroup_size(
     caps: &blade_graphics::Capabilities,
     req: Option<crate::codegen::SubgroupRequirement>,
 ) -> Option<u32> {
     let req = req?;
+    let fs = caps.full_subgroups?;
     let size = if req.size == 0 {
+        if fs.min_size != fs.max_size {
+            return None;
+        }
         caps.subgroup_size
     } else {
         req.size
@@ -1813,9 +1828,7 @@ fn required_full_subgroup_size(
     if size == 0 {
         return None;
     }
-    caps.full_subgroups
-        .is_some_and(|fs| fs.supports(size, req.workgroup_size))
-        .then_some(size)
+    fs.supports(size, req.workgroup_size).then_some(size)
 }
 
 /// Shared workgroup-cooperative tile resolution used by both `Pipelines::compile`

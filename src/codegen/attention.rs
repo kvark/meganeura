@@ -862,7 +862,7 @@ pub fn generate_flash_grad_module(
     };
     let module = attention_module(preprocess(fragment("main"), &vars), hint);
     if subgroup {
-        module.with_subgroup(subgroup_size, [threads, 1, 1])
+        module.with_subgroup(0, [threads, 1, 1])
     } else {
         module
     }
