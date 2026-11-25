@@ -83,6 +83,31 @@ pub fn save_plan(plan: &ExecutionPlan, forward_graph: &Graph, path: &Path) -> io
 
 static NEXT_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Resolve symlinks (including dangling ones) so atomic rename updates the
+/// link target instead of replacing the symlink with a regular file.
+fn resolve_save_destination(path: &Path) -> io::Result<std::path::PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&cur)?;
+                cur = if target.is_absolute() {
+                    target
+                } else {
+                    cur.parent().map_or(target.clone(), |p| p.join(&target))
+                };
+            }
+            Ok(_) => return Ok(cur),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(cur),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "too many levels of symbolic links",
+    ))
+}
+
 fn save_plan_impl(
     plan: &ExecutionPlan,
     forward_graph: &Graph,
@@ -100,9 +125,8 @@ fn save_plan_impl(
     };
     let ron_str = ron::ser::to_string_pretty(&cached, ron::ser::PrettyConfig::default())
         .map_err(io::Error::other)?;
-    // Follow an existing symlink so atomic rename updates the link target
-    // rather than replacing the symlink with a regular file.
-    let dest = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dest = resolve_save_destination(path)?;
+    let existing_perms = std::fs::metadata(&dest).ok().map(|m| m.permissions());
     if let Some(parent) = dest.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -131,9 +155,13 @@ fn save_plan_impl(
             Err(err) => return Err(err),
         }
     };
-    let write_result = file
-        .write_all(ron_str.as_bytes())
-        .and_then(|()| file.sync_all());
+    let write_result = (|| -> io::Result<()> {
+        if let Some(perms) = existing_perms {
+            file.set_permissions(perms)?;
+        }
+        file.write_all(ron_str.as_bytes())?;
+        file.sync_all()
+    })();
     drop(file);
     if let Err(err) = write_result {
         let _ = std::fs::remove_file(&tmp);
@@ -771,22 +799,46 @@ mod cache_format_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plan.ron");
-        // Pre-populate the exact next candidate temp file name to force a
-        // collision and verify `create_new(true)` skips it without truncating.
-        let next = NEXT_SAVE.load(std::sync::atomic::Ordering::Relaxed);
-        let collider = dir.join(format!("plan.ron.{}-{next}.partial", std::process::id()));
-        let legacy_collider = dir.join(format!("plan.tmp.{}.{next}", std::process::id()));
-        std::fs::write(&collider, b"keep-partial-sibling").unwrap();
-        std::fs::write(&legacy_collider, b"keep-legacy-sibling").unwrap();
+        // Pre-populate several upcoming candidate temp file names so even if
+        // another test advances `NEXT_SAVE` concurrently, `create_new(true)`
+        // hits a collision and skips over existing files without truncating.
+        let base = NEXT_SAVE.load(std::sync::atomic::Ordering::Relaxed);
+        let colliders: Vec<_> = (base..base + 16)
+            .map(|n| dir.join(format!("plan.ron.{}-{n}.partial", std::process::id())))
+            .collect();
+        for collider in &colliders {
+            std::fs::write(collider, b"keep-partial-sibling").unwrap();
+        }
 
         save_plan(&plan, &graph, &path).unwrap();
-        assert_eq!(std::fs::read(&collider).unwrap(), b"keep-partial-sibling");
-        assert_eq!(
-            std::fs::read(&legacy_collider).unwrap(),
-            b"keep-legacy-sibling"
-        );
+        for collider in &colliders {
+            assert_eq!(std::fs::read(collider).unwrap(), b"keep-partial-sibling");
+        }
         let restored = load_plan(&graph, &path).unwrap().unwrap();
         assert_eq!(restored.dispatches, plan.dispatches);
+
+        #[cfg(unix)]
+        {
+            let target_dir = dir.join("shared");
+            let target = target_dir.join("target.ron");
+            let link = dir.join("dangling.ron");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            save_plan(&plan, &graph, &link).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "saving through a dangling symlink must preserve the symlink"
+            );
+            assert!(
+                target.exists(),
+                "target file must be created through symlink"
+            );
+            let restored = load_plan(&graph, &link).unwrap().unwrap();
+            assert_eq!(restored.dispatches, plan.dispatches);
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

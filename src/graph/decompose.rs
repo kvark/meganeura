@@ -2,7 +2,10 @@
 //!
 //! Every composite op ([`OpClass::Composite`]) has a one-level expansion
 //! ([`Graph::expand`]) into primitives and other composites.
-//! [`Graph::decompose`] applies expansions until only primitives remain.
+//! [`Graph::decompose`] applies expansions until only primitives remain,
+//! except for forward attention composites referenced by a
+//! `MultiHeadAttnGrad*`'s `fwd_node` (which stay intact so backward attention
+//! keeps its LSE/O producer).
 //! [`Graph::recompose`] runs the other way: at every node, the composite's
 //! guesser proposes inputs and attributes, and the proposal holds only if
 //! the graph around the node is structurally the composite's own
@@ -32,14 +35,17 @@ const GELU_CUBIC: f32 = 0.044715;
 const BCE_EPS: f32 = 1e-7;
 
 impl Graph {
-    /// A copy of the graph with every composite replaced by primitives.
+    /// A copy of the graph with every composite replaced by primitives, except
+    /// forward attention composites referenced by a `MultiHeadAttnGrad*`'s
+    /// `fwd_node` (preserved so backward attention retains its LSE/O producer).
     pub fn decompose(&self) -> Graph {
         self.decompose_where(|_| true)
     }
 
     /// A copy with the composites `select` picks expanded, pass after pass,
     /// until it picks none. An expansion's own composites are expanded only
-    /// if `select` picks them too.
+    /// if `select` picks them too. Forward attention composites referenced by
+    /// a `MultiHeadAttnGrad*`'s `fwd_node` are never expanded.
     pub(crate) fn decompose_where(&self, select: impl Fn(&Node) -> bool) -> Graph {
         let mut graph = self.deep_clone();
         while let Some(next) = graph.expand_composites(&select) {

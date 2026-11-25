@@ -3426,7 +3426,10 @@ impl DebugStepReport {
     }
 }
 
-/// A compiled, ready-to-execute GPU session for a computation graph.
+/// A compiled, ready-to-execute GPU session.
+///
+/// Holds all blade-graphics resources: context, buffers, pipelines.
+/// Calling `step()` replays the pre-compiled dispatch sequence.
 pub struct Session {
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its
