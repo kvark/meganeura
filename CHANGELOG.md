@@ -20,6 +20,9 @@
   their own. Plans whose gradients were already exclusive are unchanged, and
   the plan cache format moves to 47.
 
+- `Graph::materialize` of a matmul result keeps its copy. The matmul used to
+  absorb the copy as its epilogue, the one fusion that ignored the barrier.
+
 - The ONNX importer reads models with its own protobuf decoder and no longer
   depends on `oxionnx-core` and `oxionnx-proto`, which change to the Business
   Source License from 0.1.8. Initializers become parameters in file order,

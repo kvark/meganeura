@@ -3293,7 +3293,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         // Binary ops (BiasAdd, Add) would require extra buffer bindings in the
         // shader data layout, which is a larger change. TODO: extend shader data
         // layouts to support dynamic extra bindings for binary epilogues.
-        if d.input_buffers.len() != 1 {
+        if d.input_buffers.len() != 1 || d.fusion_barrier {
             continue;
         }
 
@@ -3328,7 +3328,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
         );
-        if !is_matmul || prod.use_coop() {
+        if !is_matmul || prod.use_coop() || prod.fusion_barrier {
             continue;
         }
 
@@ -3968,6 +3968,20 @@ mod tests {
         let split = &plan.dispatches[1];
         assert_eq!(split.shader, ShaderEntry::SplitA);
         assert_eq!(split.input_buffers, [copy.output_buffer]);
+
+        // A matmul does not take the copy as its epilogue either.
+        let mut g = Graph::new();
+        let a = g.input("a", &[4, 8]);
+        let w = g.parameter("w", &[8, 4]);
+        let product = g.matmul(a, w);
+        let staged = g.materialize(product);
+        g.set_outputs(vec![staged]);
+
+        let plan = compile(&crate::optimize::optimize(&g));
+
+        assert_eq!(plan.dispatches.len(), 2);
+        assert!(plan.dispatches[0].matmul_epilogue.is_none());
+        assert!(plan.dispatches[1].fusion_barrier);
     }
 
     #[test]
