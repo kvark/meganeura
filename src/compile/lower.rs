@@ -385,6 +385,7 @@ fn select_matmul_paths(
     let target = matmul::Target {
         cooperative: coop_config.copied(),
         allow_raw_f16,
+        prefer: plan.knobs.prefer_matmul,
     };
     for index in 0..plan.dispatches.len() {
         let Some(problem) = matmul::Problem::of(&plan.dispatches[index]) else {
