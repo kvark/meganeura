@@ -132,7 +132,9 @@ fn check_candidates(strategy: TuneStrategy, cases: &[Case]) {
                 .filter(|o| matches!(o.candidate, MatmulTile::CooperativeWorkgroup { .. }))
                 .collect();
             // A native-F32 cooperative key does not imply F16 arithmetic,
-            // and workgroup support is specific to types, shapes and limits.
+            // and workgroup support is specific to types, shapes, layout and
+            // limits. Subgroup tiles take ragged rows in layouts whose rows
+            // are not their contiguous axis, so the layout has to be named.
             // CPU tests separately check classes filtered out before probing.
             let supported = report.outcomes.iter().any(|outcome| {
                 let class = &outcome.class;
@@ -141,7 +143,14 @@ fn check_candidates(strategy: TuneStrategy, cases: &[Case]) {
                     .or_else(|| class.cooperative_f16.then_some(MatrixTypes::F32_AS_F16));
                 types.is_some_and(|types| {
                     WorkgroupMatmulShape::all().any(|shape| {
-                        shape.supports(&gpu.capabilities(), types, class.m, class.n, class.k)
+                        shape.supports_layout(
+                            &gpu.capabilities(),
+                            types,
+                            Some(class.shader.shader_group()),
+                            class.m,
+                            class.n,
+                            class.k,
+                        )
                     })
                 })
             });
