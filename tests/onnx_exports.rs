@@ -1,10 +1,11 @@
 //! Transformer layers and a ResNet block in the form PyTorch's exporter
-//! writes, end to end.
+//! writes, and the spatial operators vision models add, end to end.
 //!
 //! `tests/fixtures/onnx/generate.py` authors the models node by node in
 //! that form (they are not exporter output) and computes their expected
-//! outputs with ONNX's reference evaluator. Each must import, run on the
-//! GPU, and build its decomposed norms and softmax as fused kernels.
+//! outputs with ONNX's reference evaluator. Each must import and run on the
+//! GPU; the layers must build their decomposed norms and softmax as fused
+//! kernels.
 
 use meganeura::graph::Op;
 use meganeura::{Mode, SessionConfig, load_onnx_bytes};
@@ -32,6 +33,9 @@ pub(super) fn fixture(name: &str) -> &'static [u8] {
         "resnet_block.onnx",
         "resnet_block.input.bin",
         "resnet_block.expected.bin",
+        "vision_ops.onnx",
+        "vision_ops.input.bin",
+        "vision_ops.expected.bin",
     )
 }
 
@@ -106,4 +110,12 @@ fn llama_gqa_dynamic_layer() {
 fn resnet_block() {
     let ops = run("resnet_block", "pixel_values");
     assert_eq!(count(&ops, |op| matches!(op, Op::Conv2d { .. })), 4);
+}
+
+#[test]
+fn vision_ops() {
+    let ops = run("vision_ops", "pixel_values");
+    // Both depthwise branches, the plain one and the one that repeats each
+    // input channel, run the depthwise kernel.
+    assert_eq!(count(&ops, |op| matches!(op, Op::Conv2dDw { .. })), 2);
 }

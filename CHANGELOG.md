@@ -1,5 +1,26 @@
 # Unreleased
 
+- The ONNX importer reads grouped and depthwise `Conv`, `ConvTranspose`,
+  `Resize`, `TopK` and `GridSample`, all through existing kernels:
+  - A `Conv` whose groups hold one input channel each runs the depthwise
+    kernel, which repeats each input plane when a group has several
+    outputs. Other groups run one convolution each, joined along channels.
+    The depthwise kernel has no derivative, so such a model imports for
+    inference.
+  - `ConvTranspose` takes per-axis strides, padding that differs between
+    the sides, `output_padding`, `output_shape`, `auto_pad` and groups.
+    Dilation is refused.
+  - `Resize` covers the spatial axes in nearest, linear and cubic modes,
+    every coordinate transform but `tf_crop_and_resize`, `exclude_outside`,
+    `antialias`, `axes` and `keep_aspect_ratio_policy`. Each resized axis is
+    a constant interpolation matrix applied by a matrix product; an axis
+    that only repeats pixels whole times repeats them instead.
+  - `TopK` takes up to 64 elements along any axis of up to four, largest or
+    smallest, sorted, ties to the lower index.
+  - `GridSample` samples NCHW bilinearly or at the nearest pixel, a half
+    rounding to even, with zero or border padding. Cubic sampling and
+    reflection padding are refused.
+
 - `TuningKnobs::prefer_matmul` names a dense-product path
   (`kernels::matmul::Path`, now public) for session construction to try
   first wherever that path admits the product, as

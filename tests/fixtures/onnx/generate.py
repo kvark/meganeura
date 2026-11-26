@@ -94,7 +94,7 @@ class Builder:
             self.inits,
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
-        model.ir_version = 8
+        model.ir_version = 8 if opset <= 18 else 9
         onnx.checker.check_model(model)
         x = self.rng.normal(0.0, 1.0, x_shape).astype(np.float32)
         (expected,) = ReferenceEvaluator(model).run(None, {x_name: x})
@@ -234,8 +234,68 @@ def resnet_block():
     b.finish("resnet_block", x, logits, 17, (1, 3, 16, 16), (1, 10))
 
 
+def vision_ops():
+    """Grouped and depthwise convolutions, transposed convolutions, Resize in
+    its modes, TopK and GridSample, each flattened and concatenated into one
+    row so a single output covers them all."""
+    b = Builder(5)
+    x = "pixel_values"
+    parts = []
+
+    def keep(t):
+        parts.append(b.op("Flatten", t, axis=0))
+
+    def conv(op, w_shape, out_channels, bias=True, **attrs):
+        inputs = [x, b.weight("weight", w_shape, 0.3)]
+        if bias:
+            inputs.append(b.weight("bias", (out_channels,), 0.1))
+        keep(b.op(op, *inputs, **attrs))
+
+    conv("Conv", (6, 2, 3, 3), 6, group=2, pads=[1, 1, 1, 1])
+    conv("Conv", (8, 1, 3, 3), 8, group=4, pads=[1, 1, 1, 1], strides=[2, 2])
+    conv("Conv", (4, 1, 3, 3), 4, bias=False, group=4, pads=[1, 1, 1, 1])
+    conv("ConvTranspose", (4, 3, 3, 3), 3, strides=[2, 2], pads=[1, 1, 0, 0], output_padding=[1, 1])
+    # The reference evaluator writes one channel per group and adds the
+    # first group's bias to every group, so the grouped transposed
+    # convolution has one channel in and out of each, and no bias.
+    conv("ConvTranspose", (4, 1, 2, 2), 4, bias=False, group=4, strides=[2, 2])
+
+    def resize(scales=None, sizes=None, **attrs):
+        inputs = [x, "", b.const("scales", scales) if scales else ""]
+        if sizes:
+            inputs.append(b.const("sizes", sizes, np.int64))
+        keep(b.op("Resize", *inputs, **attrs))
+
+    # PyTorch's nearest upsampling, then the other modes and transforms.
+    resize(scales=[1, 1, 2, 2], mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor")
+    resize(sizes=[1, 4, 9, 9], mode="linear")
+    resize(sizes=[1, 4, 4, 5], mode="linear", coordinate_transformation_mode="align_corners")
+    resize(scales=[1, 1, 1.5, 1.5], mode="cubic", coordinate_transformation_mode="pytorch_half_pixel")
+    resize(sizes=[1, 4, 4, 4], mode="nearest", nearest_mode="round_prefer_ceil")
+    resize(sizes=[1, 4, 3, 4], mode="linear", antialias=1)
+    resize(sizes=[1, 4, 5, 5], mode="cubic", exclude_outside=1, cubic_coeff_a=-0.5)
+
+    def top_k(t, k, **attrs):
+        values, indices = b.name("values"), b.name("indices")
+        b.nodes.append(helper.make_node("TopK", [t, b.const("k", [k], np.int64)], [values, indices], **attrs))
+        keep(values)
+        keep(b.op("Cast", indices, to=TensorProto.FLOAT))
+
+    top_k(b.op("Reshape", x, b.const("shape", [4, 36], np.int64)), 3)
+    top_k(x, 2, axis=1, largest=0)
+
+    # Some grid points fall outside [-1, 1], where padding decides.
+    grid = b.const("grid", b.rng.uniform(-1.2, 1.2, (1, 5, 7, 2)))
+    keep(b.op("GridSample", x, grid, mode="linear", padding_mode="zeros", align_corners=0))
+    keep(b.op("GridSample", x, grid, mode="nearest", padding_mode="border", align_corners=1))
+    keep(b.op("GridSample", x, grid, mode="linear", padding_mode="border", align_corners=1))
+    y = b.op("Concat", *parts, axis=1)
+    b.finish("vision_ops", x, y, 20, (1, 4, 6, 6), (1, "total"))
+
+
 if __name__ == "__main__":
     bert_layer()
     llama_layer()
     llama_gqa_dynamic_layer()
     resnet_block()
+    vision_ops()

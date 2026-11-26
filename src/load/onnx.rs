@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::graph::{Graph, NodeId, Op};
 
 mod proto;
+mod spatial;
 
 /// Result of loading an ONNX model.
 pub struct OnnxModel {
@@ -627,72 +628,14 @@ fn translate_node(
             }
         }
 
-        // --- Conv (1D or 2D) ---
-        "Conv" => {
-            let input = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
-            let kernel = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
-            let input_shape = get_shape(&node.inputs[0], shapes);
-            let kernel_shape = get_shape(&node.inputs[1], shapes);
-            let rank = input_shape.len();
-            if !(3..=4).contains(&rank) || kernel_shape.len() != rank {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Conv of {input_shape:?} by {kernel_shape:?} (supported: 1D and 2D)"
-                )));
-            }
-            let group = attrs.i("group", 1);
-            if group != 1 {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Conv '{}' in {group} groups (supported: 1)",
-                    node.name
-                )));
-            }
-            let (stride, pads) = window(node, &input_shape[2..], &kernel_shape[2..])?;
-            // A 1D convolution is a 2D one over images a row high.
-            let plane = |s: &[usize], fill| match *s {
-                [w] => [fill, w],
-                [h, w] => [h, w],
-                _ => [fill; 2],
-            };
-            let [in_h, in_w] = plane(&input_shape[2..], 1);
-            let [kernel_h, kernel_w] = plane(&kernel_shape[2..], 1);
-            let [padding_h, padding_w] = plane(&pads, 0);
-            let (batch, in_channels, out_channels) =
-                (input_shape[0], input_shape[1], kernel_shape[0]);
-            // The kernel reads both operands as flat NCHW.
-            let input = view(graph, input, &[batch * in_channels * in_h * in_w])?;
-            let kernel = view(
-                graph,
-                kernel,
-                &[out_channels * in_channels * kernel_h * kernel_w],
-            )?;
-            let out = graph.conv2d_hw(
-                input,
-                kernel,
-                batch as u32,
-                in_channels as u32,
-                in_h as u32,
-                in_w as u32,
-                out_channels as u32,
-                kernel_h as u32,
-                kernel_w as u32,
-                stride as u32,
-                padding_h as u32,
-                padding_w as u32,
-            );
-            let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
-            let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
-            let out = match node.inputs.get(2).filter(|name| !name.is_empty()) {
-                Some(name) => {
-                    let bias = resolve_input(name, name_to_id, &node.name)?;
-                    let bias = view(graph, bias, &[out_channels])?;
-                    graph.add_per_channel(out, bias, out_channels as u32, (out_h * out_w) as u32)
-                }
-                None => out,
-            };
-            let mut out_shape = vec![batch, out_channels];
-            out_shape.extend_from_slice(&[out_h, out_w][4 - rank..]);
-            register_output(node, 0, out, &out_shape, name_to_id, shapes);
-        }
+        // --- Convolutions, resampling ---
+        "Conv" => spatial::conv(graph, node, name_to_id, shapes)?,
+        "ConvTranspose" => spatial::conv_transpose(graph, node, name_to_id, shapes)?,
+        "Resize" => spatial::resize(graph, node, name_to_id, shapes, weights)?,
+        "GridSample" => spatial::grid_sample(graph, node, name_to_id, shapes)?,
+
+        // --- TopK ---
+        "TopK" => top_k(graph, node, name_to_id, shapes, weights)?,
 
         // --- Concat ---
         "Concat" => {
@@ -1291,6 +1234,98 @@ fn reduce_op(
         *last = 1;
     }
     register_output(node, 0, out, &out_shape, name_to_id, shapes);
+    Ok(())
+}
+
+/// Rounds `TopK` takes at most: each is a pass over every row.
+const MAX_TOP_K: usize = 64;
+
+/// `TopK` along any axis of up to four: sorted values and their indices,
+/// ties to the lower index. Each round takes every row's maximum and its
+/// first column, then masks that column out of the next round.
+fn top_k(
+    graph: &mut Graph,
+    node: &proto::Node,
+    name_to_id: &mut HashMap<String, NodeId>,
+    shapes: &mut HashMap<String, Vec<usize>>,
+    weights: &HashMap<String, Vec<f32>>,
+) -> Result<(), OnnxError> {
+    let attrs = &node.attrs;
+    let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+    let x_shape = get_shape(&node.inputs[0], shapes);
+    let rank = x_shape.len();
+    // `k` is an input from opset 10 and an attribute before.
+    let k = match node.inputs.get(1).filter(|name| !name.is_empty()) {
+        Some(name) => {
+            let id = resolve_input(name, name_to_id, &node.name)?;
+            scalar_constant(graph, id, weights).ok_or_else(|| {
+                OnnxError::UnsupportedOp(format!("TopK '{}': k must be a constant", node.name))
+            })? as i64
+        }
+        None => attrs.i("k", 0),
+    };
+    let axis = attrs.i("axis", -1);
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    if !(1..=4).contains(&rank) || !(0..rank as i64).contains(&axis) {
+        return Err(OnnxError::UnsupportedOp(format!(
+            "TopK '{}': axis {axis} of {x_shape:?} (supported: up to 4 axes)",
+            node.name
+        )));
+    }
+    let axis = axis as usize;
+    let len = x_shape[axis];
+    if !(1..=len as i64).contains(&k) || k as usize > MAX_TOP_K {
+        return Err(OnnxError::UnsupportedOp(format!(
+            "TopK '{}': k = {k} of {len} (supported: 1 to {MAX_TOP_K})",
+            node.name
+        )));
+    }
+    let k = k as usize;
+    let largest = attrs.i("largest", 1) != 0;
+    // Bring the axis innermost; swapping it with the last is its own inverse.
+    let mut perm: Vec<usize> = (0..rank).collect();
+    perm.swap(axis, rank - 1);
+    let rows = x_shape.iter().product::<usize>() / len;
+    let mut moved = view(graph, x, &x_shape)?;
+    if axis != rank - 1 {
+        moved = graph.permute(moved, &perm);
+    }
+    let mut remaining = view(graph, moved, &[rows, len])?;
+    if !largest {
+        remaining = graph.neg(remaining);
+    }
+    let mut picked: Option<(NodeId, NodeId)> = None;
+    for round in 0..k {
+        let index = graph.argmax_inner(remaining);
+        let value = graph.max_inner(remaining);
+        picked = Some(match picked {
+            None => (value, index),
+            Some((values, indices)) => (
+                graph.concat(values, value, rows as u32, round as u32, 1, 1),
+                graph.concat(indices, index, rows as u32, round as u32, 1, 1),
+            ),
+        });
+        if round + 1 < k {
+            let taken = graph.one_hot(index, len);
+            let taken = graph.scale(taken, -f32::MAX);
+            remaining = graph.add(remaining, taken);
+        }
+    }
+    let (mut values, indices) = picked.expect("k is at least one");
+    if !largest {
+        values = graph.neg(values);
+    }
+    let mut moved_shape: Vec<usize> = perm.iter().map(|&d| x_shape[d]).collect();
+    moved_shape[rank - 1] = k;
+    let mut out_shape = x_shape.clone();
+    out_shape[axis] = k;
+    for (slot, out) in [values, indices].into_iter().enumerate() {
+        let mut out = view(graph, out, &moved_shape)?;
+        if axis != rank - 1 {
+            out = graph.permute(out, &perm);
+        }
+        register_output(node, slot, out, &out_shape, name_to_id, shapes);
+    }
     Ok(())
 }
 
