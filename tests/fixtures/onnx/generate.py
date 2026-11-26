@@ -236,8 +236,9 @@ def resnet_block():
 
 def vision_ops():
     """Grouped and depthwise convolutions, transposed convolutions, Resize in
-    its modes, TopK, strided Slice and GridSample, each flattened and
-    concatenated into one row so a single output covers them all."""
+    its modes, TopK, strided Slice, Pad, Clip, Tile, GatherElements and
+    GridSample, each flattened and concatenated into one row so a single
+    output covers them all."""
     b = Builder(5)
     x = "pixel_values"
     parts = []
@@ -297,6 +298,37 @@ def vision_ops():
     slice_([-1], [np.iinfo(np.int64).min], [-1], [-1])
     slice_([1, 3], [6, 0], [3, 1], [3, -2])
     slice_([5, 2], [-7, 100], [2, 3], [-3, 9])
+
+    # HGNetv2's stem pads one row and column after, then the other modes.
+    def pad(pads, mode="constant", value=None):
+        inputs = [x, b.const("pads", pads, np.int64)]
+        if value is not None:
+            inputs.append(b.const("value", value))
+        keep(b.op("Pad", *inputs, mode=mode))
+
+    pad([0, 0, 0, 0, 0, 0, 1, 1], value=0.5)
+    pad([0, 0, 2, 1, 0, 0, 1, 2], mode="reflect")
+    pad([0, 0, 1, 0, 0, 0, 0, 3], mode="edge")
+    pad([0, 0, 0, 2, 0, 0, 0, 2], mode="wrap")
+
+    keep(b.op("Clip", x, b.const("min", -0.5), b.const("max", 0.7)))
+    keep(b.op("Clip", x, b.const("min", 0.1)))
+    keep(b.op("Clip", x, "", b.const("max", 0.2)))
+    keep(b.op("Tile", x, b.const("repeats", [1, 2, 1, 3], np.int64)))
+
+    # D-FINE's query selection: the top 100 of 144 scores, their rows by
+    # integer division, and those rows' boxes gathered.
+    scores, picks = b.name("values"), b.name("indices")
+    flat = b.op("Reshape", x, b.const("shape", [1, 144], np.int64))
+    b.nodes.append(helper.make_node("TopK", [flat, b.const("k", [100], np.int64)], [scores, picks]))
+    keep(scores)
+    rows = b.op("Div", picks, b.const("columns", [6], np.int64))
+    rows = b.op("Tile", b.op("Unsqueeze", rows, b.const("axes", [2], np.int64)), b.const("repeats", [1, 1, 6], np.int64))
+    boxes = b.op("Reshape", x, b.const("shape", [1, 24, 6], np.int64))
+    keep(b.op("GatherElements", boxes, rows, axis=1))
+    # Negative indices count from the end.
+    index = np.tile(np.array([-1, 0, -6], dtype=np.int64), (1, 4, 6, 1))
+    keep(b.op("GatherElements", x, b.const("index", index, np.int64), axis=3))
 
     # Some grid points fall outside [-1, 1], where padding decides.
     grid = b.const("grid", b.rng.uniform(-1.2, 1.2, (1, 5, 7, 2)))

@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::graph::{Graph, NodeId, Op};
 
+mod indexing;
 mod proto;
 mod spatial;
 
@@ -216,6 +217,30 @@ fn translate_node(
             reduce_op(graph, node, name_to_id, shapes, weights)?;
         }
         "Erf" => unary_op(graph, node, name_to_id, shapes, Op::Erf)?,
+
+        // Bounds are inputs from opset 11 and attributes before. A missing
+        // one is the largest finite value, so it saturates infinities.
+        "Clip" => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let bound = |slot: usize, attr: &str, default: f32| -> Result<f32, OnnxError> {
+                let Some(name) = node.inputs.get(slot).filter(|name| !name.is_empty()) else {
+                    return Ok(attrs.f(attr, default));
+                };
+                let id = resolve_input(name, name_to_id, &node.name)?;
+                scalar_constant(graph, id, weights).ok_or_else(|| {
+                    OnnxError::UnsupportedOp(format!(
+                        "Clip '{}': bounds must be constants",
+                        node.name
+                    ))
+                })
+            };
+            let min = bound(1, "min", f32::MIN)?.max(f32::MIN);
+            let max = bound(2, "max", f32::MAX)?.min(f32::MAX);
+            // A lower bound above the upper one leaves the upper one, as ONNX's does.
+            let out = graph.clamp(x, min.min(max), max);
+            register_output(node, 0, out, &x_shape, name_to_id, shapes);
+        }
 
         // Cast: passthrough (we only support f32)
         "Cast" => {
@@ -635,7 +660,12 @@ fn translate_node(
         "GridSample" => spatial::grid_sample(graph, node, name_to_id, shapes)?,
 
         // --- TopK ---
-        "TopK" => top_k(graph, node, name_to_id, shapes, weights)?,
+        "TopK" => indexing::top_k(graph, node, name_to_id, shapes, weights)?,
+
+        // --- Padding, repetition and element gathers ---
+        "Pad" => indexing::pad(graph, node, name_to_id, shapes, weights)?,
+        "Tile" => indexing::tile(graph, node, name_to_id, shapes, weights)?,
+        "GatherElements" => indexing::gather_elements(graph, node, name_to_id, shapes)?,
 
         // --- Concat ---
         "Concat" => {
@@ -762,16 +792,9 @@ fn translate_node(
                     narrow(graph, out, &out_shape, axis, start as usize..end as usize)
                 } else {
                     let step = if step > 0 { stride } else { -stride };
-                    strided(
-                        graph,
-                        node,
-                        out,
-                        &out_shape,
-                        axis,
-                        start,
-                        step,
-                        count as usize,
-                    )?
+                    let positions: Vec<usize> =
+                        (0..count).map(|j| (start + j * step) as usize).collect();
+                    indexing::gather_axis(graph, node, out, &out_shape, axis, &positions)?
                 };
                 out_shape[axis] = count as usize;
             }
@@ -1269,98 +1292,6 @@ fn reduce_op(
     Ok(())
 }
 
-/// Rounds `TopK` takes at most: each is a pass over every row.
-const MAX_TOP_K: usize = 64;
-
-/// `TopK` along any axis of up to four: sorted values and their indices,
-/// ties to the lower index. Each round takes every row's maximum and its
-/// first column, then masks that column out of the next round.
-fn top_k(
-    graph: &mut Graph,
-    node: &proto::Node,
-    name_to_id: &mut HashMap<String, NodeId>,
-    shapes: &mut HashMap<String, Vec<usize>>,
-    weights: &HashMap<String, Vec<f32>>,
-) -> Result<(), OnnxError> {
-    let attrs = &node.attrs;
-    let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
-    let x_shape = get_shape(&node.inputs[0], shapes);
-    let rank = x_shape.len();
-    // `k` is an input from opset 10 and an attribute before.
-    let k = match node.inputs.get(1).filter(|name| !name.is_empty()) {
-        Some(name) => {
-            let id = resolve_input(name, name_to_id, &node.name)?;
-            scalar_constant(graph, id, weights).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!("TopK '{}': k must be a constant", node.name))
-            })? as i64
-        }
-        None => attrs.i("k", 0),
-    };
-    let axis = attrs.i("axis", -1);
-    let axis = if axis < 0 { axis + rank as i64 } else { axis };
-    if !(1..=4).contains(&rank) || !(0..rank as i64).contains(&axis) {
-        return Err(OnnxError::UnsupportedOp(format!(
-            "TopK '{}': axis {axis} of {x_shape:?} (supported: up to 4 axes)",
-            node.name
-        )));
-    }
-    let axis = axis as usize;
-    let len = x_shape[axis];
-    if !(1..=len as i64).contains(&k) || k as usize > MAX_TOP_K {
-        return Err(OnnxError::UnsupportedOp(format!(
-            "TopK '{}': k = {k} of {len} (supported: 1 to {MAX_TOP_K})",
-            node.name
-        )));
-    }
-    let k = k as usize;
-    let largest = attrs.i("largest", 1) != 0;
-    // Bring the axis innermost; swapping it with the last is its own inverse.
-    let mut perm: Vec<usize> = (0..rank).collect();
-    perm.swap(axis, rank - 1);
-    let rows = x_shape.iter().product::<usize>() / len;
-    let mut moved = view(graph, x, &x_shape)?;
-    if axis != rank - 1 {
-        moved = graph.permute(moved, &perm);
-    }
-    let mut remaining = view(graph, moved, &[rows, len])?;
-    if !largest {
-        remaining = graph.neg(remaining);
-    }
-    let mut picked: Option<(NodeId, NodeId)> = None;
-    for round in 0..k {
-        let index = graph.argmax_inner(remaining);
-        let value = graph.max_inner(remaining);
-        picked = Some(match picked {
-            None => (value, index),
-            Some((values, indices)) => (
-                graph.concat(values, value, rows as u32, round as u32, 1, 1),
-                graph.concat(indices, index, rows as u32, round as u32, 1, 1),
-            ),
-        });
-        if round + 1 < k {
-            let taken = graph.one_hot(index, len);
-            let taken = graph.scale(taken, -f32::MAX);
-            remaining = graph.add(remaining, taken);
-        }
-    }
-    let (mut values, indices) = picked.expect("k is at least one");
-    if !largest {
-        values = graph.neg(values);
-    }
-    let mut moved_shape: Vec<usize> = perm.iter().map(|&d| x_shape[d]).collect();
-    moved_shape[rank - 1] = k;
-    let mut out_shape = x_shape.clone();
-    out_shape[axis] = k;
-    for (slot, out) in [values, indices].into_iter().enumerate() {
-        let mut out = view(graph, out, &moved_shape)?;
-        if axis != rank - 1 {
-            out = graph.permute(out, &perm);
-        }
-        register_output(node, slot, out, &out_shape, name_to_id, shapes);
-    }
-    Ok(())
-}
-
 fn unary_op(
     graph: &mut Graph,
     node: &proto::Node,
@@ -1485,40 +1416,6 @@ fn narrow(
         out = graph.split_a(out, outer, end - start, dim - end, inner);
     }
     out
-}
-
-/// `count` elements of `x` along `axis` of its `shape`, every `step`-th from
-/// `start`; a negative step walks backwards. The slices of the axis are rows
-/// of everything inside it, gathered in that order.
-#[allow(clippy::too_many_arguments)]
-fn strided(
-    graph: &mut Graph,
-    node: &proto::Node,
-    x: NodeId,
-    shape: &[usize],
-    axis: usize,
-    start: i64,
-    step: i64,
-    count: usize,
-) -> Result<NodeId, OnnxError> {
-    let outer = shape[..axis].iter().product::<usize>();
-    let dim = shape[axis];
-    let inner = shape[axis + 1..].iter().product::<usize>();
-    let rows = outer.saturating_mul(dim);
-    // Row indices are exact below 2^24.
-    if rows >= 1 << 24 {
-        return Err(OnnxError::UnsupportedOp(format!(
-            "Slice '{}' of {shape:?} in steps of {step} (supported: below 2^24 rows)",
-            node.name
-        )));
-    }
-    let indices: Vec<u32> = (0..outer)
-        .flat_map(|o| (0..count as i64).map(move |j| (o * dim) as i64 + start + j * step))
-        .map(|index| index as u32)
-        .collect();
-    let table = view(graph, x, &[rows, inner])?;
-    let indices = graph.constant_u32(&indices, &[outer * count]);
-    Ok(graph.embedding(indices, table))
 }
 
 /// `x` of `shape` broadcast to `out_shape` by one broadcast; the ranks

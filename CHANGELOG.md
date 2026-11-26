@@ -1,5 +1,22 @@
 # Unreleased
 
+- The ONNX importer reads `Pad`, `Clip`, `Tile` and `GatherElements`, and
+  `TopK` with k up to 512, the operators D-FINE needs beyond those already
+  supported. All lower onto existing kernels:
+  - `Pad` takes the constant, edge, reflect and wrap modes, pads and values
+    as attributes or inputs, and `axes`. Negative padding crops the axis
+    before the rest is padded.
+  - `Clip` takes its bounds as attributes or constant inputs. A missing
+    bound is the largest finite value, so infinite inputs saturate.
+  - `Tile` repeats an axis by broadcasting the block from it inward.
+  - `GatherElements` reads through one gather of computed offsets.
+    Negative indices count from the end; others are clamped into the axis,
+    since the gather has no bounds of its own. Indices are truncated, since
+    integer division of index tensors imports as F32.
+  - `TopK` takes a pass per element, so D-FINE's k = 300 over 24,000 scores
+    builds in about 0.7 s in release and runs some 1,800 dispatches. Its
+    masks now share one column constant instead of building one per pass.
+
 - The ONNX importer reads `Slice` with steps other than one, forward and
   backward, such as the pixel phases of YOLOv5's Focus layer and reversals.
   Bounds clamp as ONNX specifies, including exporters' `INT64_MAX` and
