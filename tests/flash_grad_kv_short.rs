@@ -6,9 +6,12 @@
 
 use std::sync::Arc;
 
-use meganeura::{Graph, Mode, SessionConfig, build, compile::ShaderEntry};
-
-use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
+use meganeura::{
+    Graph, Mode, SessionConfig, build,
+    compile::ShaderEntry,
+    kernels::attention_grad::{AttentionGrad, Operands, Part, Path},
+    runtime::auto_tune,
+};
 
 const COOP_F16: Path = Path::Cooperative(Operands::F16);
 
@@ -89,11 +92,11 @@ fn run(
 #[test]
 fn short_cross_self_and_window_attention_gradients_match_scalar() {
     let gpu = crate::support::gpu::gpu();
-    let has_coop = gpu
-        .capabilities()
-        .cooperative_matrix
-        .f16_f32_shapes
-        .contains(&[16, 16, 16]);
+    // The forward kernel needs 16×16×16 f16 tiles. The gradients also run
+    // on 8×16×16 tiles, the shape Intel's Xe2 devices have.
+    let caps = auto_tune(&gpu, 0).coop_caps;
+    let forward = caps.supports_16x16_f16();
+    let backward = forward || caps.f16_attention_rows != 0;
 
     // Minimum workgroup storage for forward, dQ, dK/dV at each width. The
     // window case covers equal query and key lengths. Wide heads must
@@ -107,8 +110,8 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
         let (scalar, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, false);
         let (cooperative, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, true);
         assert_eq!(scalar_used_coop, [false; 3]);
-        let expected = storage
-            .map(|bytes| has_coop && bytes <= gpu.capabilities().max_compute_shared_memory_size);
+        let fits = storage.map(|bytes| bytes <= gpu.capabilities().max_compute_shared_memory_size);
+        let expected = [forward && fits[0], backward && fits[1], backward && fits[2]];
         assert_eq!(coop_used_coop, expected, "{label}");
         for (i, name) in ["dQ", "dK", "dV"].into_iter().enumerate() {
             crate::support::data::assert_close(
