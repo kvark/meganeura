@@ -311,7 +311,7 @@ pub(crate) fn select_variants(
             let Some((m, n, k)) = dispatch.mnk() else {
                 continue;
             };
-            let max_splits = 1u32 << (k / 128).clamp(1, 16).ilog2();
+            let max_splits = crate::kernels::occupancy::NATIVE_F32_TILED_SPLITS.max_splits(k);
             let groups = |columns: u32| u64::from(m / 64) * u64::from(n / columns);
             let wide = n.is_multiple_of(128) && groups(128) * u64::from(max_splits) >= 512;
             let shape = CooperativeMatmulShape {
@@ -324,10 +324,9 @@ pub(crate) fn select_variants(
             {
                 continue;
             }
-            let splits = 512u64
-                .div_ceil(groups(shape.columns))
-                .next_power_of_two()
-                .min(u64::from(max_splits)) as u32;
+            let output_groups = u32::try_from(groups(shape.columns)).unwrap_or(u32::MAX);
+            let splits =
+                crate::kernels::occupancy::NATIVE_F32_TILED_SPLITS.splits(output_groups, k);
             // Fused, pinned and aliased forms keep their kernel.
             let _ = plan.tile_native_f32_matmul(index, shape, splits, 32 * 1024 * 1024);
         }

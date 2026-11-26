@@ -58,19 +58,6 @@ fn sum_rows_columns(serial_rows: bool) -> u32 {
     if serial_rows { 256 } else { 32 }
 }
 
-/// Target workgroups for a split-K heuristic, scaled by `parallel_width`
-/// (concurrent workgroups from [`crate::tune::MachineProfile`]) when known.
-pub(crate) fn split_target_workgroups(
-    parallel_width: Option<u32>,
-    waves: u32,
-    default: u32,
-) -> u32 {
-    match parallel_width.filter(|&w| w != 0) {
-        Some(width) => width.saturating_mul(waves).clamp(64, 512),
-        None => default,
-    }
-}
-
 /// Validate a K-split partial allocation and its final `SumRows` dispatch
 /// against portable limits and `budget`, returning the partial byte size.
 pub(crate) fn plan_k_split(

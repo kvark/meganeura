@@ -1347,13 +1347,9 @@ fn plan_gathered_k_split(
     remaining_budget: usize,
     parallel_width: Option<u32>,
 ) -> Option<(u32, [u32; 3], u32, usize)> {
-    let low_threshold = compile::split_target_workgroups(parallel_width, 4, 192);
-    let target_groups = compile::split_target_workgroups(parallel_width, 8, 384);
+    let policy = crate::kernels::occupancy::gathered_conv_splits(parallel_width);
     let workgroups = grid[0].saturating_mul(grid[1]).saturating_mul(batch);
-    if workgroups == 0 || workgroups >= low_threshold || stages < 32 {
-        return None;
-    }
-    let chunks = target_groups.div_ceil(workgroups).clamp(2, stages / 8);
+    let chunks = policy.multi_splits(workgroups, stages)?;
     let total_cols = total_cols?;
     let bytes = compile::plan_k_split(total_cols, chunks, chunks <= 16, remaining_budget).ok()?;
     let z = batch.checked_mul(chunks)?;
@@ -1593,7 +1589,7 @@ fn fill_conv_gradient_candidates_with_width(
         };
         if !compile::workgroups_within_portable_limits(grid)
             || grid.into_iter().map(u64::from).product::<u64>()
-                < crate::kernels::conv::MIN_F16_WORKGROUPS
+                < crate::kernels::occupancy::MIN_F16_COOP_WORKGROUPS
         {
             continue;
         }
@@ -1686,9 +1682,7 @@ fn fill_conv_weight_gradients_with_width(
     parallel_width: Option<u32>,
 ) -> usize {
     use compile::ShaderEntry as E;
-    // Partition workgroups aimed for, and the fewest K positions per chunk.
-    let target_workgroups = compile::split_target_workgroups(parallel_width, 4, 192);
-    const MIN_CHUNK: u32 = 128;
+    let policy = crate::kernels::occupancy::conv_weight_search_splits(parallel_width);
     const MAX_PARTIAL_BYTES: usize = 256 << 20;
     let mut count = 0;
     let mut partial_bytes = 0usize;
@@ -1744,11 +1738,7 @@ fn fill_conv_weight_gradients_with_width(
         let partitions = if params.vectorized_forward() {
             // Per-image products, each split into chunks of its positions.
             let k = params.out_h.saturating_mul(params.out_w);
-            batch.saturating_mul(
-                target_workgroups
-                    .div_ceil(tiles.saturating_mul(batch))
-                    .clamp(1, (k / MIN_CHUNK).max(1)),
-            )
+            batch.saturating_mul(policy.splits(tiles.saturating_mul(batch), k))
         } else {
             // One product over the batch's positions: chunks only where the
             // grid alone cannot occupy the device, and at least two when the
@@ -1756,9 +1746,7 @@ fn fill_conv_weight_gradients_with_width(
             let k = batch
                 .saturating_mul(params.out_h)
                 .saturating_mul(params.out_w);
-            let chunks = target_workgroups
-                .div_ceil(tiles)
-                .clamp(1, (k / MIN_CHUNK).max(1));
+            let chunks = policy.splits(tiles, k);
             if split { chunks.max(2) } else { chunks }
         };
         let Some(cols) = m.checked_mul(n) else {
@@ -1884,9 +1872,7 @@ fn split_long_weight_gradients(
     replace_extracted: bool,
     parallel_width: Option<u32>,
 ) -> usize {
-    // Workgroups aimed for, and the fewest K positions per partition.
-    let target_workgroups = compile::split_target_workgroups(parallel_width, 3, 144);
-    const MIN_CHUNK: u32 = 256;
+    let policy = crate::kernels::occupancy::long_gradient_splits(parallel_width);
     let mut budget: usize = 64 << 20;
     let mut count = 0;
     for index in (0..plan.dispatches.len()).rev() {
@@ -1912,11 +1898,10 @@ fn split_long_weight_gradients(
         {
             continue;
         }
-        let tiles = m.div_ceil(64) * n.div_ceil(64);
-        let splits = target_workgroups.div_ceil(tiles).min(k / MIN_CHUNK);
-        if splits < 2 {
+        let tiles = m.div_ceil(64).saturating_mul(n.div_ceil(64));
+        let Some(splits) = policy.multi_splits(tiles, k) else {
             continue;
-        }
+        };
         let shape = crate::codegen::ScalarMatmulShape {
             tile_size: 32,
             tile_n: 0,

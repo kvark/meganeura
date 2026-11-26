@@ -177,17 +177,7 @@ impl<'a> Compiler<'a> {
     /// groups still leaves those lanes on a long chain and the GPU idle.
     /// Short or wide reductions stay one slice so their rounding is unchanged.
     pub(super) fn row_reduction_splits(rows: u32, cols: u32) -> u32 {
-        let groups = cols.div_ceil(32).max(1);
-        let trip = rows.div_ceil(8);
-        if trip <= 64 || groups >= 128 {
-            return 1;
-        }
-        // About 256 workgroups, each slice at least 8 rows a lane. Whisper's
-        // bias gradients (1500 × 384) took 7.0 µs on 6 slices of 32 rows a
-        // lane, 4.8 on 22 (RTX 5070, profiled); 12544 × 64 6.9 → 5.1.
-        let want = 256u32.div_ceil(groups);
-        let cap = trip.div_ceil(8).clamp(2, 256);
-        want.clamp(2, cap)
+        crate::kernels::occupancy::row_reduction_splits(rows, cols)
     }
 
     pub(super) fn push_sum_rows(&mut self, rows: u32, cols: u32, src: BufferRef, dst: BufferRef) {

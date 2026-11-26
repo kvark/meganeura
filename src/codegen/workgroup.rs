@@ -1644,7 +1644,7 @@ pub(crate) fn conv_tile(
 /// The subgroup tile of a generated convolution on `subgroup`-wide subgroups.
 /// Larger tiles load each operand element for more products, so the largest
 /// tile that still launches
-/// [`MIN_F16_WORKGROUPS`](crate::kernels::conv::MIN_F16_WORKGROUPS)
+/// [`MIN_F16_COOP_WORKGROUPS`](crate::kernels::occupancy::MIN_F16_COOP_WORKGROUPS)
 /// workgroups runs.
 pub(crate) fn conv_tile_for(
     product: ConvProduct,
@@ -1690,19 +1690,16 @@ pub(crate) fn conv_product_tile_for(
     layers: u32,
     subgroup: u32,
 ) -> WorkgroupMatmulShape {
-    CONV_TILES
-        .into_iter()
-        .map(|dims| conv_shape(dims, subgroup))
-        .find(|s| {
-            // A tile past the product's extent only multiplies zeros.
-            s.rows <= m
-                && s.columns <= n
-                && u64::from(m.div_ceil(s.rows))
-                    * u64::from(n.div_ceil(s.columns))
-                    * u64::from(layers)
-                    >= crate::kernels::conv::MIN_F16_WORKGROUPS
-        })
-        .unwrap_or_else(|| conv_shape(CONV_TILES[2], subgroup))
+    let dims = crate::kernels::occupancy::widest_occupied_tile(
+        &CONV_TILES,
+        |dims| dims,
+        m,
+        n,
+        layers,
+        crate::kernels::occupancy::MIN_F16_COOP_WORKGROUPS,
+        true,
+    );
+    conv_shape(dims, subgroup)
 }
 
 /// How a subgroup-tiled kernel binds its operands.

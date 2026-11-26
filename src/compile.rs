@@ -10,7 +10,7 @@ mod params;
 mod softplus;
 mod split_k;
 pub use lower::CoopPolicy;
-pub(crate) use split_k::{plan_k_split, split_target_workgroups};
+pub(crate) use split_k::plan_k_split;
 pub(crate) mod stages;
 pub(crate) use params::{
     AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams, WinogradInputParams,
