@@ -12,8 +12,15 @@
 //! convolutions are separate computations with their own kernels.
 
 use super::{Family, Rejection, occupancy};
-use crate::codegen::{CoopConfig, ScalarMatmulShape, ShaderGroup};
-use crate::compile::{Dispatch, Kernel};
+use crate::codegen::{
+    CoopConfig, CooperativeMatmulShape, MatMulOptions, MatMulTile, MatmulKnobs, MatrixTypes,
+    ScalarMatmulShape, ShaderGroup, ShaderModule, TypedMatmulLayout, WorkgroupMatmulShape,
+};
+use crate::compile::{
+    BufferRef, Dispatch, EpilogueLoadKind, Kernel, MatMulEpilogue, MatMulPrologue,
+    PrologueLoadKind, ShaderEntry, WeightFormat,
+};
+use crate::schedule::PointwiseDAG;
 use serde::{Deserialize, Serialize};
 
 /// K partitions for a checked typed product: fill a small 32×32 output grid
@@ -37,7 +44,7 @@ pub(crate) fn scalar_partitions(m: u32, n: u32, k: u32) -> Option<u32> {
 }
 
 /// Which product a dispatch computes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Layout {
     /// `A·B`.
     Plain,
@@ -54,6 +61,40 @@ pub(crate) enum Layout {
 }
 
 impl Layout {
+    pub(crate) fn from_entry(entry: &ShaderEntry) -> Option<Self> {
+        Some(match *entry {
+            ShaderEntry::MatMul => Self::Plain,
+            ShaderEntry::FusedMatMulAdd => Self::PlainAdd,
+            ShaderEntry::MatMulAT => Self::TransposedA,
+            ShaderEntry::FusedMatMulATAdd => Self::TransposedAAdd,
+            ShaderEntry::MatMulBT => Self::TransposedB,
+            ShaderEntry::FusedMatMulBTAdd => Self::TransposedBAdd,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn entry_ref(self) -> &'static ShaderEntry {
+        match self {
+            Self::Plain => &ShaderEntry::MatMul,
+            Self::PlainAdd => &ShaderEntry::FusedMatMulAdd,
+            Self::TransposedA => &ShaderEntry::MatMulAT,
+            Self::TransposedAAdd => &ShaderEntry::FusedMatMulATAdd,
+            Self::TransposedB => &ShaderEntry::MatMulBT,
+            Self::TransposedBAdd => &ShaderEntry::FusedMatMulBTAdd,
+        }
+    }
+
+    pub(crate) fn group(self) -> ShaderGroup {
+        match self {
+            Self::Plain => ShaderGroup::MatMul,
+            Self::PlainAdd => ShaderGroup::MatMulAdd,
+            Self::TransposedA => ShaderGroup::MatMulAT,
+            Self::TransposedAAdd => ShaderGroup::MatMulATAdd,
+            Self::TransposedB => ShaderGroup::MatMulBT,
+            Self::TransposedBAdd => ShaderGroup::MatMulBTAdd,
+        }
+    }
+
     pub(crate) fn of(group: ShaderGroup) -> Option<Self> {
         Some(match group {
             ShaderGroup::MatMul => Self::Plain,
@@ -77,6 +118,684 @@ impl Layout {
     fn transposed_with_addend(self) -> bool {
         matches!(self, Self::TransposedAAdd | Self::TransposedBAdd)
     }
+
+    /// Encode `(m, n, k)` into the `Dispatch::params` order expected by this
+    /// layout's shader entry (`[m, k, n, 0]` for plain, `[m, n, k, 0]` for
+    /// transposed A/B).
+    pub(crate) fn params_words(self, m: u32, n: u32, k: u32) -> Vec<u32> {
+        match self {
+            Self::Plain | Self::PlainAdd => vec![m, k, n, 0],
+            Self::TransposedA | Self::TransposedAAdd | Self::TransposedB | Self::TransposedBAdd => {
+                vec![m, n, k, 0]
+            }
+        }
+    }
+}
+
+/// What a dense matrix product computes.
+///
+/// Single decoder for the six dense matmul entries (`MatMul`, `MatMulAT`,
+/// `MatMulBT`, and their `Fused*Add` forms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Product {
+    pub layout: Layout,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    /// Storage format of B (`WeightFormat::F32` when explicit `types` govern storage).
+    pub weights: WeightFormat,
+    /// Explicit operand, multiplication and output types when fixed by a typed
+    /// or workgroup cooperative kernel.
+    pub types: Option<MatrixTypes>,
+}
+
+/// How a dense matrix product runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Variant {
+    /// Compiled 64×64 scalar tiled kernel (uses session `MatmulKnobs`).
+    DefaultScalar,
+    /// Demoted 32×32 scalar tiled kernel (uses session `MatmulKnobs`).
+    SmallScalar,
+    /// Measured/specialized scalar tile shape (overrides `MatmulKnobs`).
+    Scalar(ScalarMatmulShape),
+    /// K-partitioned scalar tile shape (`k_partitions >= 2`).
+    SplitScalar(ScalarMatmulShape),
+    /// Device-configured cooperative matmul (`Kernel::Cooperative`).
+    Cooperative(CoopConfig),
+    /// Shared-tile native-f32 16×16 cooperative matmul.
+    CooperativeTiled(CooperativeMatmulShape),
+    /// Checked typed cooperative matmul.
+    CooperativeTyped { specialize: bool },
+    /// Workgroup/subgroup-tiled cooperative matmul.
+    CooperativeWorkgroup(WorkgroupMatmulShape),
+}
+
+/// Launch geometry and uniform words for one dense product dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Launch {
+    pub workgroups: [u32; 3],
+    /// `[m, n, k, _pad]` bound as `MatMulParams`.
+    pub params: [u32; 4],
+}
+
+impl Variant {
+    /// Decode `(Variant, k_partitions)` from a dense product's [`Kernel`].
+    pub(crate) fn from_kernel(
+        kernel: &Kernel,
+        coop_config: Option<&CoopConfig>,
+    ) -> Option<(Self, u32)> {
+        Some(match *kernel {
+            Kernel::Default => (Self::DefaultScalar, 1),
+            Kernel::SmallTile => (Self::SmallScalar, 1),
+            Kernel::ScalarMatmul(shape) => (Self::Scalar(shape), 1),
+            Kernel::SplitMatmul { shape, splits } => (Self::SplitScalar(shape), splits),
+            Kernel::Cooperative => (Self::Cooperative(*coop_config?), 1),
+            Kernel::CooperativeTiled { shape, splits } => (Self::CooperativeTiled(shape), splits),
+            Kernel::CooperativeTyped {
+                splits, specialize, ..
+            } => (Self::CooperativeTyped { specialize }, splits),
+            Kernel::CooperativeWorkgroup { shape, splits, .. } => {
+                (Self::CooperativeWorkgroup(shape), splits)
+            }
+            _ => return None,
+        })
+    }
+}
+
+impl Product {
+    /// Decode the dense product carried by `dispatch`, if its shader entry is
+    /// one of the six dense matmul forms and its dimensions are present.
+    pub(crate) fn of(dispatch: &Dispatch) -> Option<Self> {
+        let layout = Layout::from_entry(&dispatch.shader)?;
+        let p = &dispatch.params;
+        let (a, b, c) = (p.first().copied()?, p.get(1).copied()?, p.get(2).copied()?);
+        let (m, n, k) = match layout {
+            Layout::Plain | Layout::PlainAdd => (a, c, b),
+            Layout::TransposedA
+            | Layout::TransposedAAdd
+            | Layout::TransposedB
+            | Layout::TransposedBAdd => (a, b, c),
+        };
+        let types = match dispatch.kernel {
+            Kernel::CooperativeTyped { types, .. } => Some(types),
+            Kernel::CooperativeWorkgroup { types, .. } => types,
+            _ => None,
+        };
+        Some(Self {
+            layout,
+            m,
+            n,
+            k,
+            weights: dispatch.weight_format,
+            types,
+        })
+    }
+
+    /// Compute the launch workgroup grid and uniform words for `variant` with
+    /// `k_partitions` K slices (1 for unsplit products).
+    pub(crate) fn launch(self, variant: Variant, k_partitions: u32) -> Launch {
+        let workgroups = match variant {
+            Variant::DefaultScalar => crate::compile::matmul_workgroups(self.m, self.n, 64),
+            Variant::SmallScalar => crate::compile::matmul_workgroups(self.m, self.n, 32),
+            Variant::Scalar(shape) => {
+                crate::compile::matmul_workgroups_rect(self.m, self.n, shape.rows(), shape.cols())
+            }
+            Variant::SplitScalar(shape) => [
+                self.n.div_ceil(shape.cols()),
+                self.m.div_ceil(shape.rows()),
+                k_partitions,
+            ],
+            Variant::Cooperative(config) => {
+                let tile = config.matmul_output_tile();
+                [self.m.div_ceil(tile), self.n.div_ceil(tile), 1]
+            }
+            Variant::CooperativeTiled(shape) => [
+                self.m / CooperativeMatmulShape::ROWS,
+                self.n / shape.columns,
+                k_partitions,
+            ],
+            Variant::CooperativeTyped { .. } => {
+                [self.m.div_ceil(32), self.n.div_ceil(32), k_partitions]
+            }
+            Variant::CooperativeWorkgroup(shape) => [
+                self.m.div_ceil(shape.rows),
+                self.n / shape.columns,
+                k_partitions,
+            ],
+        };
+        let pad = match variant {
+            Variant::CooperativeTyped { .. } | Variant::CooperativeWorkgroup(_) => k_partitions,
+            _ => workgroups[1],
+        };
+        Launch {
+            workgroups,
+            params: [self.m, self.n, self.k, pad],
+        }
+    }
+
+    /// Uniform `[m, n, k, _pad]` words for a dispatch whose workgroups are
+    /// already installed.
+    pub(crate) fn uniform_params(self, kernel: &Kernel, workgroups: [u32; 3]) -> [u32; 4] {
+        let pad = match *kernel {
+            Kernel::CooperativeTyped { splits, .. }
+            | Kernel::CooperativeWorkgroup { splits, .. } => splits,
+            _ => workgroups[1],
+        };
+        [self.m, self.n, self.k, pad]
+    }
+}
+
+/// Epilogue description without buffer handles: everything that affects WGSL.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct EpilogueCode {
+    pub dag: PointwiseDAG,
+    pub input_kinds: Vec<EpilogueLoadKind>,
+}
+
+impl EpilogueCode {
+    fn from_compile(epi: &MatMulEpilogue) -> Self {
+        Self {
+            dag: epi.dag.clone(),
+            input_kinds: epi.inputs.iter().map(|entry| entry.1.clone()).collect(),
+        }
+    }
+
+    fn to_compile(&self) -> MatMulEpilogue {
+        MatMulEpilogue {
+            dag: self.dag.clone(),
+            inputs: self
+                .input_kinds
+                .iter()
+                .map(|kind| (BufferRef(0), kind.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// Implementation-specific fields that determine a dense product's WGSL.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CodeImpl {
+    DefaultScalar,
+    SmallScalar,
+    Scalar(ScalarMatmulShape),
+    SplitScalar {
+        shape: ScalarMatmulShape,
+        splits: u32,
+    },
+    Cooperative,
+    CooperativeTiled {
+        shape: CooperativeMatmulShape,
+        splits: u32,
+    },
+    CooperativeTyped {
+        types: MatrixTypes,
+        staging: TypedMatmulLayout,
+    },
+    CooperativeWorkgroup {
+        shape: WorkgroupMatmulShape,
+        types: MatrixTypes,
+        row_bounds: bool,
+    },
+}
+
+/// Everything that determines a dense matrix product's compiled pipeline.
+///
+/// `Code` is both the pipeline-map key and the sole per-dispatch input to
+/// [`module`]. Code generation receives no `&Dispatch`, so a field cannot
+/// influence the generated shader without belonging to the key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Code {
+    pub layout: Layout,
+    pub weights: WeightFormat,
+    pub implementation: CodeImpl,
+    pub epilogue: Option<EpilogueCode>,
+    pub prologue: Vec<PrologueLoadKind>,
+}
+
+/// Device and session context needed to lower a [`Code`] into WGSL.
+pub(crate) struct CodeTarget<'a> {
+    pub capabilities: &'a blade_graphics::Capabilities,
+    pub knobs: MatmulKnobs,
+    pub cooperative: Option<CoopConfig>,
+}
+
+/// The cooperative M×N×K shapes a device lists for `multiply` operands with an
+/// F32 accumulator.
+pub(crate) fn cooperative_shapes(
+    capabilities: &blade_graphics::CooperativeMatrix,
+    multiply: crate::DType,
+) -> &[[u32; 3]] {
+    match multiply {
+        crate::DType::BF16 => &capabilities.bf16_f32_shapes,
+        crate::DType::F16 => &capabilities.f16_f32_shapes,
+        crate::DType::F32 => &capabilities.f32_shapes,
+        _ => &[],
+    }
+}
+
+pub(crate) fn checked_matrix_unsupported(multiply: crate::DType) -> String {
+    format!(
+        "{multiply:?} matrix products require native 16x16x16, 8x16x16 or 8x8x8 {multiply:?}/F32 cooperative matrices"
+    )
+}
+
+/// Shared workgroup-cooperative tile resolution used by [`module`].
+pub(crate) fn workgroup_shape_and_subgroup(
+    shape: WorkgroupMatmulShape,
+    types: MatrixTypes,
+    caps: &blade_graphics::Capabilities,
+) -> Option<([u32; 3], u32)> {
+    if shape.subgroup_rows != 0 {
+        crate::codegen::native_subgroup_shape(caps, types.multiply)
+    } else {
+        Some(([16, 16, 16], 32))
+    }
+}
+
+pub(crate) fn tiled_coop_shared_bytes_for(
+    prologue: &[PrologueLoadKind],
+    shape: CooperativeMatmulShape,
+) -> u64 {
+    let row_factors = prologue
+        .iter()
+        .filter(|kind| **kind == PrologueLoadKind::PerRow)
+        .count();
+    u64::from(shape.shared_bytes()) + row_factors as u64 * 64 * 4
+}
+
+impl Code {
+    /// Project a dense product `dispatch` onto its pipeline key, or `None` if
+    /// `dispatch` is not one of the six dense matmul entries (or is a
+    /// horizontal multi-weight pack).
+    pub(crate) fn from_dispatch(
+        dispatch: &Dispatch,
+        caps: &blade_graphics::Capabilities,
+    ) -> Option<Self> {
+        let layout = Layout::from_entry(&dispatch.shader)?;
+        if dispatch.horizontal_batch >= 2 {
+            return None;
+        }
+        let dims = dispatch.product().map(|p| [p.m, p.n, p.k]);
+        let epilogue = dispatch
+            .matmul_epilogue
+            .as_ref()
+            .map(EpilogueCode::from_compile);
+        let prologue = || -> Vec<PrologueLoadKind> {
+            dispatch
+                .matmul_prologue
+                .as_ref()
+                .map(|p| p.factors.iter().map(|entry| entry.1.clone()).collect())
+                .unwrap_or_default()
+        };
+        let (implementation, weights, epilogue, prologue) = match dispatch.kernel {
+            Kernel::CooperativeWorkgroup { shape, types, .. } => {
+                let types = types.unwrap_or(MatrixTypes::F32_AS_F16);
+                let row_bounds = dims.is_some_and(|[m, _, _]| shape.ragged_rows(m));
+                (
+                    CodeImpl::CooperativeWorkgroup {
+                        shape,
+                        types,
+                        row_bounds,
+                    },
+                    WeightFormat::F32,
+                    epilogue,
+                    Vec::new(),
+                )
+            }
+            Kernel::CooperativeTyped {
+                types, specialize, ..
+            } => {
+                let raw_layout = match dims {
+                    Some(dims) => TypedMatmulLayout {
+                        dimensions: specialize.then_some(dims),
+                        ..TypedMatmulLayout::for_product(types, layout.has_addend(), dims)
+                    },
+                    None => TypedMatmulLayout::default(),
+                };
+                // The stored kernel does not read direct_inputs. Normalize it
+                // before any pipeline lookup, including tuning reuse.
+                let stored = crate::codegen::checked_cooperative_shape(cooperative_shapes(
+                    &caps.cooperative_matrix,
+                    types.multiply,
+                ))
+                .is_some_and(|shape| raw_layout.uses_stored_kernel(shape));
+                let staging = TypedMatmulLayout {
+                    direct_inputs: raw_layout.direct_inputs && !stored,
+                    ..raw_layout
+                };
+                (
+                    CodeImpl::CooperativeTyped { types, staging },
+                    WeightFormat::F32,
+                    None,
+                    Vec::new(),
+                )
+            }
+            Kernel::CooperativeTiled { shape, splits } => (
+                CodeImpl::CooperativeTiled { shape, splits },
+                WeightFormat::F32,
+                None,
+                prologue(),
+            ),
+            Kernel::SplitMatmul { shape, splits } => (
+                CodeImpl::SplitScalar { shape, splits },
+                dispatch.weight_format,
+                None,
+                Vec::new(),
+            ),
+            Kernel::Cooperative if !dispatch.weight_format.is_quantized() => (
+                CodeImpl::Cooperative,
+                dispatch.weight_format,
+                epilogue,
+                prologue(),
+            ),
+            Kernel::ScalarMatmul(shape) => (
+                CodeImpl::Scalar(shape),
+                dispatch.weight_format,
+                epilogue,
+                Vec::new(),
+            ),
+            Kernel::SmallTile => (
+                CodeImpl::SmallScalar,
+                dispatch.weight_format,
+                epilogue,
+                Vec::new(),
+            ),
+            _ => (
+                CodeImpl::DefaultScalar,
+                dispatch.weight_format,
+                epilogue,
+                Vec::new(),
+            ),
+        };
+        Some(Self {
+            layout,
+            weights,
+            implementation,
+            epilogue,
+            prologue,
+        })
+    }
+
+    /// Name used by the profiler and by pipeline-statistics dumps.
+    pub(crate) fn label(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let e = self.layout.entry_ref();
+        match self.implementation {
+            CodeImpl::CooperativeWorkgroup {
+                shape,
+                types,
+                row_bounds,
+            } => {
+                let suffix = if row_bounds { "-row-bounds" } else { "" };
+                let epi = if self.epilogue.is_some() {
+                    "-epilogue"
+                } else {
+                    ""
+                };
+                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}{epi}")
+            }
+            CodeImpl::CooperativeTyped { types, staging } => {
+                let multiply = MatrixTypes::name(types.multiply);
+                let operands = if types.a == types.multiply && types.b == types.multiply {
+                    multiply.to_owned()
+                } else {
+                    let (a, b) = (MatrixTypes::name(types.a), MatrixTypes::name(types.b));
+                    format!("{a}-{b}-as-{multiply}")
+                };
+                let output = MatrixTypes::name(types.output);
+                format!("{e:?}:cooperative-{operands}-{output}-output:{staging:?}")
+            }
+            CodeImpl::CooperativeTiled { shape, splits } => {
+                format!(
+                    "{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{:?}",
+                    self.prologue
+                )
+            }
+            CodeImpl::SplitScalar { shape, splits } => {
+                format!("{e:?}:split-k-{:?}-{splits}-{shape:?}", self.weights)
+            }
+            CodeImpl::Cooperative => {
+                if self.epilogue.is_some() {
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    self.hash(&mut hasher);
+                    format!("{e:?}:cooperative-epilogue:{:016x}", hasher.finish())
+                } else if !self.prologue.is_empty() {
+                    if self.weights == WeightFormat::F32 {
+                        format!("{e:?}:cooperative-prologue:{:?}", self.prologue)
+                    } else {
+                        format!(
+                            "{e:?}:cooperative-prologue-{:?}-weights:{:?}",
+                            self.weights, self.prologue
+                        )
+                    }
+                } else if self.weights == WeightFormat::F32 {
+                    format!("{e:?}:cooperative")
+                } else {
+                    format!("{e:?}:cooperative-{:?}-weights", self.weights)
+                }
+            }
+            CodeImpl::Scalar(shape) => {
+                if self.epilogue.is_some() {
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    self.hash(&mut hasher);
+                    format!("{e:?}:scalar-epilogue:{:016x}", hasher.finish())
+                } else {
+                    format!("{e:?}:scalar-{:?}-{shape:?}", self.weights)
+                }
+            }
+            CodeImpl::SmallScalar => {
+                if self.epilogue.is_some() {
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    self.hash(&mut hasher);
+                    format!("{e:?}:scalar-epilogue:{:016x}", hasher.finish())
+                } else if self.weights.uses_reduced_storage() {
+                    format!("{e:?}:weight-{:?}-small-tile", self.weights)
+                } else {
+                    format!("{e:?}:small-tile")
+                }
+            }
+            CodeImpl::DefaultScalar => {
+                if self.epilogue.is_some() {
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    self.hash(&mut hasher);
+                    format!("{e:?}:scalar-epilogue:{:016x}", hasher.finish())
+                } else if self.weights.uses_reduced_storage() {
+                    format!("{e:?}:weight-{:?}", self.weights)
+                } else {
+                    format!("{e:?}:scalar")
+                }
+            }
+        }
+    }
+}
+
+/// Check per-dispatch dimension legality that is not encoded in [`Code`]
+/// (because valid shapes share one pipeline across compatible dimensions).
+pub(crate) fn validate_dispatch(
+    dispatch: &Dispatch,
+    code: &Code,
+    caps: &blade_graphics::Capabilities,
+) -> Result<(), String> {
+    match code.implementation {
+        CodeImpl::CooperativeWorkgroup { shape, types, .. }
+            if !dispatch.product().is_some_and(|p| {
+                shape.supports_layout(caps, types, Some(code.layout.group()), p.m, p.n, p.k)
+            }) =>
+        {
+            return Err("unsupported workgroup cooperative product".to_owned());
+        }
+        CodeImpl::CooperativeTiled { shape, .. }
+            if !dispatch
+                .product()
+                .is_some_and(|p| shape.fits_dimensions(p.m, p.n, p.k)) =>
+        {
+            return Err("tiled cooperative matmul requires complete aligned tiles".to_owned());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Sole codegen entry point for dense matrix products.
+///
+/// Takes only [`Code`] and [`CodeTarget`] — never `&Dispatch` — so the
+/// pipeline key is guaranteed to determine the generated WGSL, layout, and
+/// entry point.
+pub(crate) fn module(
+    code: &Code,
+    target: &CodeTarget<'_>,
+) -> Result<(ShaderModule, blade_graphics::ShaderDataLayout, &'static str), String> {
+    let group = code.layout.group();
+    let entry = code.layout.entry_ref();
+    let entry_point = entry.entry_point();
+    let layout = if !code.prologue.is_empty() {
+        crate::runtime::matmul_with_prologue_layout(code.prologue.len())
+    } else {
+        crate::runtime::shader_data_layout(entry)
+    };
+    let epi = code.epilogue.as_ref().map(EpilogueCode::to_compile);
+    let pro = (!code.prologue.is_empty()).then(|| MatMulPrologue {
+        factors: code
+            .prologue
+            .iter()
+            .map(|kind| (BufferRef(0), kind.clone()))
+            .collect(),
+    });
+    let cooperative = || {
+        target
+            .cooperative
+            .expect("cooperative dispatch needs a qualified device configuration")
+    };
+    let shader_module = match code.implementation {
+        CodeImpl::DefaultScalar => crate::codegen::generate_matmul_with_epilogue(
+            group,
+            epi.as_ref(),
+            MatMulOptions {
+                format: code.weights,
+                tile: MatMulTile::Large,
+                knobs: target.knobs,
+            },
+        ),
+        CodeImpl::SmallScalar => {
+            let tile = if epi.is_none() && code.layout.transposed_with_addend() {
+                MatMulTile::Large
+            } else {
+                MatMulTile::Small
+            };
+            crate::codegen::generate_matmul_with_epilogue(
+                group,
+                epi.as_ref(),
+                MatMulOptions {
+                    format: code.weights,
+                    tile,
+                    knobs: target.knobs,
+                },
+            )
+        }
+        CodeImpl::Scalar(shape) => {
+            let limit = target.capabilities.max_compute_shared_memory_size;
+            if limit != 0 && shape.shared_bytes() > limit {
+                return Err(format!(
+                    "scalar tile requires {} shared bytes, device limit is {limit}",
+                    shape.shared_bytes()
+                ));
+            }
+            let knobs = MatmulKnobs {
+                k_stage: shape.k_stage,
+                interleave_columns: shape.interleave_columns,
+                unroll_k: shape.unroll_k,
+                vector_fragments: shape.vector_fragments,
+                ..target.knobs
+            };
+            crate::codegen::generate_matmul_with_epilogue(
+                group,
+                epi.as_ref(),
+                MatMulOptions {
+                    format: code.weights,
+                    tile: shape.geometry(),
+                    knobs,
+                },
+            )
+        }
+        CodeImpl::SplitScalar { shape, splits } => {
+            crate::codegen::generate_split_matmul(group, shape, splits, code.weights, target.knobs)
+        }
+        CodeImpl::Cooperative => {
+            let config = cooperative();
+            if let Some(ref epi) = epi {
+                crate::codegen::generate_coop_matmul_with_dag_epilogue(
+                    group,
+                    &config,
+                    epi,
+                    code.weights,
+                )
+            } else if let Some(ref pro) = pro {
+                let (add, variant) =
+                    crate::codegen::coop_shape(group).expect("cooperative matrix group");
+                crate::codegen::gen_matmul_coop_with_prologue(
+                    add,
+                    variant,
+                    &config,
+                    pro,
+                    code.weights,
+                )
+            } else {
+                crate::codegen::generate_module_coop_weighted(group, &config, code.weights)
+            }
+        }
+        CodeImpl::CooperativeTiled { shape, splits } => {
+            let config = cooperative();
+            if config.tile_size != 16 || config.use_f16_input {
+                return Err("tiled cooperative matmul requires native 16x16 f32".to_owned());
+            }
+            let shared_limit = target.capabilities.max_compute_shared_memory_size;
+            if shared_limit != 0
+                && tiled_coop_shared_bytes_for(&code.prologue, shape) > u64::from(shared_limit)
+            {
+                return Err("tiled cooperative matmul exceeds device shared memory".to_owned());
+            }
+            crate::codegen::generate_tiled_coop_matmul(group, shape, splits, pro.as_ref())
+        }
+        CodeImpl::CooperativeTyped { types, staging } => {
+            let native = crate::codegen::checked_cooperative_shape(cooperative_shapes(
+                &target.capabilities.cooperative_matrix,
+                types.multiply,
+            ))
+            .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
+            crate::codegen::generate_module_coop_typed_with_subgroup(
+                group,
+                types,
+                native,
+                staging,
+                target.capabilities.subgroup_size,
+            )
+        }
+        CodeImpl::CooperativeWorkgroup {
+            shape,
+            types,
+            row_bounds,
+        } => {
+            if !epi
+                .as_ref()
+                .is_none_or(|e| shape.subgroup_rows != 0 && e.inputs.is_empty())
+            {
+                return Err("unsupported epilogue on workgroup cooperative product".to_owned());
+            }
+            let (native, subgroup) =
+                workgroup_shape_and_subgroup(shape, types, target.capabilities)
+                    .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
+            crate::codegen::generate_workgroup_matmul_for_device(
+                group,
+                shape,
+                types,
+                native,
+                subgroup,
+                row_bounds,
+                epi.as_ref(),
+            )
+        }
+    };
+    Ok((shader_module, layout, entry_point))
 }
 
 /// One dispatch's product.
@@ -120,22 +839,14 @@ impl Problem {
 
     /// The product `dispatch` computes, if it is a dense one.
     pub(crate) fn of(dispatch: &Dispatch) -> Option<Self> {
-        let layout = Layout::of(dispatch.shader.shader_group())?;
-        let p = &dispatch.params;
-        let (m, n, k) = match layout {
-            Layout::Plain | Layout::PlainAdd => (p[0], p[2], p[1]),
-            Layout::TransposedA
-            | Layout::TransposedAAdd
-            | Layout::TransposedB
-            | Layout::TransposedBAdd => (p[0], p[1], p[2]),
-        };
+        let product = dispatch.product()?;
         Some(Self {
-            layout,
-            m,
-            n,
-            k,
-            reduced_storage: dispatch.weight_format.uses_reduced_storage(),
-            f16_weights: dispatch.weight_format == crate::compile::WeightFormat::F16,
+            layout: product.layout,
+            m: product.m,
+            n: product.n,
+            k: product.k,
+            reduced_storage: product.weights.uses_reduced_storage(),
+            f16_weights: product.weights == WeightFormat::F16,
             requires_full_precision: dispatch.full_precision(),
             epilogue_inputs: dispatch
                 .matmul_epilogue
@@ -342,11 +1053,6 @@ pub(crate) fn cooperative_geometry(
             pad_addend: problem.layout.has_addend() && !checked_addend,
         })
     }
-}
-
-/// Scalar tiled workgroups: columns of output tiles on X, rows on Y.
-pub(crate) fn tiled_workgroups(problem: &Problem, tile: u32) -> [u32; 3] {
-    [problem.n.div_ceil(tile), problem.m.div_ceil(tile), 1]
 }
 
 /// Workgroups of [`WIDE_TILE`]: columns on X, rows on Y.
@@ -605,5 +1311,69 @@ mod tests {
         let geometry = cooperative_geometry(&add, &F32).unwrap();
         assert_eq!(geometry.grid, [4, 2, 1]);
         assert_eq!(geometry.output_bytes, 128 * 64 * 4);
+    }
+
+    #[test]
+    fn product_decode_launch_and_code_agree_across_layouts() {
+        for layout in [
+            Layout::Plain,
+            Layout::PlainAdd,
+            Layout::TransposedA,
+            Layout::TransposedAAdd,
+            Layout::TransposedB,
+            Layout::TransposedBAdd,
+        ] {
+            let (m, n, k) = (96, 128, 256);
+            let dispatch = Dispatch {
+                shader: layout.entry_ref().clone(),
+                params: layout.params_words(m, n, k),
+                ..Default::default()
+            };
+            let decoded = dispatch.product().expect("dense product");
+            assert_eq!(
+                (decoded.layout, decoded.m, decoded.n, decoded.k),
+                (layout, m, n, k)
+            );
+            assert_eq!(dispatch.mnk(), Some((m, n, k)));
+
+            let default_launch = decoded.launch(Variant::DefaultScalar, 1);
+            assert_eq!(default_launch.workgroups, [2, 2, 1]);
+            assert_eq!(default_launch.params, [m, n, k, 2]);
+            assert_eq!(
+                decoded.uniform_params(&Kernel::Default, default_launch.workgroups),
+                default_launch.params
+            );
+
+            let typed_launch = decoded.launch(Variant::CooperativeTyped { specialize: false }, 4);
+            assert_eq!(typed_launch.workgroups, [3, 4, 4]);
+            assert_eq!(typed_launch.params, [m, n, k, 4]);
+            assert_eq!(
+                decoded.uniform_params(
+                    &Kernel::CooperativeTyped {
+                        types: MatrixTypes::F32_AS_F16,
+                        splits: 4,
+                        specialize: false,
+                    },
+                    typed_launch.workgroups
+                ),
+                typed_launch.params
+            );
+
+            let caps = blade_graphics::Capabilities::default();
+            let code = Code::from_dispatch(&dispatch, &caps).expect("dense product code");
+            assert_eq!(code.layout, layout);
+            assert_eq!(code.implementation, CodeImpl::DefaultScalar);
+            let (shader, _, entry_point) = module(
+                &code,
+                &CodeTarget {
+                    capabilities: &caps,
+                    knobs: MatmulKnobs::default(),
+                    cooperative: None,
+                },
+            )
+            .expect("default scalar module");
+            assert!(!shader.source.is_empty());
+            assert_eq!(entry_point, layout.entry_ref().entry_point());
+        }
     }
 }

@@ -178,17 +178,24 @@ pub(crate) fn apply_attention_precision(plan: &mut ExecutionPlan, coop: CoopPoli
 pub(crate) fn reset_workgroup_matmuls(plan: &mut ExecutionPlan) {
     for dispatch in &mut plan.dispatches {
         if let Kernel::CooperativeWorkgroup { types, splits, .. } = dispatch.kernel {
-            let (m, n, _) = dispatch.mnk().expect("workgroup product dimensions");
+            let product = dispatch.product().expect("workgroup product dimensions");
             if let Some(types) = types {
                 dispatch.kernel = Kernel::CooperativeTyped {
                     types,
                     splits,
                     specialize: false,
                 };
-                dispatch.workgroups = [m.div_ceil(32), n.div_ceil(32), splits];
+                dispatch.workgroups = product
+                    .launch(
+                        crate::kernels::matmul::Variant::CooperativeTyped { specialize: false },
+                        splits,
+                    )
+                    .workgroups;
             } else {
                 dispatch.kernel = Kernel::Default;
-                dispatch.workgroups = [n.div_ceil(64), m.div_ceil(64), 1];
+                dispatch.workgroups = product
+                    .launch(crate::kernels::matmul::Variant::DefaultScalar, 1)
+                    .workgroups;
             }
         }
     }
@@ -235,23 +242,28 @@ pub(crate) fn select_workgroup_matmuls(
         {
             continue;
         }
-        if let Some((m, n, k)) = dispatch.mnk() {
+        if let Some(product) = dispatch.product() {
             if shape.supports_layout(
                 caps,
                 types.unwrap_or(MatrixTypes::F32_AS_F16),
-                Some(dispatch.shader.shader_group()),
-                m,
-                n,
-                k,
+                Some(product.layout.group()),
+                product.m,
+                product.n,
+                product.k,
             ) && splits > 0
-                && splits <= shape.k_blocks(k)
+                && splits <= shape.k_blocks(product.k)
             {
                 dispatch.kernel = Kernel::CooperativeWorkgroup {
                     shape,
                     types,
                     splits,
                 };
-                dispatch.workgroups = [m.div_ceil(shape.rows), n / shape.columns, splits];
+                dispatch.workgroups = product
+                    .launch(
+                        crate::kernels::matmul::Variant::CooperativeWorkgroup(shape),
+                        splits,
+                    )
+                    .workgroups;
             }
         }
     }
@@ -411,13 +423,17 @@ fn select_matmul_paths(
             }
             matmul::Path::SmallTile => {
                 let dispatch = &mut plan.dispatches[index];
+                let product = dispatch.product().expect("dense product");
                 dispatch.kernel = Kernel::SmallTile;
-                dispatch.workgroups = matmul::tiled_workgroups(&problem, 32);
+                dispatch.workgroups = product.launch(matmul::Variant::SmallScalar, 1).workgroups;
             }
             matmul::Path::WideTile => {
                 let dispatch = &mut plan.dispatches[index];
+                let product = dispatch.product().expect("dense product");
                 dispatch.kernel = Kernel::ScalarMatmul(matmul::WIDE_TILE);
-                dispatch.workgroups = matmul::wide_workgroups(&problem);
+                dispatch.workgroups = product
+                    .launch(matmul::Variant::Scalar(matmul::WIDE_TILE), 1)
+                    .workgroups;
             }
             matmul::Path::Compiled => {}
         }

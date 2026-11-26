@@ -1012,16 +1012,16 @@ impl<'a> Compiler<'a> {
             shader,
             input_buffers,
             output_buffer: out_buf,
-            params: if plain {
-                vec![m, k, n, 0]
-            } else {
-                vec![m, n, k, 0]
-            },
+            params: layout.params_words(m, n, k),
             weight_format: wf,
             ..Default::default()
         };
         dispatch.workgroups = if !gemv {
-            matmul_workgroups(m, n, 64)
+            dispatch
+                .product()
+                .expect("dense product")
+                .launch(crate::kernels::matmul::Variant::DefaultScalar, 1)
+                .workgroups
         } else {
             let group = dispatch.shader.shader_group();
             dispatch.kernel = self.options.gemv_kernel(group, wf, self.coop_caps, n);
@@ -1072,7 +1072,30 @@ impl<'a> Compiler<'a> {
             } else {
                 crate::kernels::matmul::matrix_splits(m, n, k)
             };
-            let grid = [m.div_ceil(32), n.div_ceil(32), splits];
+            let layout = match node.op {
+                Op::MatMul => crate::kernels::matmul::Layout::Plain,
+                Op::MatMulAT => crate::kernels::matmul::Layout::TransposedA,
+                Op::MatMulBT => crate::kernels::matmul::Layout::TransposedB,
+                Op::FusedMatMulAdd => crate::kernels::matmul::Layout::PlainAdd,
+                Op::FusedMatMulATAdd => crate::kernels::matmul::Layout::TransposedAAdd,
+                Op::FusedMatMulBTAdd => crate::kernels::matmul::Layout::TransposedBAdd,
+                _ => unreachable!(),
+            };
+            let types = crate::codegen::MatrixTypes::reduced(storage);
+            let product = crate::kernels::matmul::Product {
+                layout,
+                m,
+                n,
+                k,
+                weights: WeightFormat::F32,
+                types: Some(types),
+            };
+            let grid = product
+                .launch(
+                    crate::kernels::matmul::Variant::CooperativeTyped { specialize: false },
+                    splits,
+                )
+                .workgroups;
             assert!(workgroups_within_portable_limits(grid));
             let partial = if splits > 1 {
                 self.alloc_buffer((m as usize) * (n as usize) * (splits as usize) * 4)
@@ -1080,28 +1103,16 @@ impl<'a> Compiler<'a> {
                 out_buf
             };
             let dispatch = Dispatch {
-                shader: match node.op {
-                    Op::MatMul => ShaderEntry::MatMul,
-                    Op::MatMulAT => ShaderEntry::MatMulAT,
-                    Op::MatMulBT => ShaderEntry::MatMulBT,
-                    Op::FusedMatMulAdd => ShaderEntry::FusedMatMulAdd,
-                    Op::FusedMatMulATAdd => ShaderEntry::FusedMatMulATAdd,
-                    Op::FusedMatMulBTAdd => ShaderEntry::FusedMatMulBTAdd,
-                    _ => unreachable!(),
-                },
+                shader: layout.entry_ref().clone(),
                 kernel: super::Kernel::CooperativeTyped {
-                    types: crate::codegen::MatrixTypes::reduced(storage),
+                    types,
                     splits,
                     specialize: false,
                 },
                 workgroups: grid,
                 input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),
                 output_buffer: partial,
-                params: if transpose_a || transpose_b {
-                    vec![m, n, k, 0]
-                } else {
-                    vec![m, k, n, 0]
-                },
+                params: layout.params_words(m, n, k),
                 fusion_barrier: true,
                 // The typed kernel is fixed by storage, not by a schedule:
                 // kernel selection keeps it, and tuning only varies K
@@ -3906,13 +3917,11 @@ impl<'a> Compiler<'a> {
                 "illegal extracted matmul: {spec:?}"
             );
             let dispatch = &mut self.plan.dispatches[dispatch_start];
+            let product = dispatch.product().expect("dense matmul product");
             dispatch.kernel = Kernel::ScalarMatmul(shape);
-            dispatch.workgroups = matmul_workgroups_rect(
-                node.ty.shape[0] as u32,
-                node.ty.shape[1] as u32,
-                shape.rows(),
-                shape.cols(),
-            );
+            dispatch.workgroups = product
+                .launch(crate::kernels::matmul::Variant::Scalar(shape), 1)
+                .workgroups;
             // If splitting is illegal (e.g. short K), retain this single-pass
             // layout. Plan deduplication and the report see the actual lowering.
             if spec.splits >= 2 {

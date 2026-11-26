@@ -18,23 +18,19 @@ use super::{
     WinogradOutputData, WinogradWeightData, reduction_is_dynamic,
 };
 use crate::compile::{
-    BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, Kernel, ShaderEntry,
+    BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, ShaderEntry,
     WinogradInputParams, WinogradOutputParams, WinogradWeightParams,
 };
 use crate::kernels::attention_grad::{AttentionGrad, Part as AttentionGradPart};
 
 fn dense_params(dispatch: &Dispatch) -> MatMulParams {
-    let (m, n, k) = dispatch.mnk().expect("dense matrix dimensions");
-    MatMulParams {
-        m,
-        n,
-        k,
-        _pad: match dispatch.kernel {
-            Kernel::CooperativeTyped { splits, .. }
-            | Kernel::CooperativeWorkgroup { splits, .. } => splits,
-            _ => dispatch.workgroups[1],
-        },
-    }
+    let [m, n, k, _pad] = if let Some(product) = dispatch.product() {
+        product.uniform_params(&dispatch.kernel, dispatch.workgroups)
+    } else {
+        let (m, n, k) = dispatch.mnk().expect("dense matrix dimensions");
+        [m, n, k, dispatch.workgroups[1]]
+    };
+    MatMulParams { m, n, k, _pad }
 }
 
 impl Session {
@@ -1224,6 +1220,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile::Kernel;
 
     #[test]
     fn dense_uniforms_distinguish_typed_splits_from_gemv_columns() {

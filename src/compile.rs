@@ -1382,21 +1382,23 @@ impl Dispatch {
         self.requires_full_precision || self.is_derivative
     }
 
+    /// Decode the dense matrix product this dispatch computes, if its shader
+    /// entry is one of the six dense matmul forms (`MatMul*` / `FusedMatMul*Add`).
+    pub(crate) fn product(&self) -> Option<crate::kernels::matmul::Product> {
+        crate::kernels::matmul::Product::of(self)
+    }
+
     /// Logical `(m, n, k)` dimensions, accounting for shader parameter order.
     pub fn mnk(&self) -> Option<(u32, u32, u32)> {
+        if let Some(product) = self.product() {
+            return Some((product.m, product.n, product.k));
+        }
         let p = &self.params;
         let (a, b, c) = (p.first().copied()?, p.get(1).copied()?, p.get(2).copied()?);
         match self.shader {
-            ShaderEntry::MatMul
-            | ShaderEntry::MatMulGemv
-            | ShaderEntry::MatMulGemvAdd
-            | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
-            ShaderEntry::MatMulAT
-            | ShaderEntry::MatMulBT
-            | ShaderEntry::MatMulGemvBT
+            ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd => Some((a, c, b)),
+            ShaderEntry::MatMulGemvBT
             | ShaderEntry::MatMulGemvBTAdd
-            | ShaderEntry::FusedMatMulATAdd
-            | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::BlockMatMul
             | ShaderEntry::BlockMatMulAT
             | ShaderEntry::BlockMatMulBT
@@ -3487,11 +3489,11 @@ pub(crate) fn row_gemv_workgroups(n: u32) -> [u32; 3] {
     [n.div_ceil(y), y, 1]
 }
 
-fn matmul_workgroups(m: u32, n: u32, tile: u32) -> [u32; 3] {
+pub(crate) fn matmul_workgroups(m: u32, n: u32, tile: u32) -> [u32; 3] {
     matmul_workgroups_rect(m, n, tile, tile)
 }
 
-fn matmul_workgroups_rect(m: u32, n: u32, row_tile: u32, col_tile: u32) -> [u32; 3] {
+pub(crate) fn matmul_workgroups_rect(m: u32, n: u32, row_tile: u32, col_tile: u32) -> [u32; 3] {
     let columns = n.div_ceil(col_tile);
     assert!(
         columns <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
