@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::graph::{Graph, NodeId, Op};
 
+mod fold;
 mod indexing;
 mod proto;
 mod spatial;
@@ -156,6 +157,9 @@ fn translate_node(
     weights: &HashMap<String, Vec<f32>>,
 ) -> Result<(), OnnxError> {
     let attrs = &node.attrs;
+    if fold::fold(graph, node, name_to_id, shapes, weights)? {
+        return Ok(());
+    }
 
     match node.op_type.as_str() {
         // --- Element-wise unary ---
@@ -414,41 +418,29 @@ fn translate_node(
                 )));
             }
             let axis = axis as usize;
-            // Shape arithmetic (`Shape` → `Gather`) folds at import.
-            if let (Some(values), Some(picks)) = (
-                constant_values(graph, data, weights),
-                constant_values(graph, indices, weights),
-            ) {
-                let (values, picks) = (values.to_vec(), picks.to_vec());
-                let dim = data_shape[axis];
-                let inner: usize = data_shape[axis + 1..].iter().product();
-                let outer: usize = data_shape[..axis].iter().product();
-                if values.len() != outer * dim * inner {
-                    return Err(OnnxError::ShapeError(format!(
-                        "node '{}': Gather data does not match {data_shape:?}",
-                        node.name
-                    )));
-                }
-                let mut out = Vec::with_capacity(outer * picks.len() * inner);
-                for o in 0..outer {
-                    for &pick in &picks {
+            // Constant indices pick along any axis. (Constant data with them
+            // folded before translation.)
+            if let Some(picks) = constant_values(graph, indices, weights) {
+                let dim = data_shape[axis] as i64;
+                let positions = picks
+                    .iter()
+                    .map(|&pick| {
                         let pick = pick as i64;
-                        let pick = if pick < 0 { pick + dim as i64 } else { pick };
-                        if !(0..dim as i64).contains(&pick) {
-                            return Err(OnnxError::ShapeError(format!(
-                                "node '{}': Gather index {pick} out of {dim}",
-                                node.name
-                            )));
-                        }
-                        let start = (o * dim + pick as usize) * inner;
-                        out.extend_from_slice(&values[start..start + inner]);
-                    }
-                }
+                        let pick = if pick < 0 { pick + dim } else { pick };
+                        usize::try_from(pick).ok().filter(|&p| p < dim as usize)
+                    })
+                    .collect::<Option<Vec<usize>>>()
+                    .ok_or_else(|| {
+                        OnnxError::ShapeError(format!(
+                            "node '{}': Gather indices {picks:?} out of {dim}",
+                            node.name
+                        ))
+                    })?;
+                let out = indexing::gather_axis(graph, node, data, &data_shape, axis, &positions)?;
                 let mut out_shape = data_shape[..axis].to_vec();
                 out_shape.extend_from_slice(&indices_shape);
                 out_shape.extend_from_slice(&data_shape[axis + 1..]);
-                let id = graph.constant(out, &out_shape);
-                register_output(node, 0, id, &out_shape, name_to_id, shapes);
+                register_output(node, 0, out, &out_shape, name_to_id, shapes);
                 return Ok(());
             }
             // Otherwise an embedding lookup: rows of the table by index.
@@ -476,12 +468,21 @@ fn translate_node(
             };
             let mut sorted = perm.clone();
             sorted.sort_unstable();
-            if sorted != (0..rank).collect::<Vec<_>>() || rank > 4 {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Transpose of {x_shape:?} by {perm:?} (supported: rank at most 4)"
+            if sorted != (0..rank).collect::<Vec<_>>() {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': Transpose of {x_shape:?} by {perm:?}",
+                    node.name
                 )));
             }
             let out_shape: Vec<usize> = perm.iter().map(|&axis| x_shape[axis]).collect();
+            let (x_shape, perm) = merged_permutation(&x_shape, &perm);
+            let rank = x_shape.len();
+            if rank > 4 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Transpose of {x_shape:?} by {perm:?} (supported: up to 4 axes, \
+                     after merging unit axes and axes that move together)"
+                )));
+            }
             let x = view(graph, x, &x_shape)?;
             // Swapping the last two axes is the batched transpose kernel.
             let swaps_last_two = rank >= 2
@@ -926,9 +927,9 @@ fn translate_node(
                 .iter()
                 .map(|&k| k.max(0) as usize)
                 .collect();
-            if input_shape.len() != 4 || kernel.len() != 2 || attrs.i("ceil_mode", 0) != 0 {
+            if input_shape.len() != 4 || kernel.len() != 2 {
                 return Err(OnnxError::UnsupportedOp(format!(
-                    "MaxPool of {input_shape:?} by {kernel:?} (supported: 2D, rounding down)"
+                    "MaxPool of {input_shape:?} by {kernel:?} (supported: 2D)"
                 )));
             }
             let (stride, pads) = window(node, &input_shape[2..], &kernel)?;
@@ -941,24 +942,50 @@ fn translate_node(
             let [batch, channels, in_h, in_w] = input_shape[..] else {
                 unreachable!()
             };
-            let input = view(graph, input, &[batch * channels * in_h * in_w])?;
+            // Rounding up adds a last window that overhangs the end, unless
+            // it would start past the padding, as PyTorch counts it.
+            let ceil_mode = attrs.i("ceil_mode", 0) != 0;
+            let windows = |extent: usize, k: usize| {
+                let span = extent + 2 * pads[0] - k;
+                let mut out = span / stride + 1;
+                if ceil_mode
+                    && !span.is_multiple_of(stride)
+                    && span / stride * stride + stride < extent + pads[0]
+                {
+                    out += 1;
+                }
+                out
+            };
+            let (out_h, out_w) = (windows(in_h, kernel[0]), windows(in_w, kernel[1]));
+            // Windows past the end read -MAX, which never wins a maximum.
+            let overhang = |extent: usize, k: usize, out: usize| {
+                ((out - 1) * stride + k).saturating_sub(extent + 2 * pads[0]) as i64
+            };
+            let mut input = input;
+            let mut padded = input_shape.clone();
+            for (axis, extra) in [
+                (2, overhang(in_h, kernel[0], out_h)),
+                (3, overhang(in_w, kernel[1], out_w)),
+            ] {
+                if extra > 0 {
+                    input =
+                        indexing::pad_constant(graph, input, &padded, axis, [0, extra], -f32::MAX)?;
+                    padded[axis] += extra as usize;
+                }
+            }
+            let input = view(graph, input, &[batch * channels * padded[2] * padded[3]])?;
             let out = graph.max_pool_2d(
                 input,
                 batch as u32,
                 channels as u32,
-                in_h as u32,
-                in_w as u32,
+                padded[2] as u32,
+                padded[3] as u32,
                 kernel[0] as u32,
                 kernel[1] as u32,
                 stride as u32,
                 pads[0] as u32,
             );
-            let out_shape = vec![
-                batch,
-                channels,
-                (in_h + 2 * pads[0] - kernel[0]) / stride + 1,
-                (in_w + 2 * pads[1] - kernel[1]) / stride + 1,
-            ];
+            let out_shape = vec![batch, channels, out_h, out_w];
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
@@ -1057,7 +1084,9 @@ fn as_matrix(graph: &mut Graph, id: NodeId, shape: &[usize]) -> Result<NodeId, O
 }
 
 /// NumPy-style matrix product: a shared `[K, N]` right side multiplies
-/// every row of `a`, and equal leading batch axes multiply per batch.
+/// every row of `a`, and equal leading batch axes multiply per batch. A
+/// one-dimensional side is a row or column vector whose axis the result
+/// drops.
 fn matmul_nd(
     graph: &mut Graph,
     a: NodeId,
@@ -1065,6 +1094,20 @@ fn matmul_nd(
     b: NodeId,
     b_shape: &[usize],
 ) -> Result<Option<(NodeId, Vec<usize>)>, OnnxError> {
+    if let [k] = *b_shape {
+        let Some((out, mut shape)) = matmul_nd(graph, a, a_shape, b, &[k, 1])? else {
+            return Ok(None);
+        };
+        shape.pop();
+        return Ok(Some((out, shape)));
+    }
+    if let [k] = *a_shape {
+        let Some((out, mut shape)) = matmul_nd(graph, a, &[1, k], b, b_shape)? else {
+            return Ok(None);
+        };
+        shape.remove(shape.len() - 2);
+        return Ok(Some((out, shape)));
+    }
     let (ra, rb) = (a_shape.len(), b_shape.len());
     if ra < 2 || rb < 2 || a_shape[ra - 1] != b_shape[rb - 2] {
         return Ok(None);
@@ -1237,6 +1280,8 @@ fn constant_values<'a>(
     match graph.node(id).op {
         Op::Constant { ref data } => Some(data),
         Op::Parameter { ref name } => weights.get(name).map(Vec::as_slice),
+        // A reshape is a view of the same values.
+        Op::Identity => constant_values(graph, graph.node(id).inputs[0], weights),
         _ => None,
     }
 }
@@ -1249,8 +1294,9 @@ fn scalar_constant(graph: &Graph, id: NodeId, weights: &HashMap<String, Vec<f32>
     }
 }
 
-/// `ReduceMean`, `ReduceSum` or `ReduceMax` over the last axis, keeping
-/// it: the per-row reductions norms and softmax are written with.
+/// `ReduceMean`, `ReduceSum` or `ReduceMax` over the last axis, kept or
+/// dropped: the per-row reductions norms, softmax and query selection are
+/// written with.
 fn reduce_op(
     graph: &mut Graph,
     node: &proto::Node,
@@ -1270,11 +1316,9 @@ fn reduce_op(
         axes = values.iter().map(|&v| v as i64).collect();
     }
     let last_axis = matches!(*axes.as_slice(), [axis] if axis == -1 || axis == rank - 1);
-    let keepdims = node.attrs.i("keepdims", 1) != 0;
-    if !last_axis || !keepdims {
+    if !last_axis {
         return Err(OnnxError::UnsupportedOp(format!(
-            "{}: axes {axes:?} of {x_shape:?} with keepdims={keepdims} \
-             (supported: the last axis, kept)",
+            "{}: axes {axes:?} of {x_shape:?} (supported: the last axis)",
             node.op_type
         )));
     }
@@ -1285,8 +1329,12 @@ fn reduce_op(
         _ => graph.max_inner(x),
     };
     let mut out_shape = x_shape;
-    if let Some(last) = out_shape.last_mut() {
-        *last = 1;
+    if node.attrs.i("keepdims", 1) != 0 {
+        if let Some(last) = out_shape.last_mut() {
+            *last = 1;
+        }
+    } else {
+        out_shape.pop();
     }
     register_output(node, 0, out, &out_shape, name_to_id, shapes);
     Ok(())
@@ -1394,6 +1442,31 @@ fn window(
         }
     }
     Ok((stride, pads))
+}
+
+/// The same permutation of `shape` with fewer axes: unit axes dropped, and
+/// neighbouring axes that stay neighbours in order merged into one.
+fn merged_permutation(shape: &[usize], perm: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let kept: Vec<usize> = (0..shape.len()).filter(|&a| shape[a] > 1).collect();
+    let position = |axis: usize| kept.iter().position(|&a| a == axis);
+    // Runs of kept input axes, in output order.
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for p in perm.iter().filter_map(|&axis| position(axis)) {
+        match runs.last_mut() {
+            Some(run) if run.end == p => run.end += 1,
+            _ => runs.push(p..p + 1),
+        }
+    }
+    let mut by_input: Vec<usize> = (0..runs.len()).collect();
+    by_input.sort_by_key(|&r| runs[r].start);
+    let merged_shape = by_input
+        .iter()
+        .map(|&r| runs[r].clone().map(|p| shape[kept[p]]).product())
+        .collect();
+    let merged_perm = (0..runs.len())
+        .map(|r| by_input.iter().position(|&i| i == r).unwrap())
+        .collect();
+    (merged_shape, merged_perm)
 }
 
 /// The `range` of `x` along `axis` of its `shape`.

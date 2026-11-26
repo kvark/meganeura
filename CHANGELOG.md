@@ -1,5 +1,21 @@
 # Unreleased
 
+- The ONNX importer runs D-FINE (onnx-community's `dfine_n_coco-ONNX` at a
+  fixed 640×640 input). Its logits and boxes match onnxruntime within 4e-4,
+  apart from two queries whose near-equal scores select in the other order.
+  - A node whose every input is a constant is evaluated at import and
+    becomes one constant. Shape arithmetic and the anchor and position
+    tables exporters compute from it then cost nothing on the GPU. `Range`,
+    `Where`, `Equal`, `Greater`, `Less`, `And`, `Or`, `Not`, `Sin`, `Cos`,
+    `ConstantOfShape` and `ScatterND` import this way, with no kernel of
+    their own. A reshaped constant counts as a constant.
+  - `MaxPool` rounds up with `ceil_mode`, counting windows as PyTorch does.
+  - `ReduceMean`, `ReduceSum` and `ReduceMax` may drop the reduced axis.
+  - `Transpose` takes more than four axes when, after dropping unit axes and
+    merging axes that move together, at most four remain.
+  - `Gather` takes constant indices along any axis of computed data.
+  - `MatMul` takes a vector on either side, as NumPy does.
+
 - The ONNX importer reads `Pad`, `Clip`, `Tile` and `GatherElements`, and
   `TopK` with k up to 512, the operators D-FINE needs beyond those already
   supported. All lower onto existing kernels:

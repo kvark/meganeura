@@ -236,9 +236,9 @@ def resnet_block():
 
 def vision_ops():
     """Grouped and depthwise convolutions, transposed convolutions, Resize in
-    its modes, TopK, strided Slice, Pad, Clip, Tile, GatherElements and
-    GridSample, each flattened and concatenated into one row so a single
-    output covers them all."""
+    its modes, TopK, strided Slice, Pad, Clip, Tile, GatherElements,
+    GridSample and the shape arithmetic D-FINE folds, each flattened and
+    concatenated into one row so a single output covers them all."""
     b = Builder(5)
     x = "pixel_values"
     parts = []
@@ -329,6 +329,39 @@ def vision_ops():
     # Negative indices count from the end.
     index = np.tile(np.array([-1, 0, -6], dtype=np.int64), (1, 4, 6, 1))
     keep(b.op("GatherElements", x, b.const("index", index, np.int64), axis=3))
+
+    # D-FINE's tables: values computed from the input's shape alone, which
+    # import folds, added to the image so they reach the output.
+    def i64(name, v):
+        return b.const(name, v, np.int64)
+
+    shape = b.op("Shape", x)
+    r = b.op("Range", i64("start", 0), b.op("Gather", shape, i64("axis2", 2)), i64("delta", 1))
+    rf = b.op("Cast", r, to=TensorProto.FLOAT)
+    band = b.op("And", b.op("Greater", r, i64("one", 1)), b.op("Less", r, i64("five", 5)))
+    outside = b.op("Cast", b.op("Not", band), to=TensorProto.FLOAT)
+    w = b.op("Where", b.op("Equal", r, i64("three", 3)), b.const("ten", 10.0), rf)
+    whole = b.op("Cast", b.op("Cast", b.op("Mul", rf, b.const("frac", 0.7)), to=TensorProto.INT64), to=TensorProto.FLOAT)
+    plane = b.op("Slice", shape, i64("from", [2]), i64("to", [4]))
+    quarter = numpy_helper.from_array(np.array([0.25], dtype=np.float32))
+    table = b.op("ConstantOfShape", plane, value=quarter)
+    table = b.op("ScatterND", table, i64("cells", [[0, 0], [5, 5]]), b.const("marks", [1.0, 2.0]))
+    wave = b.op("Expand", b.op("Unsqueeze", b.op("Sin", b.op("Mul", rf, b.const("half", 0.5))), i64("col", [1])), i64("square", [6, 6]))
+    rows = b.op("ReduceSum", b.op("MatMul", table, wave), i64("last", [1]), keepdims=1)
+    rows = b.op("Log", b.op("Add", b.op("Mul", rows, rows), b.const("one_f", 1.0)))
+    bias = b.op("Add", b.op("Mul", outside, rows), b.op("Add", w, b.op("Cos", whole)))
+    keep(b.op("Add", x, bias))
+
+    # Pooling that rounds up, a reduction dropping its axis, a transpose of
+    # five axes that two merge, a gather at constant positions, and a
+    # product with a vector.
+    keep(b.op("MaxPool", x, kernel_shape=[3, 3], strides=[2, 2], ceil_mode=1))
+    keep(b.op("ReduceMax", x, i64("axes", [-1]), keepdims=0))
+    split = b.op("Reshape", x, i64("five", [1, 4, 3, 2, 6]))
+    keep(b.op("Transpose", split, perm=[0, 2, 1, 3, 4]))
+    keep(b.op("Gather", x, i64("picks", [[5, 0], [2, 2]]), axis=2))
+    rows6 = b.op("Reshape", x, i64("rows", [24, 6]))
+    keep(b.op("MatMul", rows6, b.weight("vector", (6,), 0.5)))
 
     # Some grid points fall outside [-1, 1], where padding decides.
     grid = b.const("grid", b.rng.uniform(-1.2, 1.2, (1, 5, 7, 2)))
