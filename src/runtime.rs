@@ -3836,6 +3836,77 @@ impl std::fmt::Display for ShareParameterError {
 
 impl std::error::Error for ShareParameterError {}
 
+/// A compiled plan lowered for one device, as a session with the same
+/// options would run it before tuning.
+pub(crate) struct Lowered {
+    /// The barrier groups are moved out into `groups`.
+    pub plan: ExecutionPlan,
+    pub groups: Vec<std::ops::Range<usize>>,
+    pub preparation: Option<crate::compile::stages::Preparation>,
+    /// The cooperative configuration that passed this device's probe.
+    pub coop_config: Option<crate::codegen::CoopConfig>,
+}
+
+/// Lower `plan` for `gpu` under `opts`, as session construction does: probe
+/// the cooperative configuration, then
+/// [`ExecutionPlan::finalize_for_target`]. Builds no session. The probe runs
+/// a small qualification kernel once per context.
+pub(crate) fn lower(mut plan: ExecutionPlan, gpu: &Arc<Gpu>, opts: &SessionOptions) -> Lowered {
+    let coop_caps = auto_tune(gpu, 0).coop_caps;
+    let coop_config = {
+        let _span = tracing::info_span!("coop_probe").entered();
+        Session::select_coop_config(&coop_caps, opts.coop)
+            .filter(|config| Session::coop_matmul_qualified(gpu, config))
+    };
+    if let Some(ref config) = coop_config {
+        log::info!(
+            "cooperative matrix enabled (tile={}×{}, {}, f32_tile={}, f16_tile={})",
+            config.tile_size,
+            config.tile_size,
+            if config.use_f16_input {
+                "f16→f32"
+            } else {
+                "f32"
+            },
+            coop_caps.f32_tile,
+            coop_caps.f16_tile,
+        );
+    } else {
+        let info = gpu.device_information();
+        log::info!(
+            "no ordinary square cooperative path on {} ({}) (f32_tile={}, f16_tile={}); checked typed paths remain device-qualified",
+            info.device_name,
+            info.driver_name,
+            coop_caps.f32_tile,
+            coop_caps.f16_tile,
+        );
+    }
+
+    let _span = tracing::info_span!("schedule").entered();
+    let capabilities = gpu.capabilities();
+    let preparation = plan.finalize_for_target(&crate::compile::lower::LowerTarget {
+        coop_config: coop_config.as_ref(),
+        capabilities: &capabilities,
+        coop_policy: opts.coop,
+        workgroup_matmul: opts.workgroup_matmul,
+        serial_dispatch: opts.serial_dispatch,
+        debug: opts.debug,
+        prepare_outputs: &opts.prepare_outputs,
+    });
+    let groups = std::mem::take(&mut plan.groups);
+    log::info!(
+        "{} dispatches → {} barrier groups",
+        plan.dispatches.len(),
+        groups.len()
+    );
+    Lowered {
+        plan,
+        groups,
+        preparation,
+        coop_config,
+    }
+}
+
 impl DebugStepReport {
     /// The first reported nonfinite primary-output prefix, if any.
     pub fn first_bad(&self) -> Option<&DispatchAnomaly> {
@@ -4385,55 +4456,12 @@ impl Session {
             buffers = plan.buffers.len()
         )
         .entered();
-        let coop_caps = auto_tune(&gpu, 0).coop_caps;
-        let coop_config = {
-            let _span = tracing::info_span!("coop_probe").entered();
-            Self::select_coop_config(&coop_caps, opts.coop)
-                .filter(|config| Self::coop_matmul_qualified(&gpu, config))
-        };
-        if let Some(ref config) = coop_config {
-            log::info!(
-                "cooperative matrix enabled (tile={}×{}, {}, f32_tile={}, f16_tile={})",
-                config.tile_size,
-                config.tile_size,
-                if config.use_f16_input {
-                    "f16→f32"
-                } else {
-                    "f32"
-                },
-                coop_caps.f32_tile,
-                coop_caps.f16_tile,
-            );
-        } else {
-            let info = gpu.device_information();
-            log::info!(
-                "no ordinary square cooperative path on {} ({}) (f32_tile={}, f16_tile={}); checked typed paths remain device-qualified",
-                info.device_name,
-                info.driver_name,
-                coop_caps.f32_tile,
-                coop_caps.f16_tile,
-            );
-        }
-
-        let mut plan = plan;
-        let schedule_span = tracing::info_span!("schedule").entered();
-        let capabilities = gpu.capabilities();
-        let preparation = plan.finalize_for_target(&crate::compile::lower::LowerTarget {
-            coop_config: coop_config.as_ref(),
-            capabilities: &capabilities,
-            coop_policy: opts.coop,
-            workgroup_matmul: opts.workgroup_matmul,
-            serial_dispatch: opts.serial_dispatch,
-            debug: opts.debug,
-            prepare_outputs: &opts.prepare_outputs,
-        });
-        let groups = std::mem::take(&mut plan.groups);
-        log::info!(
-            "{} dispatches → {} barrier groups",
-            plan.dispatches.len(),
-            groups.len()
-        );
-        drop(schedule_span);
+        let Lowered {
+            plan,
+            groups,
+            preparation,
+            coop_config,
+        } = lower(plan, &gpu, &opts);
 
         // Lifetime-based buffer aliasing: step-local intermediates with
         // disjoint live ranges (at barrier-group granularity) share one

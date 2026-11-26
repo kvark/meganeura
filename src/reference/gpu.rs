@@ -111,11 +111,8 @@ fn dispatched(session: &crate::Session) -> Vec<crate::compile::ShaderEntry> {
     plan.dispatches.iter().map(|d| d.shader.clone()).collect()
 }
 
-/// The plan a session for `graph` built with `options` compiles, against
-/// the same device and policy, without building the session. Kernel
-/// choices made while compiling (attention among them) are final here;
-/// session construction's cooperative and small-tile choices are not yet
-/// applied.
+/// The plan a session for `graph` built with `options` runs before tuning,
+/// on the same device and policy, without building the session.
 pub fn plan(graph: &Graph, options: &Options, mode: Mode) -> crate::compile::ExecutionPlan {
     crate::train::plan(graph, &options.session_config(mode))
 }
