@@ -165,7 +165,7 @@ pub(super) fn pad(
 
 /// Blocks of `value`, `before` and `after` slices long, on either side of
 /// `axis`.
-fn pad_constant(
+pub(super) fn pad_constant(
     graph: &mut Graph,
     x: NodeId,
     shape: &[usize],
