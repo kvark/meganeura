@@ -46,7 +46,7 @@ impl SearchState {
                 "configure runtime optimizers and accumulation after program search".into(),
             );
         }
-        session.wait();
+        session.wait_checked()?;
         let mut physical: Vec<_> = persistent_writes(&session.plan)
             .iter()
             .map(|b| session.alias.map[b.0 as usize])
@@ -106,7 +106,7 @@ impl SearchState {
         if self.images.is_empty() {
             return Ok(());
         }
-        session.wait();
+        session.wait_checked()?;
         if restore {
             // Restored parameters need their derived results again.
             session.invariants_valid.set(false);
@@ -126,13 +126,7 @@ impl SearchState {
         }
         let sync = session.gpu.submit(&mut session.encoder);
         session.sync_point = Some(sync.clone());
-        if !session
-            .gpu
-            .wait_for(&sync, !0)
-            .map_err(|_| "state copy GPU wait failed")?
-        {
-            return Err("state copy GPU wait did not complete".into());
-        }
+        super::completed(session.gpu.wait_for(&sync, !0), "state copy")?;
         session.sync_point = None;
         Ok(())
     }

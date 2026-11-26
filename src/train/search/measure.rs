@@ -136,7 +136,7 @@ fn run(
     refresh_inputs: &mut impl FnMut(&mut Session) -> Result<(), String>,
 ) -> Result<f64, String> {
     prepare(session, state, trial, refresh_inputs)?;
-    Ok(session.measure_step().as_secs_f64() * 1000.0)
+    Ok(session.measure_step()?.as_secs_f64() * 1000.0)
 }
 
 fn validate(
@@ -165,9 +165,10 @@ fn validate_once(
     prepare(session, state, trial, refresh_inputs)?;
     let start = Instant::now();
     session.step();
-    session.wait();
+    let waited = session.wait_checked();
     let execution = start.elapsed();
-    let result = check(session);
+    // Outputs of a step the device did not finish are not checked.
+    let result = waited.and_then(|()| check(session));
     trial.qualification_time += start.elapsed();
     trial.qualifications += 1;
     restore(session, state, &mut trial.state_copy_time)?;
@@ -602,7 +603,7 @@ pub(super) fn select(
                 refresh_inputs(&mut session)
                     .map_err(|error| format!("incumbent input refresh failed: {error}"))?;
                 session.step();
-                session.wait();
+                session.wait_checked()?;
                 qualify(&session)?;
                 report.final_qualifications += 1;
             }

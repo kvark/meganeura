@@ -49,8 +49,32 @@ pub(super) fn wait_for_timed_encoder(
     if !result? {
         return Ok(None);
     }
+    Ok(resolved_timings(gpu, encoder, timing))
+}
+
+/// The answer of a GPU wait as an error unless the work finished. `what`
+/// names the work. After a backend error, and after a wait that returned
+/// early, nothing the work was to write may be read as its result.
+pub(super) fn completed(
+    result: Result<bool, blade_graphics::DeviceError>,
+    what: &str,
+) -> Result<(), String> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("{what} GPU wait did not complete")),
+        Err(error) => Err(format!("{what} GPU wait failed: {error}")),
+    }
+}
+
+/// The timings of the submission `encoder` last recorded, once a wait has
+/// seen it finish. See [`wait_for_timed_encoder`] for `timing`.
+pub(super) fn resolved_timings(
+    gpu: &Gpu,
+    encoder: &mut blade_graphics::CommandEncoder,
+    timing: bool,
+) -> Option<crate::profiler::GpuTimings> {
     if !timing || !gpu.capabilities().timing {
-        return Ok(None);
+        return None;
     }
     let borrowed = encoder.last_timing();
     let timings = crate::profiler::GpuTimings {
@@ -63,7 +87,7 @@ pub(super) fn wait_for_timed_encoder(
     };
     tracing::debug!(passes = timings.passes.len(), "GPU timestamps resolved");
     crate::profiler::record_gpu_timings(&timings);
-    Ok(Some(timings))
+    Some(timings)
 }
 
 /// Leave room for pipelines, command buffers, and driver-owned allocations
@@ -1502,7 +1526,8 @@ struct MatMulProbe<'a> {
 }
 
 /// Compile `module`, run `probe` once and read C back. `None` if the shader
-/// is rejected, which is logged as "`kind` shader rejected".
+/// is rejected, which is logged as "`kind` shader rejected", or if the device
+/// does not report the run finished.
 fn run_matmul_probe(
     gpu: &Gpu,
     module: crate::codegen::ShaderModule,
@@ -1567,15 +1592,39 @@ fn run_matmul_probe(
     }
     let sync = gpu.submit(&mut encoder);
     // A standalone scratch submission with no session behind it: nothing
-    // is profiling it, so do not ask for timestamps it may not collect.
-    let _ = wait_for_timed_encoder(gpu, &sync, &mut encoder, false);
-    let result = unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, len).to_vec() };
+    // is profiling it, so it asks for no timestamps. C is the kernel's
+    // answer only if the submission finished.
+    let result = match completed(gpu.wait_for(&sync, !0), kind) {
+        Ok(()) => {
+            Some(unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, len).to_vec() })
+        }
+        Err(error) => {
+            log::warn!("{error}");
+            None
+        }
+    };
     gpu.destroy_command_encoder(&mut encoder);
     gpu.destroy_compute_pipeline(&mut pipeline);
     gpu.destroy_buffer(a_buf);
     gpu.destroy_buffer(b_buf);
     gpu.destroy_buffer(c_buf);
-    Some(result)
+    result
+}
+
+/// The first element of a probe's `result` that is not within `tolerance`
+/// of `expected`. An element that is NaN or infinite is never within it.
+fn first_probe_mismatch(result: &[f32], expected: &[f32], tolerance: f32) -> Option<usize> {
+    let compared = result.len().min(expected.len());
+    result
+        .iter()
+        .zip(expected)
+        .position(|(got, want)| {
+            // NaN compares false to everything, so ask what passes.
+            let agrees = (got - want).abs() <= tolerance;
+            !agrees
+        })
+        // A result of another length has an element with nothing to agree with.
+        .or((result.len() != expected.len()).then_some(compared))
 }
 
 /// One 32x32 output block over two K steps. A mixes subnormal (2^-15 and
@@ -1699,6 +1748,45 @@ mod precision_requirement_tests {
         codegen::{CoopConfig, MatrixTypes},
         compile::{self, Kernel},
     };
+
+    /// An observation the device did not deliver is not a result. A probe
+    /// lane that is NaN or infinite fails like one that is too far off, and
+    /// a wait confirms its work only when the device reports it finished.
+    #[test]
+    fn failed_observations_do_not_pass() {
+        let expected = [1.0f32, -2.0, 3.0, 0.5];
+        assert_eq!(super::first_probe_mismatch(&expected, &expected, 0.1), None);
+        assert_eq!(
+            super::first_probe_mismatch(&expected[..3], &expected, 0.1),
+            Some(3)
+        );
+        assert_eq!(
+            super::first_probe_mismatch(&[1.05, -2.0, 3.0, 0.45], &expected, 0.1),
+            None
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 3.5] {
+            let mut result = expected;
+            result[2] = bad;
+            assert_eq!(
+                super::first_probe_mismatch(&result, &expected, 0.1),
+                Some(2),
+                "{bad}"
+            );
+        }
+
+        assert_eq!(super::completed(Ok(true), "step"), Ok(()));
+        assert_eq!(
+            super::completed(Ok(false), "step").unwrap_err(),
+            "step GPU wait did not complete"
+        );
+        for error in [
+            blade_graphics::DeviceError::DeviceLost,
+            blade_graphics::DeviceError::OutOfMemory,
+        ] {
+            let message = super::completed(Err(error), "step").unwrap_err();
+            assert!(message.starts_with("step GPU wait failed"), "{message}");
+        }
+    }
 
     #[test]
     fn f16_subnormal_probe_is_exact_and_sensitive() {
@@ -4191,7 +4279,8 @@ impl Session {
             buffers: ["test_a", "test_b", "test_c"],
             a: bytemuck::cast_slice(&a),
             b: bytemuck::cast_slice(&b),
-            c_fill: 0.0,
+            // NaN outputs expose a kernel that did not store.
+            c_fill: f32::NAN,
             params: MatMulParams {
                 m: m as u32,
                 n: n_out as u32,
@@ -4207,27 +4296,19 @@ impl Session {
         // Compare against CPU-computed reference. f16 coop paths accumulate
         // in f32 but the inputs are truncated, so leave ~5% slack per term.
         let tol = 0.05 * (inner as f32);
-        let mut ok = true;
-        let mut first_mismatch = true;
-        for i in 0..m {
-            for j in 0..n_out {
-                let got = result[i * n_out + j];
-                let want = expected[i * n_out + j];
-                if (got - want).abs() > tol && (got - want).abs() > 1e-3 {
-                    if first_mismatch {
-                        log::warn!(
-                            "coop self-test FAILED (m={m}, n={n_out}, k={inner}, tile={}, tol={tol:.3})",
-                            config.tile_size
-                        );
-                        log::warn!("  got row 0: {:?}", &result[..n_out.min(8)]);
-                        log::warn!("  want row 0: {:?}", &expected[..n_out.min(8)]);
-                        first_mismatch = false;
-                    }
-                    ok = false;
-                }
-            }
-        }
-        ok
+        let Some(lane) = first_probe_mismatch(&result, &expected, tol) else {
+            return true;
+        };
+        log::warn!(
+            "coop self-test FAILED (m={m}, n={n_out}, k={inner}, tile={}, tol={tol:.3}): \
+             element {lane} is {} instead of {}",
+            config.tile_size,
+            result[lane],
+            expected[lane],
+        );
+        log::warn!("  got row 0: {:?}", &result[..n_out.min(8)]);
+        log::warn!("  want row 0: {:?}", &expected[..n_out.min(8)]);
+        false
     }
 
     /// Create a session from a compiled execution plan.
@@ -6680,33 +6761,56 @@ impl Session {
     /// Measure a whole-program search sample without profiling waits.
     /// Timestamp harvesting between chunks serializes recording and GPU work;
     /// private kernel tuning and explicit profiles keep their timing settings.
-    pub(crate) fn measure_step(&mut self) -> std::time::Duration {
-        self.wait();
+    ///
+    /// An error means a wait did not see the step finish, and the sample
+    /// would time something else.
+    pub(crate) fn measure_step(&mut self) -> Result<std::time::Duration, String> {
+        self.wait_checked()?;
         let timing = std::mem::replace(&mut self.gpu_timing, false);
         let start = std::time::Instant::now();
         self.step();
-        self.wait();
+        let waited = self.wait_checked();
         let elapsed = start.elapsed();
         self.gpu_timing = timing;
-        elapsed
+        waited.map(|()| elapsed)
     }
 
     /// Wait for any pending GPU work, including a caller submission reported
     /// through [`Session::track_submission`].
+    ///
+    /// A wait the device fails or cuts short is logged as an error and
+    /// otherwise passes like a finished one, as it always has: this call
+    /// has no way to report it. What the session reads back afterwards is
+    /// then not the step's result.
     pub fn wait(&mut self) {
-        if let Some(sp) = self.external_sync_point.take() {
-            let _span = tracing::info_span!("wait_external").entered();
-            let _ = self.gpu.wait_for(&sp, !0);
+        if let Err(error) = self.wait_checked() {
+            log::error!("{error}");
         }
-        if let Some(sp) = self.sync_point.take() {
-            log::debug!(target: "meganeura::submission", "wait begin");
-            let _span = tracing::info_span!("wait").entered();
-            self.last_gpu_timings =
-                wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder, self.gpu_timing)
-                    .ok()
-                    .flatten();
-            log::debug!(target: "meganeura::submission", "wait complete");
-        }
+    }
+
+    /// [`Session::wait`] for a caller that must not read a result the device
+    /// did not finish, such as program search and checkpoint saving. Both
+    /// waits are attempted, and the first failure is returned.
+    pub(crate) fn wait_checked(&mut self) -> Result<(), String> {
+        let external = match self.external_sync_point.take() {
+            Some(sp) => {
+                let _span = tracing::info_span!("wait_external").entered();
+                completed(self.gpu.wait_for(&sp, !0), "external submission")
+            }
+            None => Ok(()),
+        };
+        let Some(sp) = self.sync_point.take() else {
+            return external;
+        };
+        log::debug!(target: "meganeura::submission", "wait begin");
+        let _span = tracing::info_span!("wait").entered();
+        let step = completed(self.gpu.wait_for(&sp, !0), "step");
+        self.last_gpu_timings = match step {
+            Ok(()) => resolved_timings(&self.gpu, &mut self.encoder, self.gpu_timing),
+            Err(_) => None,
+        };
+        log::debug!(target: "meganeura::submission", "wait complete");
+        external.and(step)
     }
 
     /// Execute the full dispatch sequence (forward + backward + update).
