@@ -1,5 +1,13 @@
 # Unreleased
 
+- Occupancy thresholds (`SCALAR_OCCUPIED`, `MIN_F16_COOP_WORKGROUPS`,
+  `MIN_F32_COOP_WORKGROUPS`, `MIN_GRAD_INPUT_WORKGROUPS`,
+  `SMALL_TILE_BELOW_WORKGROUPS`), device-scaled workgroup targets, widest-tile
+  selection, and all eight reduction-partition heuristics across
+  `kernels::matmul`, `kernels::conv`, `codegen::workgroup`, `compile::lower`,
+  `compile::emit`, `compile::split_k`, and `train::search` are consolidated
+  into one `kernels::occupancy` module with a single `PartitionPolicy`.
+
 - The ONNX importer runs D-FINE (onnx-community's `dfine_n_coco-ONNX` at a
   fixed 640×640 input). Its logits and boxes match onnxruntime within 4e-4,
   apart from two queries whose near-equal scores select in the other order.

@@ -21,6 +21,7 @@ pub(crate) mod attention;
 pub mod attention_grad;
 pub(crate) mod conv;
 pub mod matmul;
+pub(crate) mod occupancy;
 
 /// Why a variant declined a problem.
 pub(crate) type Rejection = &'static str;

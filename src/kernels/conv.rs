@@ -8,7 +8,7 @@
 //! [`Path`] family. Depthwise and Winograd convolutions are separate
 //! computations with their own kernels.
 
-use super::{Family, Rejection};
+use super::{Family, Rejection, occupancy};
 use crate::codegen::{CoopConfig, ShaderGroup};
 use crate::compile::{Dispatch, Kernel, ShaderEntry};
 
@@ -98,32 +98,30 @@ pub(crate) enum Kind {
 
 /// Register tiles of the scalar kernels, widest first.
 const TILES: [u32; 3] = [64, 32, 16];
-/// Workgroups a scalar tiling needs to occupy the device.
-const OCCUPIED: u32 = 64;
-/// With f32 cooperative matrices, the 64-wide tile is kept from this many
-/// workgroups on, so session construction can promote it.
-const COOPERATIVE_CANDIDATE: u32 = 16;
 
 /// The scalar register tile for a `rows × cols` product over `batch`
 /// images: the widest that still occupies the device, or 16 when none
 /// does. A device with f32 cooperative matrices keeps the 64-wide tile
-/// from 16 workgroups on, since only that entry is promoted.
+/// from [`occupancy::MIN_F32_COOP_WORKGROUPS`] workgroups on, since only that
+/// entry is promoted.
 pub(crate) fn register_tile(rows: u32, cols: u32, batch: u32, f32_cooperative: bool) -> u32 {
     let batch = batch.max(1);
-    let groups = |tile: u32| rows.div_ceil(tile) * cols.div_ceil(tile) * batch;
-    if f32_cooperative && groups(64) >= COOPERATIVE_CANDIDATE {
+    if f32_cooperative
+        && u64::from(rows.div_ceil(64)) * u64::from(cols.div_ceil(64)) * u64::from(batch)
+            >= occupancy::MIN_F32_COOP_WORKGROUPS
+    {
         return 64;
     }
-    TILES
-        .into_iter()
-        .find(|&tile| groups(tile) >= OCCUPIED)
-        .unwrap_or(16)
+    occupancy::widest_occupied_tile(
+        &TILES,
+        |tile| (tile, tile),
+        rows,
+        cols,
+        batch,
+        u64::from(occupancy::SCALAR_OCCUPIED),
+        false,
+    )
 }
-
-/// Workgroups the reduction partitions of a split weight gradient aim for.
-const SPLIT_WORKGROUPS: u32 = 256;
-/// Fewest reduction positions in a partition: sixteen K stages.
-const MIN_PARTITION: u32 = 256;
 
 /// Reduction partitions for a weight gradient's `rows × cols` output summed
 /// over `reduction` positions, when its 64-wide grid cannot occupy the
@@ -135,15 +133,8 @@ pub(crate) fn weight_partitions(rows: u32, cols: u32, reduction: u32) -> Option<
     if rows < 64 || cols < 64 {
         return None;
     }
-    let groups = rows.div_ceil(64) * cols.div_ceil(64);
-    if groups >= OCCUPIED {
-        return None;
-    }
-    let splits = SPLIT_WORKGROUPS
-        .div_ceil(groups)
-        .min(reduction / MIN_PARTITION)
-        .min(65_535);
-    (splits >= 2).then_some(splits)
+    let groups = rows.div_ceil(64).saturating_mul(cols.div_ceil(64));
+    occupancy::CONV_WEIGHT_SPLITS.multi_splits(groups, reduction)
 }
 
 /// The scalar shader entry for `kind` at `tile`.
@@ -271,14 +262,6 @@ pub(crate) enum Path {
     Compiled,
 }
 
-/// Cooperative tiles below which staging costs more than it saves: f16
-/// tiles lose on discrete NVIDIA GPUs at low occupancy, and the input
-/// gradient's scalar staging runs 64 threads against the scalar kernel's
-/// 256.
-pub(crate) const MIN_F16_WORKGROUPS: u64 = 128;
-const MIN_F32_WORKGROUPS: u64 = 16;
-const MIN_GRAD_INPUT_WORKGROUPS: u64 = 16;
-
 impl Family for Path {
     type Problem = Problem;
     type Target = Target;
@@ -315,9 +298,11 @@ impl Family for Path {
             let geometry = cooperative_geometry(problem, config)?;
             let workgroups: u64 = geometry.grid.into_iter().map(u64::from).product();
             let minimum = match problem.kind {
-                Kind::GradInput => MIN_GRAD_INPUT_WORKGROUPS,
-                Kind::Forward | Kind::GradWeight if config.use_f16_input => MIN_F16_WORKGROUPS,
-                Kind::Forward | Kind::GradWeight => MIN_F32_WORKGROUPS,
+                Kind::GradInput => occupancy::MIN_GRAD_INPUT_WORKGROUPS,
+                Kind::Forward | Kind::GradWeight if config.use_f16_input => {
+                    occupancy::MIN_F16_COOP_WORKGROUPS
+                }
+                Kind::Forward | Kind::GradWeight => occupancy::MIN_F32_COOP_WORKGROUPS,
             };
             if workgroups < minimum {
                 // Policy, not legality.

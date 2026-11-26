@@ -11,7 +11,7 @@
 //! Single-row products (GEMV), block-diagonal and batch-major layouts and
 //! convolutions are separate computations with their own kernels.
 
-use super::{Family, Rejection};
+use super::{Family, Rejection, occupancy};
 use crate::codegen::{CoopConfig, ScalarMatmulShape, ShaderGroup};
 use crate::compile::{Dispatch, Kernel};
 use serde::{Deserialize, Serialize};
@@ -21,29 +21,20 @@ use serde::{Deserialize, Serialize};
 /// multiplication types do not change the partition contract.
 pub(crate) fn matrix_splits(m: u32, n: u32, k: u32) -> u32 {
     let groups = m.div_ceil(32).saturating_mul(n.div_ceil(32)).max(1);
-    if k < 1024 || groups >= 128 {
-        return 1;
-    }
-    128u32.div_ceil(groups).min(k / 256).min(16)
+    occupancy::TYPED_MATMUL_SPLITS.splits(groups, k)
 }
 
 /// K partitions for a scalar product whose grid of 32×32 tiles, the
-/// narrowest tuning offers, has fewer workgroups than [`SCALAR_OCCUPIED`]:
-/// aim for 128 workgroups with at least eight 16-deep K stages each. A
-/// 64×1024 by 1024×256 product has 16 workgroups and gets 8 partitions; on
-/// RTX 5070 and Arc B570 that takes 0.4 of the unsplit time, SumRows
-/// included. A 64×256 by 256×1024 product already has 64 and stays whole.
+/// narrowest tuning offers, has fewer workgroups than
+/// [`occupancy::SCALAR_OCCUPIED`]: aim for 128 workgroups with at least eight
+/// 16-deep K stages each. A 64×1024 by 1024×256 product has 16 workgroups and
+/// gets 8 partitions; on RTX 5070 and Arc B570 that takes 0.4 of the unsplit
+/// time, SumRows included. A 64×256 by 256×1024 product already has 64 and
+/// stays whole.
 pub(crate) fn scalar_partitions(m: u32, n: u32, k: u32) -> Option<u32> {
     let groups = m.div_ceil(32).saturating_mul(n.div_ceil(32)).max(1);
-    if groups >= SCALAR_OCCUPIED {
-        return None;
-    }
-    let splits = 128u32.div_ceil(groups).min(k / 128).min(16);
-    (splits >= 2).then_some(splits)
+    occupancy::SCALAR_MATMUL_SPLITS.multi_splits(groups, k)
 }
-
-/// Scalar output grids with this many workgroups are left unsplit.
-const SCALAR_OCCUPIED: u32 = 64;
 
 /// Which product a dispatch computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,23 +181,14 @@ pub enum Path {
     Compiled,
 }
 
-/// Output workgroups below which f16 cooperative staging costs more than
-/// it saves. Representative transformer projections with 20--72 tiles
-/// regress on discrete NVIDIA GPUs; wider backward and MLP products win.
-const MIN_F16_COOPERATIVE_WORKGROUPS: u64 = 128;
-/// The same for f32 cooperative tiles, whose staging is cheaper.
-const MIN_F32_COOPERATIVE_WORKGROUPS: u64 = 16;
-/// 64-wide tilings with fewer workgroups than this switch to 32-wide tiles,
-/// four times as many, to occupy GPUs with many SMs.
-const SMALL_TILE_BELOW_WORKGROUPS: u32 = 16;
-
 /// 128 rows by 64 columns: an 8×4 register tile per thread, against 4×4
 /// for the compiled 64×64 kernel, reads shared memory 1.5 times less often
-/// per multiply-add. Products with at least [`SCALAR_OCCUPIED`] such tiles
-/// take 0.60–0.97 of the 64×64 time on Arc B570 and 0.85–0.92 on RTX 5070
-/// (4096³: 26.4 against 44.1 ms, and 12.4 against 14.6); with 16 or fewer
-/// they run slower on both. Interleaved columns suit the B570 (2048³: 4.7
-/// TFLOP/s against 3.4) and cost the RTX 5070 a little (12.4 against 13.5).
+/// per multiply-add. Products with at least [`occupancy::SCALAR_OCCUPIED`]
+/// such tiles take 0.60–0.97 of the 64×64 time on Arc B570 and 0.85–0.92 on
+/// RTX 5070 (4096³: 26.4 against 44.1 ms, and 12.4 against 14.6); with 16 or
+/// fewer they run slower on both. Interleaved columns suit the B570 (2048³:
+/// 4.7 TFLOP/s against 3.4) and cost the RTX 5070 a little (12.4 against
+/// 13.5).
 pub(crate) const WIDE_TILE: ScalarMatmulShape = ScalarMatmulShape {
     tile_size: 128,
     tile_n: 64,
@@ -263,9 +245,9 @@ impl Family for Path {
                     let geometry = cooperative_geometry(problem, config)?;
                     let workgroups: u64 = geometry.grid.into_iter().map(u64::from).product();
                     let minimum = if config.use_f16_input {
-                        MIN_F16_COOPERATIVE_WORKGROUPS
+                        occupancy::MIN_F16_COOP_WORKGROUPS
                     } else {
-                        MIN_F32_COOPERATIVE_WORKGROUPS
+                        occupancy::MIN_F32_COOP_WORKGROUPS
                     };
                     if workgroups < minimum {
                         // Policy, not legality: tuning may still measure it.
@@ -282,7 +264,7 @@ impl Family for Path {
                     Err("packed weights keep their compiled kernel")
                 } else if problem.layout.transposed_with_addend() {
                     Err("no 32-wide kernel for transposed products with an addend")
-                } else if problem.compiled_workgroups >= SMALL_TILE_BELOW_WORKGROUPS {
+                } else if problem.compiled_workgroups >= occupancy::SMALL_TILE_BELOW_WORKGROUPS {
                     Err("64-wide tiles already occupy the device")
                 } else {
                     Ok(())
@@ -294,7 +276,9 @@ impl Family for Path {
                     Err("the kernel is fixed by a schedule or storage policy")
                 } else if problem.reduced_storage {
                     Err("packed weights keep their compiled kernel")
-                } else if u64::from(columns) * u64::from(rows) < u64::from(SCALAR_OCCUPIED) {
+                } else if u64::from(columns) * u64::from(rows)
+                    < u64::from(occupancy::SCALAR_OCCUPIED)
+                {
                     Err("too few 128x64 tiles to occupy the device")
                 } else if !crate::compile::workgroups_within_portable_limits(wide_workgroups(
                     problem,
