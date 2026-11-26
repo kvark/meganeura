@@ -233,7 +233,8 @@ impl ExecutionPlan {
                 "tiled native f32 prologue with addend is unsupported",
             ));
         }
-        let (m, n, k) = dispatch.mnk().ok_or(TuneError("not a dense product"))?;
+        let product = dispatch.product().ok_or(TuneError("not a dense product"))?;
+        let (m, n, k) = (product.m, product.n, product.k);
         let rows = crate::codegen::CooperativeMatmulShape::ROWS;
         if !shape.fits_dimensions(m, n, k)
             || !(1..=(k / shape.k_stage).min(65535)).contains(&splits)
@@ -262,18 +263,19 @@ impl ExecutionPlan {
         if !binding_fits(dispatch.input_buffers.first(), m.checked_mul(k))
             || !binding_fits(dispatch.input_buffers.get(1), n.checked_mul(k))
             || !binding_fits(Some(&dispatch.output_buffer), Some(columns))
-            || (matches!(
-                dispatch.shader,
-                ShaderEntry::FusedMatMulAdd
-                    | ShaderEntry::FusedMatMulATAdd
-                    | ShaderEntry::FusedMatMulBTAdd
-            ) && !binding_fits(dispatch.input_buffers.get(2), Some(columns)))
+            || (product.layout.has_addend()
+                && !binding_fits(dispatch.input_buffers.get(2), Some(columns)))
         {
             return Err(TuneError("tiled native f32 binding capacity is too small"));
         }
         let mut producer = dispatch.clone();
         producer.kernel = super::Kernel::CooperativeTiled { shape, splits };
-        producer.workgroups = [m / rows, n / shape.columns, splits];
+        producer.workgroups = product
+            .launch(
+                crate::kernels::matmul::Variant::CooperativeTiled(shape),
+                splits,
+            )
+            .workgroups;
         if splits == 1 {
             self.dispatches[index] = producer;
             return Ok(());
@@ -456,13 +458,12 @@ impl ExecutionPlan {
             .m
             .checked_mul(class.n)
             .ok_or(TuneError("matrix size overflow"))?;
+        let product = dispatch.product().expect("split-K matrix product");
         let mut producer = dispatch.clone();
         producer.kernel = super::Kernel::SplitMatmul { shape, splits };
-        producer.workgroups = [
-            class.n.div_ceil(shape.cols()),
-            class.m.div_ceil(shape.rows()),
-            splits,
-        ];
+        producer.workgroups = product
+            .launch(crate::kernels::matmul::Variant::SplitScalar(shape), splits)
+            .workgroups;
         self.splice_k_partials(index, producer, columns, splits, max_partial_bytes)
     }
 

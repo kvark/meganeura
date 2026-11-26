@@ -1,7 +1,6 @@
 pub use crate::compile::CoopPolicy;
 #[cfg(test)]
 pub(crate) use crate::compile::lower::select_variants;
-use crate::compile::lower::tiled_coop_shared_bytes;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
     ExecutionPlan, RoPEParams, ShaderEntry, WinogradInputParams, WinogradOutputParams,
@@ -900,45 +899,6 @@ struct MultiHeadAttnGradKVData {
 
 // ---- Pipeline collection ----
 
-/// A packed B buffer and a 32×32 tile each change the generated WGSL, so
-/// both travel in the key: sharing one pipeline across them would run an
-/// f32 shader over packed blocks, or a 64×64 shader under a workgroup
-/// count computed for 32×32 tiles.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct EpiloguePipelineKey(
-    crate::compile::MatMulEpilogue,
-    crate::compile::WeightFormat,
-    Option<crate::tune::MatmulTile>,
-);
-
-fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
-    let format = dispatch.weight_format;
-    dispatch.matmul_epilogue.as_ref().map(|epilogue| {
-        EpiloguePipelineKey(
-            epilogue.clone(),
-            format,
-            crate::tune::MatmulTile::selected(dispatch, None),
-        )
-    })
-}
-
-/// Tile geometry the epilogue shader must be generated for.
-///
-/// `select_variants` demotes low-occupancy matmuls to 32×32 tiles and
-/// recomputes `workgroups` to match. The epilogue path has to follow, or
-/// the dispatch runs a 64×64 shader over a 32×32 grid — the store bounds
-/// check keeps the result correct, but three quarters of the workgroups
-/// do nothing.
-fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
-    if let Some(shape) = dispatch.scalar_matmul() {
-        shape.geometry()
-    } else if dispatch.use_small_tiles() {
-        crate::codegen::MatMulTile::Small
-    } else {
-        crate::codegen::MatMulTile::Large
-    }
-}
-
 /// Identifies one compiled pipeline.
 ///
 /// A dispatch names a `ShaderEntry`, but the pipeline it actually runs
@@ -947,17 +907,12 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    /// Dense matrix product (`MatMul*` / `FusedMatMul*Add`), keyed by its
+    /// codegen input [`crate::kernels::matmul::Code`].
+    Product(crate::kernels::matmul::Code),
     StoredGate(ShaderEntry, crate::DType),
     WinogradTransform(ShaderEntry, crate::DType),
     WinogradMatmul(ShaderEntry, crate::DType, [u32; 2]),
-    /// Checked cooperative product with explicit operand, multiplication and
-    /// output types. K partitions are uniform data and do not change the
-    /// pipeline.
-    CoopTyped(
-        ShaderEntry,
-        crate::codegen::MatrixTypes,
-        crate::codegen::TypedMatmulLayout,
-    ),
     /// Entry, types, parameters, whether a forward/pointwise convolution splits
     /// K over workgroup Z, and whether a phased input gradient reads transposed weights.
     CoopConv(
@@ -966,27 +921,6 @@ enum Variant {
         Conv2dParams,
         bool,
         bool,
-    ),
-    CoopWorkgroup(
-        ShaderEntry,
-        crate::codegen::WorkgroupMatmulShape,
-        crate::codegen::MatrixTypes,
-        /// Guard global accesses to the final, incomplete row tile.
-        bool,
-        /// Optional unary fused elementwise epilogue.
-        Option<crate::compile::MatMulEpilogue>,
-    ),
-    CoopTiled(
-        ShaderEntry,
-        crate::codegen::CooperativeMatmulShape,
-        u32,
-        Vec<crate::compile::PrologueLoadKind>,
-    ),
-    SplitMatmul(
-        ShaderEntry,
-        crate::compile::WeightFormat,
-        crate::codegen::ScalarMatmulShape,
-        u32,
     ),
     SpecializedConv(ShaderEntry, Vec<u32>, u32, bool),
     ScalarMatmul(
@@ -1013,18 +947,6 @@ enum Variant {
     /// strict bound. Causal and unmasked forward share that rule.
     Attention(ShaderEntry, u32, Option<u32>, bool),
     BlockAttention(ShaderEntry, AttentionParams),
-    /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
-    /// uses workgroup memory to expose accumulator lanes to the epilogue.
-    Epilogue(ShaderEntry, EpiloguePipelineKey),
-    CoopEpilogue(ShaderEntry, EpiloguePipelineKey),
-    /// Prologue-fused coop matmuls. Prologues only apply when `use_coop`
-    /// is set. Weight storage and factor kinds determine the shader; buffer
-    /// IDs are resolved at dispatch time.
-    CoopPrologue(
-        ShaderEntry,
-        crate::compile::WeightFormat,
-        Vec<crate::compile::PrologueLoadKind>,
-    ),
     /// GEMV with a RmsNorm folded into its A operand, at a weight format
     /// and measured shape. Packing and width are part of the key so a Q4_0
     /// winner cannot be installed on an f32 fused GEMV of the same extents.
@@ -1056,11 +978,9 @@ enum Variant {
         crate::compile::WeightFormat,
         crate::codegen::GemvShape,
     ),
-    /// Non-f32 weight storage (f16, Q4, Q8).
+    /// Non-f32 weight storage (f16, Q4, Q8) on non-product kernels (GEMV).
     Weight(ShaderEntry, crate::compile::WeightFormat),
-    WeightSmall(ShaderEntry, crate::compile::WeightFormat),
-    /// Cooperative-matrix implementation qualified for the session's precision
-    /// policy, for the weight format it reads (f32, or f16 with f16 tiles).
+    /// Cooperative-matrix implementation for non-product kernels (convolutions).
     Coop(ShaderEntry, crate::compile::WeightFormat),
     /// Same-A matmul pack (D1). The kind is part of the key so scalar and
     /// cooperative packs of the same arity cannot share a pipeline.
@@ -1090,27 +1010,20 @@ impl Variant {
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
             Variant::Reduction { .. } | Variant::Pointwise { .. } => None,
+            Variant::Product(ref code) => Some(code.layout.entry_ref()),
             Variant::StoredGate(ref e, _)
             | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
             | Variant::BlockAttention(ref e, _)
             | Variant::Attention(ref e, _, _, _)
-            | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _, _, _)
-            | Variant::CoopWorkgroup(ref e, _, _, _, _)
-            | Variant::CoopTiled(ref e, _, _, _)
-            | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
-            | Variant::Epilogue(ref e, _)
-            | Variant::CoopEpilogue(ref e, _)
-            | Variant::CoopPrologue(ref e, _, _)
             | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
             | Variant::GemvIntDot(ref e, _, _)
             | Variant::GemvRmsNormIntDot(ref e, _, _)
             | Variant::Weight(ref e, _)
-            | Variant::WeightSmall(ref e, _)
             | Variant::Coop(ref e, _)
             | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
@@ -1121,6 +1034,7 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::Product(ref code) => code.label(),
             Variant::CoopConv(ref e, types, ref params, split, transposed) => {
                 let split = if split { ":split-k" } else { "" };
                 let wt = if transposed { ":wt" } else { "" };
@@ -1130,29 +1044,6 @@ impl Variant {
             Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
-            }
-            Variant::CoopWorkgroup(ref e, shape, types, row_bounds, ref epilogue) => {
-                let suffix = if row_bounds { "-row-bounds" } else { "" };
-                let epi = if epilogue.is_some() { "-epilogue" } else { "" };
-                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}{epi}")
-            }
-            Variant::CoopTyped(ref e, types, staging) => {
-                use crate::codegen::MatrixTypes;
-                let multiply = MatrixTypes::name(types.multiply);
-                let operands = if types.a == types.multiply && types.b == types.multiply {
-                    multiply.to_owned()
-                } else {
-                    let (a, b) = (MatrixTypes::name(types.a), MatrixTypes::name(types.b));
-                    format!("{a}-{b}-as-{multiply}")
-                };
-                let output = MatrixTypes::name(types.output);
-                format!("{e:?}:cooperative-{operands}-{output}-output:{staging:?}")
-            }
-            Variant::CoopTiled(ref e, shape, splits, ref prologue) => {
-                format!("{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{prologue:?}")
-            }
-            Variant::SplitMatmul(ref e, format, shape, splits) => {
-                format!("{e:?}:split-k-{format:?}-{splits}-{shape:?}")
             }
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
@@ -1178,14 +1069,6 @@ impl Variant {
                 let tiles = if f16_tiles { ":f16-tiles" } else { "" };
                 format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}{tiles}")
             }
-            Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
-            Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
-            Variant::CoopPrologue(ref e, crate::compile::WeightFormat::F32, ref kinds) => {
-                format!("{e:?}:cooperative-prologue:{kinds:?}")
-            }
-            Variant::CoopPrologue(ref e, format, ref kinds) => {
-                format!("{e:?}:cooperative-prologue-{format:?}-weights:{kinds:?}")
-            }
             Variant::GemvRmsNorm(ref e, format, shape) => {
                 format!("{e:?}:rmsnorm-{format:?}-{shape:?}")
             }
@@ -1197,7 +1080,6 @@ impl Variant {
             }
             Variant::Gemv(ref e, format, shape) => format!("{e:?}:gemv-{format:?}-{shape:?}"),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
-            Variant::WeightSmall(ref e, format) => format!("{e:?}:weight-{format:?}-small-tile"),
             Variant::Coop(ref e, crate::compile::WeightFormat::F32) => format!("{e:?}:cooperative"),
             Variant::Coop(ref e, format) => format!("{e:?}:cooperative-{format:?}-weights"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
@@ -1365,30 +1247,6 @@ fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTyp
     }
 }
 
-fn typed_matmul_layout(dispatch: &Dispatch, specialize: bool) -> crate::codegen::TypedMatmulLayout {
-    let types = checked_matrix_types(dispatch).expect("typed matrix product");
-    let Some((m, n, k)) = dispatch.mnk() else {
-        assert!(matches!(
-            dispatch.shader,
-            ShaderEntry::Conv2dGemmCoopGen(..)
-        ));
-        return crate::codegen::TypedMatmulLayout::default();
-    };
-    crate::codegen::TypedMatmulLayout {
-        dimensions: specialize.then_some([m, n, k]),
-        ..crate::codegen::TypedMatmulLayout::for_product(
-            types,
-            matches!(
-                dispatch.shader,
-                ShaderEntry::FusedMatMulAdd
-                    | ShaderEntry::FusedMatMulATAdd
-                    | ShaderEntry::FusedMatMulBTAdd
-            ),
-            [m, n, k],
-        )
-    }
-}
-
 /// Reduced storage types, and the multiplication types of checked
 /// cooperative products, that a plan needs from the device.
 fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<crate::DType>) {
@@ -1428,25 +1286,7 @@ fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<cr
     (storage, multiply)
 }
 
-/// The cooperative M×N×K shapes a device lists for `multiply` operands with
-/// an F32 accumulator.
-fn cooperative_shapes(
-    capabilities: &blade_graphics::CooperativeMatrix,
-    multiply: crate::DType,
-) -> &[[u32; 3]] {
-    match multiply {
-        crate::DType::BF16 => &capabilities.bf16_f32_shapes,
-        crate::DType::F16 => &capabilities.f16_f32_shapes,
-        crate::DType::F32 => &capabilities.f32_shapes,
-        _ => &[],
-    }
-}
-
-fn checked_matrix_unsupported(multiply: crate::DType) -> String {
-    format!(
-        "{multiply:?} matrix products require native 16x16x16, 8x16x16 or 8x8x8 {multiply:?}/F32 cooperative matrices"
-    )
-}
+use crate::kernels::matmul::{checked_matrix_unsupported, cooperative_shapes};
 
 const F16_SUBNORMALS_LOST: &str = "F16 matrix products require F16/F32 cooperative matrices that keep subnormal F16 operands; this device flushes them";
 
@@ -2007,27 +1847,6 @@ fn required_full_subgroup_size(
     fs.supports(size, req.workgroup_size).then_some(size)
 }
 
-/// Shared workgroup-cooperative tile resolution used by both `Pipelines::compile`
-/// and `tuning::tile_module`.
-pub(super) fn workgroup_matmul_shape_and_subgroup(
-    shape: crate::codegen::WorkgroupMatmulShape,
-    types: crate::codegen::MatrixTypes,
-    caps: &blade_graphics::Capabilities,
-) -> Option<([u32; 3], u32)> {
-    if shape.subgroup_rows != 0 {
-        crate::codegen::native_subgroup_shape(caps, types.multiply)
-    } else {
-        Some(([16, 16, 16], 32))
-    }
-}
-
-pub(super) fn workgroup_matmul_epilogue_supported(
-    shape: crate::codegen::WorkgroupMatmulShape,
-    epilogue: Option<&crate::compile::MatMulEpilogue>,
-) -> bool {
-    epilogue.is_none_or(|epi| shape.subgroup_rows != 0 && epi.inputs.is_empty())
-}
-
 fn create_profiled_pipeline(
     gpu: &Gpu,
     name: String,
@@ -2269,15 +2088,28 @@ impl Pipelines {
         String,
     > {
         use crate::codegen::ShaderGroup;
-        let mut matmul_knobs = crate::codegen::MatmulKnobs {
+        let capabilities = gpu.capabilities();
+        let base_matmul_knobs = crate::codegen::MatmulKnobs {
             k_stage: knobs.matmul_k_stage,
             interleave_columns: knobs.matmul_interleave_columns,
-            integer_dot: gpu.capabilities().shader_integer_dot_product,
+            integer_dot: capabilities.shader_integer_dot_product,
             unroll_k: false,
             vector_fragments: false,
         };
+        if let Variant::Product(ref code) = *key {
+            crate::kernels::matmul::validate_dispatch(dispatch, code, &capabilities)?;
+            return crate::kernels::matmul::module(
+                code,
+                &crate::kernels::matmul::CodeTarget {
+                    capabilities: &capabilities,
+                    knobs: base_matmul_knobs,
+                    cooperative: coop_config.copied(),
+                },
+            );
+        }
+        let mut matmul_knobs = base_matmul_knobs;
         if let Some(shape) = dispatch.scalar_matmul() {
-            let limit = gpu.capabilities().max_compute_shared_memory_size;
+            let limit = capabilities.max_compute_shared_memory_size;
             if limit != 0 && shape.shared_bytes() > limit {
                 return Err(format!(
                     "scalar tile requires {} shared bytes, device limit is {limit}",
@@ -2291,7 +2123,6 @@ impl Pipelines {
         }
         let group = dispatch.shader.shader_group();
         let typed_shape = |multiply| {
-            let capabilities = gpu.capabilities();
             crate::codegen::checked_cooperative_shape(cooperative_shapes(
                 &capabilities.cooperative_matrix,
                 multiply,
@@ -2303,6 +2134,7 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::Product(_) => unreachable!(),
             Variant::StoredGate(_, output) => crate::codegen::generate_gated_module(output),
             Variant::WinogradTransform(_, storage) => {
                 crate::codegen::winograd::transform(group, storage)
@@ -2311,7 +2143,7 @@ impl Pipelines {
                 storage,
                 typed_shape(storage)?,
                 tile,
-                gpu.capabilities().subgroup_size,
+                capabilities.subgroup_size,
             ),
             Variant::CoopConv(
                 ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSplit,
@@ -2322,7 +2154,7 @@ impl Pipelines {
             ) => crate::codegen::generate_subgroup_weight_grad(
                 types,
                 typed_shape(types.multiply)?,
-                gpu.capabilities().subgroup_size,
+                capabilities.subgroup_size,
                 params,
             )
             .ok_or("subgroup-tiled weight gradients need supported cooperative matrices")?,
@@ -2335,7 +2167,7 @@ impl Pipelines {
             ) if stride > 1 => crate::codegen::generate_subgroup_phased_grad_input(
                 types,
                 typed_shape(types.multiply)?,
-                gpu.capabilities().subgroup_size,
+                capabilities.subgroup_size,
                 params,
                 transposed,
             )
@@ -2359,69 +2191,8 @@ impl Pipelines {
                     types,
                     typed_shape(types.multiply)?,
                     params,
-                    gpu.capabilities().subgroup_size,
+                    capabilities.subgroup_size,
                     split,
-                )
-            }
-            Variant::CoopTyped(_, types, staging) => {
-                crate::codegen::generate_module_coop_typed_with_subgroup(
-                    group,
-                    types,
-                    typed_shape(types.multiply)?,
-                    staging,
-                    gpu.capabilities().subgroup_size,
-                )
-            }
-            Variant::CoopWorkgroup(_, shape, types, row_bounds, ref epilogue) => {
-                let capabilities = gpu.capabilities();
-                if !dispatch.mnk().is_some_and(|(m, n, k)| {
-                    shape.supports_layout(&capabilities, types, Some(group), m, n, k)
-                }) {
-                    return Err("unsupported workgroup cooperative product".to_owned());
-                }
-                if !workgroup_matmul_epilogue_supported(shape, epilogue.as_ref()) {
-                    return Err("unsupported epilogue on workgroup cooperative product".to_owned());
-                }
-                let (native, subgroup) =
-                    workgroup_matmul_shape_and_subgroup(shape, types, &capabilities)
-                        .ok_or_else(|| checked_matrix_unsupported(types.multiply))?;
-                crate::codegen::generate_workgroup_matmul_for_device(
-                    group,
-                    shape,
-                    types,
-                    native,
-                    subgroup,
-                    row_bounds,
-                    epilogue.as_ref(),
-                )
-            }
-            Variant::CoopTiled(_, shape, splits, _) => {
-                let config = cooperative();
-                if config.tile_size != 16 || config.use_f16_input {
-                    return Err("tiled cooperative matmul requires native 16x16 f32".to_owned());
-                }
-                if !dispatch
-                    .mnk()
-                    .is_some_and(|(m, n, k)| shape.fits_dimensions(m, n, k))
-                {
-                    return Err(
-                        "tiled cooperative matmul requires complete aligned tiles".to_owned()
-                    );
-                }
-                let shared_limit = gpu.capabilities().max_compute_shared_memory_size;
-                if shared_limit != 0
-                    && tiled_coop_shared_bytes(dispatch, shape) > u64::from(shared_limit)
-                {
-                    return Err("tiled cooperative matmul exceeds device shared memory".to_owned());
-                }
-                if let Some(ref prologue) = dispatch.matmul_prologue {
-                    layout = matmul_with_prologue_layout(prologue.factors.len());
-                }
-                crate::codegen::generate_tiled_coop_matmul(
-                    group,
-                    shape,
-                    splits,
-                    dispatch.matmul_prologue.as_ref(),
                 )
             }
             Variant::Scalar(_) => match group {
@@ -2432,12 +2203,12 @@ impl Pipelines {
                         types,
                         typed_shape(types.multiply)?,
                         Default::default(),
-                        gpu.capabilities().subgroup_size,
+                        capabilities.subgroup_size,
                     )
                 }
                 // Subgroup sums where the device has subgroups: two barriers
                 // a reduction where the shared-memory tree takes eight.
-                crate::codegen::ShaderGroup::LayerNorm if gpu.capabilities().subgroup_size > 0 => {
+                crate::codegen::ShaderGroup::LayerNorm if capabilities.subgroup_size > 0 => {
                     crate::codegen::generate_layer_norm_subgroup()
                 }
                 _ => crate::codegen::generate_module(group, matmul_knobs),
@@ -2446,29 +2217,16 @@ impl Pipelines {
             Variant::Weight(_, format) => {
                 crate::codegen::generate_module_weighted(group, format, matmul_knobs)
             }
-            Variant::WeightSmall(..) => tuning::tile_module(
-                dispatch,
-                crate::tune::MatmulTile::Tile32,
-                matmul_knobs,
-                &gpu.capabilities(),
-            ),
             Variant::ScalarMatmul(_, _, shape) => tuning::tile_module(
                 dispatch,
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
-                &gpu.capabilities(),
-            ),
-            Variant::SplitMatmul(_, _, shape, splits) => crate::codegen::generate_split_matmul(
-                group,
-                shape,
-                splits,
-                dispatch.weight_format,
-                matmul_knobs,
+                &capabilities,
             ),
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
-                tuning::tile_module(dispatch, tile, matmul_knobs, &gpu.capabilities())
+                tuning::tile_module(dispatch, tile, matmul_knobs, &capabilities)
             }
             Variant::Gemv(_, _, shape)
             | Variant::GemvIntDot(_, _, shape)
@@ -2481,7 +2239,7 @@ impl Pipelines {
                     dispatch,
                     crate::tune::MatmulTile::Gemv(shape),
                     matmul_knobs,
-                    &gpu.capabilities(),
+                    &capabilities,
                 )
             }
             Variant::Coop(..) => {
@@ -2506,46 +2264,8 @@ impl Pipelines {
                             &config,
                         )
                     }
-                    _ => crate::codegen::generate_module_coop_weighted(
-                        group,
-                        &config,
-                        dispatch.weight_format,
-                    ),
+                    _ => unreachable!("dense products route through Variant::Product"),
                 }
-            }
-            Variant::Epilogue(..) => crate::codegen::generate_matmul_with_epilogue(
-                group,
-                dispatch.matmul_epilogue.as_ref(),
-                crate::codegen::MatMulOptions {
-                    format: dispatch.weight_format,
-                    tile: epilogue_tile(dispatch),
-                    knobs: matmul_knobs,
-                },
-            ),
-            Variant::CoopEpilogue(..) => crate::codegen::generate_coop_matmul_with_dag_epilogue(
-                group,
-                &cooperative(),
-                dispatch
-                    .matmul_epilogue
-                    .as_ref()
-                    .expect("cooperative epilogue"),
-                dispatch.weight_format,
-            ),
-            Variant::CoopPrologue(..) => {
-                let prologue = dispatch
-                    .matmul_prologue
-                    .as_ref()
-                    .expect("cooperative prologue");
-                let (add, variant) =
-                    crate::codegen::coop_shape(group).expect("cooperative matrix group");
-                layout = matmul_with_prologue_layout(prologue.factors.len());
-                crate::codegen::gen_matmul_coop_with_prologue(
-                    add,
-                    variant,
-                    &cooperative(),
-                    prologue,
-                    dispatch.weight_format,
-                )
             }
             Variant::BlockAttention(ref entry, p) => {
                 let caps = gpu.capabilities();
@@ -2781,70 +2501,22 @@ impl Pipelines {
             }
             _ => {}
         }
-        if let crate::compile::Kernel::CooperativeWorkgroup { shape, types, .. } = dispatch.kernel {
-            return Variant::CoopWorkgroup(
-                entry,
-                shape,
-                types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
-                dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
-                dispatch.matmul_epilogue.clone(),
-            );
+        if let Some(code) = crate::kernels::matmul::Code::from_dispatch(dispatch, caps) {
+            return Variant::Product(code);
         }
-        if let crate::compile::Kernel::CooperativeTyped {
-            types, specialize, ..
-        } = dispatch.kernel
-        {
-            if matches!(
+        if let crate::compile::Kernel::CooperativeTyped { types, splits, .. } = dispatch.kernel {
+            let split = matches!(
                 entry,
                 ShaderEntry::Conv2dGemmCoopGen(..)
-                    | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
-                    | ShaderEntry::Conv2dGradWeightGemm
-                    | ShaderEntry::Conv2dGradWeightGemmSplit
-            ) {
-                let split = matches!(
-                    entry,
-                    ShaderEntry::Conv2dGemmCoopGen(..)
-                        | ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1)
-                ) && matches!(dispatch.kernel, crate::compile::Kernel::CooperativeTyped { splits, .. } if splits > 1);
-                return Variant::CoopConv(
-                    entry,
-                    types,
-                    Conv2dParams::from(dispatch),
-                    split,
-                    dispatch.conv_transposed_weights,
-                );
-            }
-            let layout = typed_matmul_layout(dispatch, specialize);
-            // The stored kernel does not read direct_inputs. Normalize it
-            // before any pipeline lookup, including tuning reuse.
-            let stored = crate::codegen::checked_cooperative_shape(cooperative_shapes(
-                &caps.cooperative_matrix,
-                types.multiply,
-            ))
-            .is_some_and(|shape| layout.uses_stored_kernel(shape));
-            return Variant::CoopTyped(
+                    | ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1)
+            ) && splits > 1;
+            return Variant::CoopConv(
                 entry,
                 types,
-                crate::codegen::TypedMatmulLayout {
-                    direct_inputs: layout.direct_inputs && !stored,
-                    ..layout
-                },
+                Conv2dParams::from(dispatch),
+                split,
+                dispatch.conv_transposed_weights,
             );
-        }
-        if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
-            return Variant::CoopTiled(
-                entry,
-                shape,
-                splits,
-                dispatch
-                    .matmul_prologue
-                    .as_ref()
-                    .map(|p| p.factors.iter().map(|f| f.1.clone()).collect())
-                    .unwrap_or_default(),
-            );
-        }
-        if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
-            return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
             return Variant::SpecializedConv(
@@ -2856,13 +2528,6 @@ impl Pipelines {
         }
         if dispatch.horizontal_batch >= 2 {
             return Variant::Horizontal(entry, dispatch.horizontal_batch, horiz_kind(dispatch));
-        }
-        if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
-            return if dispatch.use_coop() {
-                Variant::CoopEpilogue(entry, epilogue)
-            } else {
-                Variant::Epilogue(entry, epilogue)
-            };
         }
         if let Some(shape) = dispatch.scalar_matmul() {
             return Variant::ScalarMatmul(entry, dispatch.weight_format, shape);
@@ -2935,23 +2600,10 @@ impl Pipelines {
         if let Some(shape) = dispatch.gemv_shape() {
             return Variant::Gemv(entry, dispatch.weight_format, shape);
         }
-        let cooperative_f16_weights =
-            dispatch.use_coop() && dispatch.weight_format == crate::compile::WeightFormat::F16;
-        if dispatch.weight_format.uses_reduced_storage() && !cooperative_f16_weights {
-            return if dispatch.use_small_tiles() {
-                Variant::WeightSmall(entry, dispatch.weight_format)
-            } else {
-                Variant::Weight(entry, dispatch.weight_format)
-            };
+        if dispatch.weight_format.uses_reduced_storage() {
+            return Variant::Weight(entry, dispatch.weight_format);
         }
         if dispatch.use_coop() {
-            if let Some(ref prologue) = dispatch.matmul_prologue {
-                return Variant::CoopPrologue(
-                    entry,
-                    dispatch.weight_format,
-                    prologue.factors.iter().map(|f| f.1.clone()).collect(),
-                );
-            }
             return Variant::Coop(entry, dispatch.weight_format);
         }
         if dispatch.use_small_tiles() {
@@ -3025,23 +2677,6 @@ impl Pipelines {
             .map(|(variant, pipeline)| (variant.label(), &pipeline.raw))
             .collect()
     }
-}
-
-fn epilogue_profile_key(
-    entry: &ShaderEntry,
-    epilogue: &EpiloguePipelineKey,
-    cooperative: bool,
-) -> String {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::hash::DefaultHasher::new();
-    epilogue.hash(&mut hasher);
-    let variant = if cooperative {
-        "cooperative-epilogue"
-    } else {
-        "scalar-epilogue"
-    };
-    format!("{entry:?}:{variant}:{:016x}", hasher.finish())
 }
 
 fn horizontal_matmul_layout(count: u32) -> blade_graphics::ShaderDataLayout {
@@ -5647,10 +5282,7 @@ mod variant_tests {
         super::Pipelines::key(dispatch, &blade_graphics::Capabilities::default())
     }
 
-    use super::{
-        Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, epilogue_pipeline_key,
-        epilogue_tile, select_variants,
-    };
+    use super::{Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, select_variants};
 
     #[test]
     fn native16_ignores_direct_input_layout_in_pipeline_keys() {
@@ -5754,31 +5386,47 @@ mod variant_tests {
     /// dispatch runs, so it is pinned rather than left to review.
     #[test]
     fn modifiers_outrank_the_scalar_base() {
-        assert_eq!(matmul(|_| {}), Variant::Scalar(ShaderEntry::MatMul));
+        use crate::compile::WeightFormat;
+        use crate::kernels::matmul::CodeImpl;
 
-        assert_eq!(
+        assert!(matches!(
+            matmul(|_| {}),
+            Variant::Product(code)
+                if code.implementation == CodeImpl::DefaultScalar
+                    && code.weights == WeightFormat::F32
+                    && code.epilogue.is_none()
+        ));
+
+        assert!(matches!(
             matmul(|d| {
                 d.kernel = crate::compile::Kernel::SmallTile;
-                d.weight_format = crate::compile::WeightFormat::F16;
+                d.weight_format = WeightFormat::F16;
             }),
-            Variant::WeightSmall(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
-        );
-        assert_eq!(
+            Variant::Product(code)
+                if code.implementation == CodeImpl::SmallScalar
+                    && code.weights == WeightFormat::F16
+        ));
+        assert!(matches!(
             matmul(|d| d.kernel = crate::compile::Kernel::Cooperative),
-            Variant::Coop(ShaderEntry::MatMul, crate::compile::WeightFormat::F32),
-        );
-        assert_eq!(
+            Variant::Product(code)
+                if code.implementation == CodeImpl::Cooperative
+                    && code.weights == WeightFormat::F32
+        ));
+        assert!(matches!(
             matmul(|d| {
                 d.kernel = crate::compile::Kernel::Cooperative;
-                d.weight_format = crate::compile::WeightFormat::F16;
+                d.weight_format = WeightFormat::F16;
             }),
-            Variant::Coop(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
-        );
+            Variant::Product(code)
+                if code.implementation == CodeImpl::Cooperative
+                    && code.weights == WeightFormat::F16
+        ));
     }
 
     #[test]
     fn cooperative_prologues_keep_weight_storage_in_the_key() {
         use crate::compile::{BufferRef, Kernel, MatMulPrologue, PrologueLoadKind, WeightFormat};
+        use crate::kernels::matmul::CodeImpl;
 
         let key = |format| {
             matmul(|dispatch| {
@@ -5793,8 +5441,16 @@ mod variant_tests {
             })
         };
         let (f32, f16) = (key(WeightFormat::F32), key(WeightFormat::F16));
-        assert!(matches!(f32, Variant::CoopPrologue(..)));
-        assert!(matches!(f16, Variant::CoopPrologue(..)));
+        assert!(matches!(
+            f32,
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::Cooperative && code.prologue.len() == 2
+        ));
+        assert!(matches!(
+            f16,
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::Cooperative && code.prologue.len() == 2
+        ));
         assert_ne!(f32, f16, "mixed-storage prologues must not reuse a shader");
         assert_ne!(f32.label(), f16.label());
     }
@@ -5892,37 +5548,41 @@ mod variant_tests {
     /// fall back to the unfused kernel.
     #[test]
     fn epilogue_fusion_has_no_fallback() {
+        use crate::compile::WeightFormat;
+        use crate::kernels::matmul::CodeImpl;
+
         let candidates = matmul(|d| {
             d.matmul_epilogue = Some(relu_epilogue());
         });
-        assert!(matches!(candidates, Variant::Epilogue(..)));
+        assert!(matches!(
+            candidates,
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::DefaultScalar && code.epilogue.is_some()
+        ));
 
         let coop = matmul(|d| {
             d.matmul_epilogue = Some(relu_epilogue());
             d.kernel = crate::compile::Kernel::Cooperative;
         });
-        assert!(matches!(coop, Variant::CoopEpilogue(..)));
+        assert!(matches!(
+            coop,
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::Cooperative && code.epilogue.is_some()
+        ));
 
         let q4 = matmul(|d| {
             d.matmul_epilogue = Some(relu_epilogue());
-            d.weight_format = crate::compile::WeightFormat::Q4;
+            d.weight_format = WeightFormat::Q4;
         });
-        assert!(matches!(q4, Variant::Epilogue(..)));
+        assert!(matches!(
+            q4,
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::DefaultScalar
+                    && code.weights == WeightFormat::Q4
+                    && code.epilogue.is_some()
+        ));
         assert_ne!(
-            epilogue_pipeline_key(&{
-                let mut d = Dispatch {
-                    shader: ShaderEntry::MatMul,
-                    matmul_epilogue: Some(relu_epilogue()),
-                    ..Default::default()
-                };
-                d.weight_format = crate::compile::WeightFormat::Q4;
-                d
-            }),
-            epilogue_pipeline_key(&Dispatch {
-                shader: ShaderEntry::MatMul,
-                matmul_epilogue: Some(relu_epilogue()),
-                ..Default::default()
-            }),
+            q4, candidates,
             "Q4 and F32 epilogue pipelines must not share a key"
         );
     }
@@ -5932,6 +5592,8 @@ mod variant_tests {
     /// generated for the same geometry, so the tile belongs in the key.
     #[test]
     fn small_tile_epilogue_gets_its_own_pipeline() {
+        use crate::kernels::matmul::CodeImpl;
+
         let large = Dispatch {
             shader: ShaderEntry::MatMul,
             matmul_epilogue: Some(relu_epilogue()),
@@ -5942,8 +5604,8 @@ mod variant_tests {
             ..large.clone()
         };
         assert_ne!(
-            epilogue_pipeline_key(&small),
-            epilogue_pipeline_key(&large),
+            test_key(&small),
+            test_key(&large),
             "32×32 and 64×64 epilogue pipelines must not share a key"
         );
         let mut keys = std::collections::HashSet::new();
@@ -5962,8 +5624,12 @@ mod variant_tests {
                         kernel: crate::compile::Kernel::ScalarMatmul(shape),
                         ..large.clone()
                     };
-                    assert!(matches!(test_key(&dispatch), Variant::Epilogue(..)));
-                    assert_eq!(epilogue_tile(&dispatch), shape.geometry());
+                    assert!(matches!(
+                        test_key(&dispatch),
+                        Variant::Product(code)
+                            if code.implementation == CodeImpl::Scalar(shape)
+                                && code.epilogue.is_some()
+                    ));
                     assert!(keys.insert(test_key(&dispatch)), "{shape:?}");
                     let split = Dispatch {
                         kernel: crate::compile::Kernel::SplitMatmul { shape, splits: 4 },
@@ -5987,22 +5653,35 @@ mod variant_tests {
     /// group-wide veto.
     #[test]
     fn epilogue_dispatch_does_not_request_unreachable_variants() {
+        use crate::compile::WeightFormat;
+        use crate::kernels::matmul::CodeImpl;
+
         let epilogue_small = matmul(|d| {
             d.matmul_epilogue = Some(relu_epilogue());
             d.kernel = crate::compile::Kernel::SmallTile;
-            d.weight_format = crate::compile::WeightFormat::Q4;
+            d.weight_format = WeightFormat::Q4;
         });
-        assert!(matches!(epilogue_small, Variant::Epilogue(..)));
+        assert!(matches!(
+            epilogue_small,
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::SmallScalar
+                    && code.weights == WeightFormat::Q4
+                    && code.epilogue.is_some()
+        ));
 
         // Removing the epilogue still preserves both tile and storage format.
         let plain_small = matmul(|d| {
             d.kernel = crate::compile::Kernel::SmallTile;
-            d.weight_format = crate::compile::WeightFormat::Q4;
+            d.weight_format = WeightFormat::Q4;
         });
-        assert_eq!(
+        assert!(matches!(
             plain_small,
-            Variant::WeightSmall(ShaderEntry::MatMul, crate::compile::WeightFormat::Q4),
-        );
+            Variant::Product(ref code)
+                if code.implementation == CodeImpl::SmallScalar
+                    && code.weights == WeightFormat::Q4
+                    && code.epilogue.is_none()
+        ));
+        assert_ne!(epilogue_small, plain_small);
     }
 
     /// Sessions on one context share the pipelines of identical generated
@@ -6066,14 +5745,17 @@ mod variant_tests {
             pipelines
                 .map
                 .keys()
-                .any(|v| matches!(v, Variant::Epilogue(..))),
+                .any(|v| matches!(v, Variant::Product(code) if code.epilogue.is_some())),
             "the epilogue pipeline itself must be compiled"
         );
         assert!(
-            !pipelines
-                .map
-                .contains_key(&Variant::SmallTile(ShaderEntry::MatMul)),
-            "no dispatch can select SmallTile here, so it must not be built"
+            !pipelines.map.keys().any(|v| matches!(
+                v,
+                Variant::Product(code)
+                    if code.implementation == crate::kernels::matmul::CodeImpl::SmallScalar
+                        && code.epilogue.is_none()
+            )),
+            "no dispatch can select plain SmallScalar here, so it must not be built"
         );
         drop(pipelines);
 
@@ -6094,9 +5776,11 @@ mod variant_tests {
         );
         let pipelines = Pipelines::new(&gpu, &weighted, None, None);
         assert!(
-            !pipelines.map.contains_key(&Variant::Weight(
-                ShaderEntry::MatMul,
-                crate::compile::WeightFormat::Q4
+            !pipelines.map.keys().any(|v| matches!(
+                v,
+                Variant::Product(code)
+                    if code.weights == crate::compile::WeightFormat::Q4
+                        && code.epilogue.is_none()
             )),
             "no dispatch can select the plain weighted kernel here"
         );
@@ -6130,9 +5814,13 @@ mod variant_tests {
             [2, 2, 1],
             "workgroups must cover the 64×64 output in 32×32 tiles"
         );
-        assert_eq!(
-            epilogue_tile(d),
-            crate::codegen::MatMulTile::Small,
+        assert!(
+            matches!(
+                test_key(d),
+                Variant::Product(code)
+                    if code.implementation == crate::kernels::matmul::CodeImpl::SmallScalar
+                        && code.epilogue.is_some()
+            ),
             "the epilogue shader must be generated for the demoted tile"
         );
 

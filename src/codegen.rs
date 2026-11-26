@@ -174,7 +174,7 @@ impl GemvShape {
 ///
 /// Derived from `blade_graphics::CooperativeMatrix` capabilities at runtime.
 /// Determines which shader variant is generated for coop matmul.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CoopConfig {
     /// Cooperative matrix tile dimension (8 for Apple Silicon, 16 for RDNA3/Volta+).
     pub tile_size: u32,

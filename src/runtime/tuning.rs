@@ -449,6 +449,22 @@ pub(super) fn tile_module(
     knobs: crate::codegen::MatmulKnobs,
     caps: &bg::Capabilities,
 ) -> crate::codegen::ShaderModule {
+    if crate::kernels::matmul::Layout::from_entry(&dispatch.shader).is_some() {
+        let mut selected = dispatch.clone();
+        tile.configure(&mut selected);
+        let code = crate::kernels::matmul::Code::from_dispatch(&selected, caps)
+            .expect("dense product code");
+        return crate::kernels::matmul::module(
+            &code,
+            &crate::kernels::matmul::CodeTarget {
+                capabilities: caps,
+                knobs,
+                cooperative: tile.coop_config(),
+            },
+        )
+        .expect("legal dense product tile")
+        .0;
+    }
     let entry = &dispatch.shader;
     if let MatmulTile::Scalar(shape) = tile {
         let options = crate::codegen::MatMulOptions {
@@ -462,11 +478,12 @@ pub(super) fn tile_module(
                 ..knobs
             },
         };
-        return if *entry == ShaderEntry::WinogradBatchedMatMul {
-            crate::codegen::gen_block_matmul(entry.shader_group(), options)
-        } else {
-            crate::codegen::generate_matmul_with_epilogue(entry.shader_group(), None, options)
-        };
+        assert_eq!(
+            *entry,
+            ShaderEntry::WinogradBatchedMatMul,
+            "dense products route through kernels::matmul::module"
+        );
+        return crate::codegen::gen_block_matmul(entry.shader_group(), options);
     }
     if let MatmulTile::Gemv(shape) = tile {
         // The int-dot kernel is a different computation, not a different
@@ -493,21 +510,6 @@ pub(super) fn tile_module(
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
     let selected_entry = tile.shader(entry);
-    if dispatch.weight_format.uses_reduced_storage() {
-        return crate::codegen::generate_matmul_with_epilogue(
-            selected_entry.shader_group(),
-            None,
-            crate::codegen::MatMulOptions {
-                format: dispatch.weight_format,
-                tile: match tile {
-                    MatmulTile::Tile32 => crate::codegen::MatMulTile::Small,
-                    MatmulTile::Tile64 => crate::codegen::MatMulTile::Large,
-                    _ => unreachable!("reduced storage only changes scalar tile geometry"),
-                },
-                knobs,
-            },
-        );
-    }
     if let MatmulTile::SpecializedConv {
         k_tile,
         interleave_columns,
@@ -526,14 +528,6 @@ pub(super) fn tile_module(
         crate::codegen::generate_module(selected_entry.shader_group(), knobs)
     } else {
         match tile {
-            MatmulTile::CooperativeTiled { shape, splits } => {
-                crate::codegen::generate_tiled_coop_matmul(
-                    entry.shader_group(),
-                    shape,
-                    splits,
-                    None,
-                )
-            }
             MatmulTile::Tile32 => {
                 crate::codegen::generate_module_small(entry.shader_group(), knobs)
             }
@@ -541,51 +535,7 @@ pub(super) fn tile_module(
             MatmulTile::Tile16 | MatmulTile::Tile64 => {
                 crate::codegen::generate_module(entry.shader_group(), knobs)
             }
-            MatmulTile::CooperativeF32 { .. } | MatmulTile::CooperativeF16 { .. } => {
-                crate::codegen::generate_module_coop(
-                    entry.shader_group(),
-                    &tile.coop_config().expect("cooperative candidate"),
-                )
-            }
-            MatmulTile::CooperativeChecked { specialize, .. } => {
-                let types = super::checked_matrix_types(dispatch).expect("checked tile types");
-                let native = crate::codegen::checked_cooperative_shape(super::cooperative_shapes(
-                    &caps.cooperative_matrix,
-                    types.multiply,
-                ))
-                .unwrap_or([16, 16, 16]);
-                crate::codegen::generate_module_coop_typed_with_subgroup(
-                    entry.shader_group(),
-                    types,
-                    native,
-                    super::typed_matmul_layout(dispatch, specialize),
-                    caps.subgroup_size,
-                )
-            }
-            MatmulTile::CooperativeWorkgroup { shape, .. } => {
-                let types = super::checked_matrix_types(dispatch)
-                    .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
-                let epilogue = dispatch.matmul_epilogue.as_ref();
-                assert!(
-                    super::workgroup_matmul_epilogue_supported(shape, epilogue),
-                    "unsupported epilogue on workgroup cooperative product"
-                );
-                let (native, subgroup) =
-                    super::workgroup_matmul_shape_and_subgroup(shape, types, caps)
-                        .unwrap_or(([16, 16, 16], 32));
-                crate::codegen::generate_workgroup_matmul_for_device(
-                    entry.shader_group(),
-                    shape,
-                    types,
-                    native,
-                    subgroup,
-                    dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
-                    epilogue,
-                )
-            }
-            MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
-                unreachable!()
-            }
+            _ => unreachable!("dense products route through kernels::matmul::module"),
         }
     }
 }

@@ -1945,9 +1945,10 @@ fn fill_dense_product(
     {
         return false;
     }
-    let Some((m, n, k)) = d.mnk() else {
+    let Some(product) = d.product() else {
         return false;
     };
+    let (m, n, k) = (product.m, product.n, product.k);
     if m <= 1 || n == 0 || k == 0 {
         return false;
     }
@@ -1959,7 +1960,12 @@ fn fill_dense_product(
     if splits > 1 && (d.input_buffers.len() != 2 || splits > k.div_ceil(32)) {
         return false;
     }
-    let grid = [m.div_ceil(32), n.div_ceil(32), splits];
+    let grid = product
+        .launch(
+            crate::kernels::matmul::Variant::CooperativeTyped { specialize: false },
+            splits,
+        )
+        .workgroups;
     if !compile::workgroups_within_portable_limits(grid) {
         return false;
     }

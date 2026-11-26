@@ -513,57 +513,98 @@ impl MatmulTile {
     }
 
     pub(crate) fn workgroups(self, class: &TuneClass) -> [u32; 3] {
+        self.try_workgroups(class)
+            .expect("tile belongs to tune class")
+    }
+
+    /// Launch workgroup counts for `self` on `class`, or `None` when `self`
+    /// does not belong to `class`'s kernel family (e.g. a convolution or GEMV
+    /// tile tested against a dense product class).
+    pub(crate) fn try_workgroups(self, class: &TuneClass) -> Option<[u32; 3]> {
+        if let Some(layout) = crate::kernels::matmul::Layout::from_entry(&class.shader) {
+            let product = crate::kernels::matmul::Product {
+                layout,
+                m: class.m,
+                n: class.n,
+                k: class.k,
+                weights: class.weight_format,
+                types: class.matrix_types,
+            };
+            let (variant, splits) = match self {
+                Self::Tile32 => (crate::kernels::matmul::Variant::SmallScalar, 1),
+                Self::Tile64 => (crate::kernels::matmul::Variant::DefaultScalar, 1),
+                Self::Scalar(shape) => (crate::kernels::matmul::Variant::Scalar(shape), 1),
+                Self::CooperativeTiled { shape, splits } => (
+                    crate::kernels::matmul::Variant::CooperativeTiled(shape),
+                    splits,
+                ),
+                Self::CooperativeWorkgroup { shape, splits } => (
+                    crate::kernels::matmul::Variant::CooperativeWorkgroup(shape),
+                    splits,
+                ),
+                Self::CooperativeChecked { splits, specialize } => (
+                    crate::kernels::matmul::Variant::CooperativeTyped { specialize },
+                    splits,
+                ),
+                Self::CooperativeF32 { .. } | Self::CooperativeF16 { .. } => (
+                    crate::kernels::matmul::Variant::Cooperative(self.coop_config()?),
+                    1,
+                ),
+                Self::Tile16 | Self::SpecializedConv { .. } | Self::Gemv(_) => return None,
+            };
+            return Some(product.launch(variant, splits).workgroups);
+        }
         let tile = match self {
-            Self::Gemv(shape) => return class.gemv_workgroups(shape),
+            Self::Gemv(shape) => return Some(class.gemv_workgroups(shape)),
             Self::Tile16 => 16,
             Self::Tile32 => 32,
             Self::Tile64 => 64,
             Self::Scalar(shape) => {
-                return [
+                return Some([
                     class.n.div_ceil(shape.cols()),
                     class.m.div_ceil(shape.rows()),
                     class.batch_dispatches(),
-                ];
+                ]);
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
             Self::CooperativeTiled { shape, splits } => {
-                return [class.m / 64, class.n / shape.columns, splits];
+                return Some([class.m / 64, class.n / shape.columns, splits]);
             }
             Self::CooperativeWorkgroup { shape, splits } => {
-                return [
+                return Some([
                     class.m.div_ceil(shape.rows),
                     class.n / shape.columns,
                     splits,
-                ];
+                ]);
             }
             // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
             Self::CooperativeChecked { splits, .. } => {
-                return [class.m.div_ceil(32), class.n.div_ceil(32), splits];
+                return Some([class.m.div_ceil(32), class.n.div_ceil(32), splits]);
             }
             Self::CooperativeF32 { .. } | Self::CooperativeF16 { .. } => {
-                let tile = self.coop_config().unwrap().matmul_output_tile();
+                let tile = self.coop_config()?.matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
-                return [class.m.div_ceil(tile), class.n.div_ceil(tile), 1];
+                return Some([class.m.div_ceil(tile), class.n.div_ceil(tile), 1]);
             }
         };
         if class.shader == ShaderEntry::Conv2dGradInputGemm {
-            let c = class.conv2d.expect("convolution class");
-            return crate::kernels::conv::grad_input_workgroups(
+            let c = class.conv2d?;
+            return Some(crate::kernels::conv::grad_input_workgroups(
                 c.batch,
                 c.in_channels,
                 c.in_h,
                 c.in_w,
                 c.stride,
                 tile,
-            );
+            ));
         }
         // Scalar tiled kernels use X for columns, Y for rows. Derive exact
         // geometry; doubling rounded 64-tile counts overdispatches edges.
-        [
+        Some([
             class.n.div_ceil(tile),
             class.m.div_ceil(tile),
             class.batch_dispatches(),
-        ]
+        ])
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
@@ -588,7 +629,7 @@ impl MatmulTile {
             *sizes.last_mut()? = usize::try_from(elements)
                 .ok()?
                 .checked_mul(crate::codegen::MatrixTypes::bytes(types.output))?;
-            return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
+            return crate::compile::workgroups_within_portable_limits(self.try_workgroups(class)?)
                 .then_some(sizes);
         }
         if matches!(self, Self::CooperativeF16 { .. }) != class.cooperative_f16 {
@@ -614,7 +655,7 @@ impl MatmulTile {
             }
             let mut sizes = class.buffer_sizes()?;
             *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
-            return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
+            return crate::compile::workgroups_within_portable_limits(self.try_workgroups(class)?)
                 .then_some(sizes);
         }
         if matches!(self, Self::CooperativeChecked { .. })
@@ -656,10 +697,13 @@ impl MatmulTile {
             // dispatches that on devices that advertise more; applying the
             // portable 65535 cap here would drop the kernel that dominates
             // Gemma 4 logits from `tune_with`.
-            if self.workgroups(class).contains(&0) {
+            if self.try_workgroups(class)?.contains(&0) {
                 return None;
             }
             return Some(sizes);
+        }
+        if matches!(self, Self::Tile16) && class.conv2d.is_none() {
+            return None;
         }
         if let Self::SpecializedConv {
             tile_size, k_tile, ..
@@ -705,7 +749,7 @@ impl MatmulTile {
                 sizes[2] = geometry.output_bytes;
             }
         }
-        if !crate::compile::workgroups_within_portable_limits(self.workgroups(class)) {
+        if !crate::compile::workgroups_within_portable_limits(self.try_workgroups(class)?) {
             return None;
         }
         Some(sizes)
@@ -834,15 +878,11 @@ impl TuneClass {
                 let k = s.batch.checked_mul(spatial)?;
                 (s.out_channels, n, k)
             }
-        } else if matches!(
-            shader,
-            ShaderEntry::MatMul
-                | ShaderEntry::FusedMatMulAdd
-                // The forward GEMV pair carries `[m, k, n]` like the tiled
-                // forward matmul; only the transposed form is `[m, n, k]`.
-                | ShaderEntry::MatMulGemv
-                | ShaderEntry::MatMulGemvAdd
-        ) {
+        } else if let Some(product) = dispatch.product() {
+            (product.m, product.n, product.k)
+        } else if matches!(shader, ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd) {
+            // The forward GEMV pair carries `[m, k, n]` like the tiled
+            // forward matmul; only the transposed form is `[m, n, k]`.
             (dispatch.params[0], dispatch.params[2], dispatch.params[1])
         } else {
             (dispatch.params[0], dispatch.params[1], dispatch.params[2])
@@ -890,9 +930,18 @@ impl TuneClass {
         // bytes are known; the geometry check below still applies to every
         // class.
         let extents_derivable = !class.weight_format.uses_reduced_storage();
+        let expected_workgroups = dispatch
+            .product()
+            .and_then(|product| {
+                let (variant, splits) =
+                    crate::kernels::matmul::Variant::from_kernel(&dispatch.kernel, config)?;
+                Some(product.launch(variant, splits).workgroups)
+            })
+            .unwrap_or_else(|| initial.workgroups(&class));
+        debug_assert_eq!(expected_workgroups, initial.workgroups(&class));
         ((!extents_derivable || initial.buffer_sizes(&class).is_some())
-            && dispatch.workgroups == initial.workgroups(&class))
-        .then_some(class)
+            && dispatch.workgroups == expected_workgroups)
+            .then_some(class)
     }
 
     pub(crate) fn has_addend(&self) -> bool {
@@ -2906,5 +2955,29 @@ mod tests {
             )],
         });
         assert!(TuneClass::from_dispatch(&d, None).is_none());
+    }
+
+    #[test]
+    fn non_product_tiles_are_rejected_without_panicking_on_dense_product_class() {
+        let mut d = dispatch();
+        d.params = vec![128, 64, 128, 0];
+        d.workgroups = [2, 2, 1];
+        let mut class = TuneClass::from_dispatch(&d, None).expect("dense matmul should tune");
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        let bad_tiles = [
+            MatmulTile::Tile16,
+            MatmulTile::SpecializedConv {
+                tile_size: 32,
+                k_tile: 16,
+                interleave_columns: false,
+            },
+            MatmulTile::Gemv(crate::codegen::GemvShape::initial(
+                crate::codegen::ShaderGroup::MatMulGemv,
+            )),
+        ];
+        for tile in bad_tiles {
+            assert_eq!(tile.try_workgroups(&class), None, "{tile:?}");
+            assert!(!tile.fits(&class), "{tile:?}");
+        }
     }
 }
