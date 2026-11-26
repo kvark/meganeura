@@ -11,6 +11,15 @@
   output, a node that reads it and also depends on the result, or a second
   write to it.
 
+- Three entry points now do what they say. `Eager::eval` keys its cached
+  session on the graph's contents; it used to key on the node count, so a
+  second graph of the same size got the first one's answers. The NNEF
+  importer applies `transpose` at every rank up to four, with `axes` shorter
+  than the rank leaving the remaining axes in place; any transpose that was
+  not two-dimensional used to be imported as a relabelled copy. Orders it
+  cannot express are refused as unsupported. `build_measured` refuses
+  `share_parameters_from`, which it used to accept and then ignore.
+
 - Gradient clipping no longer changes values that are not one parameter's
   own gradient. A gradient that reached its parameter through additions
   alone could be the constant that seeds the backward pass, or a buffer

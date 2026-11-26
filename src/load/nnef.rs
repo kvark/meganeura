@@ -699,17 +699,59 @@ pub fn load_nnef(path: &Path) -> Result<NnefModel, NnefError> {
             "transpose" => {
                 let x = resolve(&stmt.positional[0], &name_to_id, &stmt.name)?;
                 let x_shape = get_shape_v(&stmt.positional[0], &shapes);
-                if x_shape.len() == 2 {
-                    let out = graph.transpose(x);
-                    name_to_id.insert(stmt.name.clone(), out);
-                    shapes.insert(stmt.name.clone(), vec![x_shape[1], x_shape[0]]);
-                } else {
-                    // For non-2D, treat as identity with reordered shape
-                    name_to_id.insert(stmt.name.clone(), x);
-                    let mut rev = x_shape;
-                    rev.reverse();
-                    shapes.insert(stmt.name.clone(), rev);
+                let rank = x_shape.len();
+                // Output axis `d` is input axis `axes[d]`, and the axes past
+                // the list stay in place. Without a list the order reverses.
+                let unsupported = |axes: &dyn std::fmt::Debug| {
+                    NnefError::UnsupportedOp(format!(
+                        "transpose of {x_shape:?} by {axes:?} (supported: a permutation of at most 4 axes)"
+                    ))
+                };
+                let perm: Vec<usize> = match stmt.named.get("axes") {
+                    Some(value) => {
+                        let axes = value.as_int_array().ok_or_else(|| unsupported(value))?;
+                        axes.iter()
+                            .map(|&axis| usize::try_from(axis).map_err(|_| unsupported(&axes)))
+                            .chain((axes.len()..rank).map(Ok))
+                            .collect::<Result<_, _>>()?
+                    }
+                    None => (0..rank).rev().collect(),
+                };
+                let mut sorted = perm.clone();
+                sorted.sort_unstable();
+                if sorted != (0..rank).collect::<Vec<_>>() || rank > 4 {
+                    return Err(unsupported(&perm));
                 }
+                let in_place = |axes: &[usize]| axes.iter().enumerate().all(|(d, &axis)| d == axis);
+                let out = if in_place(&perm) {
+                    x
+                } else {
+                    // A graph node may hold any view of the tracked shape,
+                    // and the permutation needs the axes it names.
+                    let node = &graph.node(x).ty;
+                    if node.num_elements() != x_shape.iter().product::<usize>() {
+                        return Err(NnefError::ShapeError(format!(
+                            "{}: cannot view {:?} as {x_shape:?}",
+                            stmt.name, node.shape
+                        )));
+                    }
+                    let x = if node.shape == x_shape {
+                        x
+                    } else {
+                        graph.reshape(x, &x_shape)
+                    };
+                    // Swapping the last two axes is the batched transpose kernel.
+                    if in_place(&perm[..rank - 2]) {
+                        graph.transpose(x)
+                    } else {
+                        graph.permute(x, &perm)
+                    }
+                };
+                name_to_id.insert(stmt.name.clone(), out);
+                shapes.insert(
+                    stmt.name.clone(),
+                    perm.iter().map(|&axis| x_shape[axis]).collect(),
+                );
             }
 
             // --- Concat ---
@@ -901,6 +943,69 @@ graph G( x ) -> ( out )
         assert!(model.graph.nodes().len() >= 3);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Axis orders of rank three and four move the elements, checked on the
+    /// graph as imported. Only two-dimensional transposes used to.
+    #[test]
+    fn transpose_moves_elements_at_every_rank() {
+        use crate::reference::{Feeds, evaluate_outputs};
+        let import = |shape: &str, axes: &str| {
+            let text = format!(
+                "version 1.0;\ngraph G( x ) -> ( out )\n{{\n    \
+                 x = external(shape = {shape});\n    \
+                 out = transpose(x, axes = {axes});\n}}\n"
+            );
+            let digits = |text: &str| text.replace(|c: char| !c.is_ascii_digit(), "");
+            let tmp = std::env::temp_dir().join(format!(
+                "nnef_test_transpose_{}_{}_{}",
+                std::process::id(),
+                digits(shape),
+                digits(axes)
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+            std::fs::write(tmp.join("graph.nnef"), text).unwrap();
+            let model = load_nnef(&tmp);
+            let _ = std::fs::remove_dir_all(&tmp);
+            model
+        };
+        let values = |shape: &str, axes: &str, len: usize| {
+            let model = import(shape, axes).unwrap();
+            let mut feeds = Feeds::new();
+            feeds.set("x", &(0..len).map(|i| i as f32).collect::<Vec<_>>());
+            evaluate_outputs(&model.graph, &feeds)
+                .unwrap()
+                .remove(0)
+                .data
+        };
+        assert_eq!(
+            values("[2, 3, 2]", "[2, 1, 0]", 12),
+            [0.0, 6.0, 2.0, 8.0, 4.0, 10.0, 1.0, 7.0, 3.0, 9.0, 5.0, 11.0]
+        );
+        // Axes past the listed ones stay where they are.
+        assert_eq!(
+            values("[2, 2, 3]", "[1, 0]", 12),
+            [0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 3.0, 4.0, 5.0, 9.0, 10.0, 11.0]
+        );
+        assert_eq!(
+            values("[2, 2, 3]", "[0, 2, 1]", 12),
+            [0.0, 3.0, 1.0, 4.0, 2.0, 5.0, 6.0, 9.0, 7.0, 10.0, 8.0, 11.0]
+        );
+        assert_eq!(
+            values("[2, 3]", "[0, 1]", 6),
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        for (shape, axes) in [
+            ("[2, 3, 2]", "[0, 0, 1]"),
+            ("[2, 3, 2]", "[0, -1, 1]"),
+            ("[2, 3, 2]", "1"),
+            ("[1, 2, 1, 2, 1]", "[4, 3, 2, 1, 0]"),
+        ] {
+            assert!(matches!(
+                import(shape, axes),
+                Err(NnefError::UnsupportedOp(_))
+            ));
+        }
     }
 
     #[test]
