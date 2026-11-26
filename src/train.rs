@@ -434,10 +434,8 @@ fn compile_for_target(
     (plan, report)
 }
 
-/// The plan [`build`] compiles for `forward_graph` under `cfg`, against
-/// the same target, without creating a session or reading a plan cache.
-/// Session construction then picks implementations (see
-/// `compile::lower::select_variants`), which this does not apply.
+/// The plan a session from [`build`] for `forward_graph` under `cfg` runs
+/// before tuning, without creating the session or reading a plan cache.
 pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::ExecutionPlan {
     let gpu = cfg.gpu.clone().unwrap_or_else(runtime::default_gpu_context);
     let mut options = cfg.options.clone();
@@ -446,7 +444,8 @@ pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::E
     }
     let target = compile_target(&gpu, cfg.runtime.coop);
     let optimize = (cfg.optimize, cfg.skip_full_optimize);
-    compile_for_target(forward_graph, cfg.mode, &options, optimize, target).0
+    let compiled = compile_for_target(forward_graph, cfg.mode, &options, optimize, target).0;
+    runtime::lower(compiled, &gpu, &cfg.runtime).plan
 }
 
 /// `graph` with the composites spelled in primitives recognized: all of
@@ -690,5 +689,70 @@ mod tests {
             .map(|entry| entry.0.as_str())
             .collect();
         assert_eq!(trained, ["down", "gate+up"]);
+    }
+
+    #[test]
+    fn plan_is_what_an_untuned_session_runs() {
+        let gpu = crate::reference::gpu::shared_context();
+        let mut cases = Vec::new();
+
+        // Products whose kernels lowering picks.
+        let mut g = Graph::new();
+        let x = g.input("x", &[8, 2048]);
+        let w1 = g.parameter("w1", &[2048, 64]);
+        let w2 = g.parameter("w2", &[64, 16]);
+        let h = g.matmul(x, w1);
+        let h = g.relu(h);
+        let y = g.matmul(h, w2);
+        let labels = g.input("labels", &[8, 16]);
+        let loss = g.cross_entropy_loss(y, labels);
+        g.set_outputs(vec![loss]);
+        cases.push((g, Mode::Training));
+
+        // Normalizations and a product that lowering may split along K.
+        let mut g = Graph::new();
+        let x = g.input("x", &[64, 256]);
+        let r = g.input("r", &[64, 256]);
+        let scale = g.parameter("scale", &[256]);
+        let w = g.parameter("w", &[256, 512]);
+        let n = g.rms_norm(x, scale, 1e-5);
+        let sum = g.add(n, r);
+        let n = g.rms_norm(sum, scale, 1e-5);
+        let y = g.matmul(n, w);
+        g.set_outputs(vec![y]);
+        cases.push((g, Mode::Inference));
+
+        // Attention and its gradients, which lowering schedules.
+        let mut g = Graph::new();
+        let q = g.parameter("q", &[32, 64]);
+        let k = g.parameter("k", &[32, 64]);
+        let v = g.parameter("v", &[32, 64]);
+        let a = g.causal_attention(q, k, v, 2, 2, 32);
+        let loss = g.sum_all(a);
+        g.set_outputs(vec![loss]);
+        cases.push((g, Mode::Training));
+
+        let mut lowered = false;
+        for &(ref graph, mode) in &cases {
+            let cfg = || {
+                let mut cfg = SessionConfig {
+                    mode,
+                    ..SessionConfig::inference_from_env_on(gpu.clone())
+                };
+                cfg.tune = false;
+                cfg.cache = None;
+                cfg
+            };
+            let planned = plan(graph, &cfg());
+            let (session, _) = build(graph, cfg());
+            assert_eq!(&planned, session.plan(), "{mode:?}");
+
+            let cfg = cfg();
+            let target = compile_target(&gpu, cfg.runtime.coop);
+            let optimize = (cfg.optimize, cfg.skip_full_optimize);
+            let compiled = compile_for_target(graph, mode, &cfg.options, optimize, target).0;
+            lowered |= compiled != planned;
+        }
+        assert!(lowered, "no case reached lowering");
     }
 }
