@@ -1,5 +1,12 @@
 # Unreleased
 
+- The ONNX importer reads `Slice` with steps other than one, forward and
+  backward, such as the pixel phases of YOLOv5's Focus layer and reversals.
+  Bounds clamp as ONNX specifies, including exporters' `INT64_MAX` and
+  `INT64_MIN` sentinels and backward slices that end before the axis. A
+  strided axis gathers its slices as rows, in one dispatch; a unit step still
+  narrows the axis as before. A slice that leaves nothing is refused.
+
 - The ONNX importer reads grouped and depthwise `Conv`, `ConvTranspose`,
   `Resize`, `TopK` and `GridSample`, all through existing kernels:
   - A `Conv` whose groups hold one input channel each runs the depthwise

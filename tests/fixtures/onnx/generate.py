@@ -236,8 +236,8 @@ def resnet_block():
 
 def vision_ops():
     """Grouped and depthwise convolutions, transposed convolutions, Resize in
-    its modes, TopK and GridSample, each flattened and concatenated into one
-    row so a single output covers them all."""
+    its modes, TopK, strided Slice and GridSample, each flattened and
+    concatenated into one row so a single output covers them all."""
     b = Builder(5)
     x = "pixel_values"
     parts = []
@@ -283,6 +283,20 @@ def vision_ops():
 
     top_k(b.op("Reshape", x, b.const("shape", [4, 36], np.int64)), 3)
     top_k(x, 2, axis=1, largest=0)
+
+    def slice_(starts, ends, axes, steps):
+        keep(b.op("Slice", x, *(b.const(name, v, np.int64) for name, v in
+                                [("starts", starts), ("ends", ends), ("axes", axes), ("steps", steps)])))
+
+    # YOLOv5's Focus layer: the four pixel phases, to the exporter's sentinel end.
+    big = np.iinfo(np.int64).max
+    for row, col in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+        slice_([row, col], [big, big], [2, 3], [2, 2])
+    # Reversal to the low sentinel, steps past the end and longer than the
+    # axis, and backward ends clamped to just before the axis.
+    slice_([-1], [np.iinfo(np.int64).min], [-1], [-1])
+    slice_([1, 3], [6, 0], [3, 1], [3, -2])
+    slice_([5, 2], [-7, 100], [2, 3], [-3, 9])
 
     # Some grid points fall outside [-1, 1], where padding decides.
     grid = b.const("grid", b.rng.uniform(-1.2, 1.2, (1, 5, 7, 2)))

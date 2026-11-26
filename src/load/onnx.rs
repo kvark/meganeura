@@ -718,15 +718,18 @@ fn translate_node(
             let steps = ints(4).unwrap_or_else(|| vec![1; starts.len()]);
             if axes.len() != starts.len()
                 || ends.len() != starts.len()
-                || steps.iter().any(|&step| step != 1)
+                || steps.len() != starts.len()
+                || steps.contains(&0)
             {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Slice with axes {axes:?} and steps {steps:?} (supported: unit steps)"
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': Slice of {starts:?} to {ends:?} on axes {axes:?} in steps {steps:?}",
+                    node.name
                 )));
             }
             let mut out = x;
             let mut out_shape = x_shape;
-            for ((&axis, &start), &end) in axes.iter().zip(&starts).zip(&ends) {
+            for (((&axis, &start), &end), &step) in axes.iter().zip(&starts).zip(&ends).zip(&steps)
+            {
                 let rank = out_shape.len() as i64;
                 let axis = if axis < 0 { axis + rank } else { axis };
                 if !(0..rank).contains(&axis) {
@@ -737,11 +740,40 @@ fn translate_node(
                 }
                 let axis = axis as usize;
                 let dim = out_shape[axis] as i64;
-                // Negative bounds count from the end; both clamp to the axis.
-                let clamp = |v: i64| (if v < 0 { v + dim } else { v }).clamp(0, dim) as usize;
-                let (start, end) = (clamp(start), clamp(end).max(clamp(start)));
-                out = narrow(graph, out, &out_shape, axis, start..end);
-                out_shape[axis] = end - start;
+                // Negative bounds count from the end. A forward slice clamps
+                // both to the axis; a backward one may end just before it.
+                let wrap = |v: i64| if v < 0 { v.saturating_add(dim) } else { v };
+                let (start, end) = if step > 0 {
+                    (wrap(start).clamp(0, dim), wrap(end).clamp(0, dim))
+                } else {
+                    (wrap(start).clamp(0, dim - 1), wrap(end).clamp(-1, dim - 1))
+                };
+                // A step longer than the axis takes one element, as the axis does.
+                let stride = step.unsigned_abs().min(dim as u64) as i64;
+                let span = if step > 0 { end - start } else { start - end };
+                let count = (span.max(0) + stride - 1) / stride;
+                if count == 0 {
+                    return Err(OnnxError::UnsupportedOp(format!(
+                        "Slice '{}' leaves nothing of axis {axis} of {out_shape:?}",
+                        node.name
+                    )));
+                }
+                out = if step == 1 {
+                    narrow(graph, out, &out_shape, axis, start as usize..end as usize)
+                } else {
+                    let step = if step > 0 { stride } else { -stride };
+                    strided(
+                        graph,
+                        node,
+                        out,
+                        &out_shape,
+                        axis,
+                        start,
+                        step,
+                        count as usize,
+                    )?
+                };
+                out_shape[axis] = count as usize;
             }
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
@@ -1453,6 +1485,40 @@ fn narrow(
         out = graph.split_a(out, outer, end - start, dim - end, inner);
     }
     out
+}
+
+/// `count` elements of `x` along `axis` of its `shape`, every `step`-th from
+/// `start`; a negative step walks backwards. The slices of the axis are rows
+/// of everything inside it, gathered in that order.
+#[allow(clippy::too_many_arguments)]
+fn strided(
+    graph: &mut Graph,
+    node: &proto::Node,
+    x: NodeId,
+    shape: &[usize],
+    axis: usize,
+    start: i64,
+    step: i64,
+    count: usize,
+) -> Result<NodeId, OnnxError> {
+    let outer = shape[..axis].iter().product::<usize>();
+    let dim = shape[axis];
+    let inner = shape[axis + 1..].iter().product::<usize>();
+    let rows = outer.saturating_mul(dim);
+    // Row indices are exact below 2^24.
+    if rows >= 1 << 24 {
+        return Err(OnnxError::UnsupportedOp(format!(
+            "Slice '{}' of {shape:?} in steps of {step} (supported: below 2^24 rows)",
+            node.name
+        )));
+    }
+    let indices: Vec<u32> = (0..outer)
+        .flat_map(|o| (0..count as i64).map(move |j| (o * dim) as i64 + start + j * step))
+        .map(|index| index as u32)
+        .collect();
+    let table = view(graph, x, &[rows, inner])?;
+    let indices = graph.constant_u32(&indices, &[outer * count]);
+    Ok(graph.embedding(indices, table))
 }
 
 /// `x` of `shape` broadcast to `out_shape` by one broadcast; the ranks
