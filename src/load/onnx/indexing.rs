@@ -313,14 +313,9 @@ pub(super) fn gather_elements(
     Ok(())
 }
 
-/// Rounds `TopK` takes at most. Each is a pass over every row and about a
-/// dozen graph nodes: D-FINE's k = 300 over 24,000 scores builds in about
-/// 0.7 s in release and runs some 1,800 dispatches.
-const MAX_TOP_K: usize = 512;
-
 /// `TopK` along any axis of up to four: sorted values and their indices,
-/// ties to the lower index. Each round takes every row's maximum and its
-/// first column, then masks that column out of the next round.
+/// ties to the lower index. [`Graph::top_k_inner`] selects and sorts each
+/// row's columns in one dispatch; the values are gathered at them.
 pub(super) fn top_k(
     graph: &mut Graph,
     node: &proto::Node,
@@ -352,9 +347,10 @@ pub(super) fn top_k(
     }
     let axis = axis as usize;
     let len = x_shape[axis];
-    if !(1..=len as i64).contains(&k) || k as usize > MAX_TOP_K {
+    let max_k = crate::graph::MAX_TOP_K_INNER;
+    if !(1..=len as i64).contains(&k) || k as usize > max_k {
         return Err(OnnxError::UnsupportedOp(format!(
-            "TopK '{}': k = {k} of {len} (supported: 1 to {MAX_TOP_K})",
+            "TopK '{}': k = {k} of {len} (supported: 1 to {max_k})",
             node.name
         )));
     }
@@ -372,32 +368,26 @@ pub(super) fn top_k(
     if !largest {
         remaining = graph.neg(remaining);
     }
-    // Every round's mask compares its picks with the same column numbers.
-    let columns = graph.constant((0..len).map(|c| -(c as f32)).collect(), &[len]);
-    let mut picked: Option<(NodeId, NodeId)> = None;
-    for round in 0..k {
-        let index = graph.argmax_inner(remaining);
-        let value = graph.max_inner(remaining);
-        picked = Some(match picked {
-            None => (value, index),
-            Some((values, indices)) => (
-                graph.concat(values, value, rows as u32, round as u32, 1, 1),
-                graph.concat(indices, index, rows as u32, round as u32, 1, 1),
-            ),
-        });
-        if round + 1 < k {
-            // 1 in the picked column and 0 elsewhere, as `one_hot` spells it.
-            let spread = graph.broadcast_inner(index, len);
-            let offset = graph.bias_add(spread, columns);
-            let distance = graph.abs(offset);
-            let closeness = graph.neg(distance);
-            let closeness = graph.add_scalar(closeness, 1.0);
-            let taken = graph.relu(closeness);
-            let taken = graph.scale(taken, -f32::MAX);
-            remaining = graph.add(remaining, taken);
-        }
+    // The gather addresses each pick as `row · len + column` in F32.
+    let elements = rows.saturating_mul(len);
+    if elements > 1 << 24 || rows > 65535 {
+        return Err(OnnxError::UnsupportedOp(format!(
+            "TopK '{}': {rows} rows of {len} (supported: up to 65535 rows and 2^24 elements)",
+            node.name
+        )));
     }
-    let (mut values, indices) = picked.expect("k is at least one");
+    let indices = graph.top_k_inner(remaining, k);
+    let row_starts = graph.constant(
+        (0..rows)
+            .flat_map(|row| std::iter::repeat_n((row * len) as f32, k))
+            .collect(),
+        &[rows * k],
+    );
+    let flat = view(graph, indices, &[rows * k])?;
+    let flat = graph.add(flat, row_starts);
+    let flat = graph.to_u32(flat);
+    let table = view(graph, remaining, &[elements, 1])?;
+    let mut values = graph.embedding(flat, table);
     if !largest {
         values = graph.neg(values);
     }

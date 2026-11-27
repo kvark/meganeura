@@ -642,6 +642,54 @@ fn argmax_inner() {
     }
 }
 
+/// Short rows take a thread each, long ones a workgroup that selects and
+/// sorts: tied rows keep columns in order, signed zeros tie, k ranges from
+/// one to the whole row. D-FINE's two shapes are here (4 of 33 over 1,200
+/// rows, 300 of 1,500), and 300 of 24,000 for a long row.
+#[test]
+fn top_k_inner() {
+    for (rows, cols, k) in [
+        (5, 1, 1),
+        (8, 3, 3),
+        (9, 5, 2),
+        (12, 32, 7),
+        (1200, 33, 4),
+        (8, 300, 300),
+        (3, 1500, 1024),
+        (1, 24_000, 300),
+    ] {
+        let what = format!("top_k_inner {rows}x{cols} k={k}");
+        let build = |g: &mut Graph| {
+            let x = g.parameter("x", &[rows, cols]);
+            g.top_k_inner(x, k)
+        };
+        let x = tied_rows(rows, cols);
+        inference_case(&what, build, |feeds| {
+            feeds.set("x", &x);
+        });
+    }
+    // Signed zeros and negatives: -0 and +0 tie, so column order decides.
+    let x = [0.0, -0.0, -1.0, 0.0, -0.0, 2.0, -3.0, -1.0];
+    let build = |g: &mut Graph| {
+        let x = g.parameter("x", &[1, 8]);
+        g.top_k_inner(x, 6)
+    };
+    let mut g = Graph::new();
+    let y = build(&mut g);
+    g.set_outputs(vec![y]);
+    let mut feeds = Feeds::new();
+    feeds.set("x", &x);
+    let picked = &meganeura::reference::evaluate_outputs(&g, &feeds).unwrap()[0];
+    assert_eq!(
+        picked.data,
+        [5.0, 0.0, 1.0, 3.0, 4.0, 2.0],
+        "reference order"
+    );
+    inference_case("top_k_inner signed zeros", build, |feeds| {
+        feeds.set("x", &x);
+    });
+}
+
 /// Indices outside the class range select nothing.
 #[test]
 fn one_hot() {

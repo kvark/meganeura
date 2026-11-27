@@ -82,6 +82,7 @@ impl Op {
             | Op::SumInner
             | Op::MaxInner
             | Op::ArgMaxInner
+            | Op::TopKInner { .. }
             | Op::SumAll
             | Op::ExclusiveCumsum { .. }
             | Op::Transpose

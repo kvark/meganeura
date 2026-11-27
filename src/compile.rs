@@ -455,6 +455,8 @@ pub enum ShaderEntry {
     MaxPool2dGrad,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    /// Top-k column selection per row: [`crate::graph::Op::TopKInner`].
+    TopKInner,
     PairwiseGrad,
     WinogradInputTransform,
     WinogradOutputTransform {
@@ -567,6 +569,7 @@ impl ShaderEntry {
             | ShaderEntry::GroupNormGradStats
             | ShaderEntry::GlobalAvgPool
             | ShaderEntry::GlobalAvgPoolGrad
+            | ShaderEntry::TopKInner
             | ShaderEntry::PairwiseGrad => "normalization_reduction",
 
             ShaderEntry::SgdUpdate
@@ -756,6 +759,7 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2dGrad => ShaderGroup::MaxPool2dGrad,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
+            ShaderEntry::TopKInner => ShaderGroup::TopKInner,
             ShaderEntry::PairwiseGrad => ShaderGroup::PairwiseGrad,
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform { fused } => {
@@ -873,6 +877,7 @@ impl ShaderEntry {
             ShaderEntry::MaxPool2dGrad => "main",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
+            ShaderEntry::TopKInner => "main",
             ShaderEntry::PairwiseGrad => "main",
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform { .. }

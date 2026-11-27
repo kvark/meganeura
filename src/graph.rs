@@ -191,6 +191,10 @@ pub enum PairwiseGradKind {
     RejectionDirections,
 }
 
+/// The largest `k` [`Graph::top_k_inner`] selects: its workgroup sorts
+/// the selection in a power-of-two array of this size.
+pub const MAX_TOP_K_INNER: usize = 1024;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     // Leaf nodes
@@ -294,6 +298,12 @@ pub enum Op {
     /// Column of the first maximum of each row, as an exact F32 index:
     /// `[M, N]` → `[M, 1]`. A selection, so it has no gradient.
     ArgMaxInner,
+    /// Columns of each row's `k` largest values, largest first, ties to the
+    /// lower column, as exact F32 indices: `[M, N]` → `[M, k]`. A selection,
+    /// so it has no gradient.
+    TopKInner {
+        k: u32,
+    },
     /// Backward helper for [`Op::SumInner`]: repeat each `[M, 1]` row across
     /// the inner axis, `[M, 1]` → `[M, N]`.
     BroadcastInner {
@@ -2032,6 +2042,42 @@ impl Graph {
             "argmax_inner rows exceed one portable dispatch"
         );
         self.add_node(Op::ArgMaxInner, vec![x], TensorType::f32(vec![rows, 1]))
+    }
+
+    /// Columns of the `k` largest values of each nonempty F32 row, largest
+    /// first, as exact F32 indices: `x: [M, N] → [M, k]`, like
+    /// `torch.topk(x, k, dim=1).indices`. Equal values tie to the lower
+    /// column, including signed zeros; rows holding NaN are unspecified. A
+    /// selection has no derivative. One dispatch computes it: a workgroup
+    /// per row selects and sorts long rows, a thread per row picks short
+    /// ones (`k·N <= 8192`). `k <= 1024`, `M <= 65535` and `N <= 2^24`
+    /// (exact in F32).
+    #[track_caller]
+    pub fn top_k_inner(&mut self, x: NodeId, k: usize) -> NodeId {
+        let ty = &self.node(x).ty;
+        assert_eq!(ty.dtype, DType::F32, "top_k_inner expects F32 values");
+        assert_eq!(ty.rank(), 2, "top_k_inner expects [rows, columns]");
+        let (rows, columns) = (ty.shape[0], ty.shape[1]);
+        assert!(
+            (1..=1 << 24).contains(&columns),
+            "top_k_inner needs 1..=2^24 columns, got {columns}"
+        );
+        assert!(
+            (1..=columns.min(MAX_TOP_K_INNER)).contains(&k),
+            "top_k_inner needs 1 <= k <= min(columns, {MAX_TOP_K_INNER}), got {k} of {columns}"
+        );
+        assert!(
+            (1..=65535).contains(&rows)
+                && rows
+                    .checked_mul(columns)
+                    .is_some_and(|len| len <= u32::MAX as usize),
+            "top_k_inner needs 1..=65535 rows and 1..=u32::MAX elements"
+        );
+        self.add_node(
+            Op::TopKInner { k: k as u32 },
+            vec![x],
+            TensorType::f32(vec![rows, k]),
+        )
     }
 
     /// One-hot rows of integer F32 `indices`: `[M]` or `[M, 1]` →
