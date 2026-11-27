@@ -2269,8 +2269,15 @@ impl Pipelines {
             Variant::RegisterConv(_, ref params, block) => {
                 crate::codegen::generate_register_conv(params, block)
             }
-            Variant::RegisterMatmul(_, mnk, tile) => {
-                crate::codegen::generate_register_matmul(mnk, tile)
+            Variant::RegisterMatmul(ref entry, mnk, tile) => {
+                let bindings = if entry.shader_group() == crate::codegen::ShaderGroup::MatMul
+                    || entry.shader_group() == crate::codegen::ShaderGroup::BatchMatMul
+                {
+                    crate::codegen::ProductBindings::Matmul
+                } else {
+                    crate::codegen::ProductBindings::Conv
+                };
+                crate::codegen::generate_register_matmul(mnk, tile, bindings)
             }
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
@@ -2580,7 +2587,11 @@ impl Pipelines {
             );
         }
         if let crate::compile::Kernel::RegisterMatmul(tile) = dispatch.kernel {
-            let (m, n, k) = dispatch.mnk().expect("a register product has dimensions");
+            // A 1×1 convolution's product: Co rows over Ci, one column per pixel.
+            let (m, n, k) = dispatch.mnk().unwrap_or_else(|| {
+                let p = crate::kernels::conv::Params::from(dispatch);
+                (p.out_channels, p.out_h * p.out_w, p.in_channels)
+            });
             return Variant::RegisterMatmul(entry, [m, n, k], tile);
         }
         if let crate::compile::Kernel::RegisterConv(block) = dispatch.kernel {
