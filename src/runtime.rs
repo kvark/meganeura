@@ -2530,7 +2530,11 @@ impl Pipelines {
             );
         }
         if let crate::compile::Kernel::RegisterConv(block) = dispatch.kernel {
-            return Variant::RegisterConv(entry, dispatch.params.clone(), block);
+            // The image comes from the grid, so the batch is not baked in and
+            // convolutions differing only in it share a pipeline.
+            let mut params = dispatch.params.clone();
+            params[0] = 0;
+            return Variant::RegisterConv(entry, params, block);
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
             return Variant::SpecializedConv(

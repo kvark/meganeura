@@ -246,10 +246,15 @@ pub(crate) fn register_workgroups(
     ]
 }
 
-/// One 64-wide dispatch that cooperative tiles may replace.
+/// One convolution dispatch whose kernel session construction chooses.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Problem {
     pub kind: Kind,
+    /// The 64-wide entry, the one with a cooperative form.
+    pub wide: bool,
+    /// Still on the kernel the compiler emitted (or the register one), so
+    /// no measurement has fixed it.
+    pub compiled: bool,
     pub m: u32,
     pub n: u32,
     pub k: u32,
@@ -266,14 +271,17 @@ pub(crate) struct Problem {
 }
 
 impl Problem {
-    /// The convolution `dispatch` computes, if its 64-wide entry has a
-    /// cooperative form. The narrower tiles and the weight gradient do not.
+    /// The convolution `dispatch` computes: every forward entry, and the
+    /// 64-wide input gradient. The weight gradient has no other path.
     pub(crate) fn of(dispatch: &Dispatch) -> Option<Self> {
         let p = &dispatch.params;
         // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h,
         // kernel_w, stride, padding_h, out_h, out_w, padding_w]
-        let (kind, m, n, k) = match dispatch.shader.shader_group() {
-            ShaderGroup::Conv2dGemm => (Kind::Forward, p[4], p[9] * p[10], p[1] * p[5] * p[6]),
+        let group = dispatch.shader.shader_group();
+        let (kind, m, n, k) = match group {
+            ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGemmSmall | ShaderGroup::Conv2dGemm16 => {
+                (Kind::Forward, p[4], p[9] * p[10], p[1] * p[5] * p[6])
+            }
             ShaderGroup::Conv2dGradInputGemm => {
                 (Kind::GradInput, p[1], p[2] * p[3], p[4] * p[5] * p[6])
             }
@@ -281,6 +289,12 @@ impl Problem {
         };
         Some(Self {
             kind,
+            wide: matches!(
+                group,
+                ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
+            ),
+            compiled: dispatch.kernel == exact_kernel()
+                || matches!(dispatch.kernel, Kernel::RegisterConv(_)),
             m,
             n,
             k,
@@ -315,11 +329,13 @@ pub(crate) struct Target {
     pub allow_raw_f16: bool,
 }
 
-/// How a 64-wide convolution runs, most preferred first.
+/// How a convolution runs, most preferred first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Path {
     /// A generated cooperative-matrix kernel for the window.
     Cooperative,
+    /// The direct register-blocked forward kernel, [`register_block`].
+    Register,
     /// The scalar kernel the compiler emitted. The fallback.
     Compiled,
 }
@@ -327,19 +343,28 @@ pub(crate) enum Path {
 impl Family for Path {
     type Problem = Problem;
     type Target = Target;
-    const PREFERENCE: &'static [Self] = &[Path::Cooperative, Path::Compiled];
+    const PREFERENCE: &'static [Self] = &[Path::Cooperative, Path::Register, Path::Compiled];
 
-    fn tile(self, _: &Problem, target: &Target) -> Option<[u32; 2]> {
+    fn tile(self, problem: &Problem, target: &Target) -> Option<[u32; 2]> {
         Some(match self {
             Path::Cooperative => [target.cooperative?.output_tile(); 2],
+            Path::Register => {
+                let block = problem.register_block();
+                [block.channels, block.pixels * block.threads]
+            }
             Path::Compiled => [64; 2],
         })
     }
 
     fn admits(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
-        let Path::Cooperative = self else {
-            return Ok(());
-        };
+        match self {
+            Path::Compiled => return Ok(()),
+            Path::Register => return register_admits(problem, target),
+            Path::Cooperative => {}
+        }
+        if !problem.wide {
+            return Err("only the 64-wide entry has a cooperative form");
+        }
         let Some(ref config) = target.cooperative else {
             return Err("no cooperative matrices");
         };
@@ -373,6 +398,40 @@ impl Family for Path {
                 Ok(())
             }
         }
+    }
+}
+
+/// Policy: the register kernel replaces the shared-memory tiles where no
+/// cooperative matrices are available. It was measured there (Adreno 740,
+/// and an RTX 3050 with cooperative matrices disabled); devices with them
+/// keep their kernels unless tuning measures otherwise.
+fn register_admits(problem: &Problem, target: &Target) -> Result<(), Rejection> {
+    if problem.kind != Kind::Forward {
+        Err("the register kernel computes the forward convolution only")
+    } else if target.cooperative.is_some() {
+        Err("measured only where cooperative matrices are absent")
+    } else if !problem.compiled {
+        Err("a measurement fixed the kernel")
+    } else if problem.reduced_storage {
+        Err("packed weights keep their compiled kernel")
+    } else if problem.epilogue_inputs {
+        Err("the epilogue binds buffers of its own")
+    } else if !crate::compile::workgroups_within_portable_limits(problem.register_workgroups()) {
+        Err("grid exceeds the portable dispatch limit")
+    } else {
+        Ok(())
+    }
+}
+
+impl Problem {
+    /// The register block for this forward convolution.
+    pub(crate) fn register_block(&self) -> RegisterBlock {
+        register_block(self.m, self.n.saturating_mul(self.batch), self.window[2])
+    }
+
+    /// The grid of [`Problem::register_block`].
+    pub(crate) fn register_workgroups(&self) -> [u32; 3] {
+        register_workgroups(self.register_block(), self.m, self.n, self.batch)
     }
 }
 
@@ -476,6 +535,8 @@ mod tests {
     fn problem(kind: Kind, m: u32, n: u32, k: u32) -> Problem {
         Problem {
             kind,
+            wide: true,
+            compiled: true,
             m,
             n,
             k,
@@ -511,8 +572,66 @@ mod tests {
             allow_raw_f16: false,
         };
         let p = problem(Kind::Forward, 256, 3136, 576);
-        assert_eq!(select(&p, &bare), Path::Compiled);
+        assert_eq!(Path::Compiled.admits(&p, &bare), Ok(()));
         assert_eq!(Path::Compiled.admits(&p, &target(F16)), Ok(()));
+        let grad = problem(Kind::GradInput, 64, 3136, 576);
+        assert_eq!(select(&grad, &bare), Path::Compiled);
+    }
+
+    #[test]
+    fn register_takes_forward_convolutions_without_cooperative_matrices() {
+        let bare = Target {
+            cooperative: None,
+            allow_raw_f16: false,
+        };
+        let p = problem(Kind::Forward, 256, 3136, 576);
+        assert_eq!(select(&p, &bare), Path::Register);
+        let narrow = Problem {
+            wide: false,
+            ..problem(Kind::Forward, 8, 76_800, 64)
+        };
+        assert_eq!(select(&narrow, &bare), Path::Register);
+        for (p, target, reason) in [
+            (
+                problem(Kind::GradInput, 64, 3136, 576),
+                bare,
+                "the register kernel computes the forward convolution only",
+            ),
+            (
+                p,
+                target(F16),
+                "measured only where cooperative matrices are absent",
+            ),
+            (
+                Problem {
+                    compiled: false,
+                    ..p
+                },
+                bare,
+                "a measurement fixed the kernel",
+            ),
+            (
+                Problem {
+                    reduced_storage: true,
+                    ..p
+                },
+                bare,
+                "packed weights keep their compiled kernel",
+            ),
+            (
+                // 2^24 pixels need 65,536 workgroups of 4 × 64.
+                problem(Kind::Forward, 16, 1 << 24, 27),
+                bare,
+                "grid exceeds the portable dispatch limit",
+            ),
+            (
+                Problem { batch: 70_000, ..p },
+                bare,
+                "grid exceeds the portable dispatch limit",
+            ),
+        ] {
+            assert_eq!(Path::Register.admits(&p, &target), Err(reason));
+        }
     }
 
     #[test]
@@ -560,6 +679,14 @@ mod tests {
         ] {
             assert_eq!(Path::Cooperative.admits(&p, &target(config)), Err(reason));
         }
+        let narrow = Problem {
+            wide: false,
+            ..wide
+        };
+        assert_eq!(
+            Path::Cooperative.admits(&narrow, &target(F16)),
+            Err("only the 64-wide entry has a cooperative form")
+        );
         // The f32 input gradient stages its right edge through checked
         // stores, so unaligned columns stay eligible.
         let ragged = problem(Kind::GradInput, 64, 3130, 576);

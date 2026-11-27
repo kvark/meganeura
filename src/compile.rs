@@ -1331,8 +1331,8 @@ pub enum Kernel {
     Cooperative,
     /// A forward convolution computed directly from registers, with its
     /// geometry baked in: no workgroup memory and no im2col tile. Faster than
-    /// the shared-memory tiles where cooperative matrices are absent; see
-    /// [`crate::kernels::conv::register_block`].
+    /// the shared-memory tiles where cooperative matrices are absent; the
+    /// convolution family's `Register` path chooses it.
     RegisterConv(crate::kernels::conv::RegisterBlock),
     /// Checked partial tiles with explicit operand, multiplication and output
     /// types, and F32 accumulation. Multiple K partitions write F32 partials
