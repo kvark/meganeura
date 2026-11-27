@@ -20,6 +20,14 @@
   `compile::emit`, `compile::split_k`, and `train::search` are consolidated
   into one `kernels::occupancy` module with a single `PartitionPolicy`.
 
+- Plain and batch-major f32 products with N and K multiples of four, which
+  cooperative tiles do not take, run on a direct register kernel instead of
+  the shared-memory tiles: each thread accumulates four rows by one vec4 of
+  columns, with threads enumerating (row block, column) pairs so narrow
+  outputs still fill a workgroup. It needs neither split-K nor horizontal
+  packing. On Adreno 740 (Quest 3S) D-FINE-N's products take 5.1 ms instead
+  of 21.6 ms per frame.
+
 - Forward convolutions that cooperative tiles do not take run on a direct
   register-blocked kernel instead of the shared-memory im2col tiles. Each
   thread accumulates up to 16 output channels for 2–4 output pixels, with

@@ -12,3 +12,9 @@ conv dfine-1x1-512to128@30x40 512 30 40 128 1 1 0
 conv dfine-1x1-1024to128@15x20 1024 15 20 128 1 1 0
 conv dfine-1x1-128to256@60x80 128 60 80 256 1 1 0
 gemm dfine-mm-300x512x128 300 512 128
+# gemm: M K N. D-FINE-N's decoder and encoder products (no batch-major ones).
+gemm dfine-mm-300x128x128 300 128 128
+gemm dfine-mm-300x128x512 300 128 512
+gemm dfine-mm-300x256x256 300 256 256
+gemm dfine-mm-1500x128x128 1500 128 128
+gemm dfine-mm-1500x128x80 1500 128 80

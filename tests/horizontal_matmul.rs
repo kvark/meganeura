@@ -15,8 +15,11 @@ fn same_a_siblings_pack_and_keep_outputs_independent() {
         .cooperative_matrix
         .f32_shapes;
     let native_f32 = f32_shapes.contains(&[8, 8, 8]) || f32_shapes.contains(&[16, 16, 16]);
+    // N = 30 keeps the scalar case on the shared-memory tiles, which pack:
+    // products with N and K multiples of four take the register kernel,
+    // which runs each sibling on its own and does not pack.
     for (native, [m, n, k], copies) in [
-        (false, [32, 32, 32], 3),
+        (false, [32, 30, 32], 3),
         (true, [65, 256, 33], 2),
         (true, [65, 256, 33], 3),
     ] {

@@ -428,6 +428,8 @@ impl Code {
                 .unwrap_or_default()
         };
         let (implementation, weights, epilogue, prologue) = match dispatch.kernel {
+            // Its own pipeline, shared with batch-major products.
+            Kernel::RegisterMatmul(_) => return None,
             Kernel::CooperativeWorkgroup { shape, types, .. } => {
                 let types = types.unwrap_or(MatrixTypes::F32_AS_F16);
                 let row_bounds = dims.is_some_and(|[m, _, _]| shape.ragged_rows(m));
@@ -1078,9 +1080,54 @@ pub(crate) fn wide_workgroups(problem: &Problem) -> [u32; 3] {
     ]
 }
 
+/// Register tile of the direct product ([`crate::compile::Kernel::RegisterMatmul`]):
+/// each thread accumulates `rows` rows of C by four columns, read and
+/// written as one vec4, from A rows read as vec4 along K and B rows read as
+/// vec4 along N. Threads enumerate (row block, column) pairs with columns
+/// fastest, so a narrow output still fills the workgroup and adjacent
+/// threads read adjacent columns of B. No workgroup memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RegisterTile {
+    pub rows: u32,
+    pub threads: u32,
+}
+
+/// The register tile for a plain or batch-major `m × n` product over `k`,
+/// if it applies: vec4 loads need `n` and `k` to be multiples of four.
+///
+/// Four rows and 64 threads, measured on Adreno 740 (Quest 3S) over
+/// D-FINE-N's products: 0.88 ms for its seven distinct shapes against about
+/// 3.7 ms on the shared-memory tiles. Other tiles won single shapes by up
+/// to 1.3× and lost others by more.
+pub(crate) fn register_tile(m: u32, n: u32, k: u32) -> Option<RegisterTile> {
+    let tile = RegisterTile {
+        rows: 4,
+        threads: 64,
+    };
+    let aligned = m != 0 && n.is_multiple_of(4) && n != 0 && k.is_multiple_of(4) && k != 0;
+    (aligned && register_workgroups(tile, m, n, 1)[0] <= 65_535).then_some(tile)
+}
+
+/// The grid of a [`RegisterTile`] over `batch` products of `m × n`.
+pub(crate) fn register_workgroups(tile: RegisterTile, m: u32, n: u32, batch: u32) -> [u32; 3] {
+    let threads = (n / 4).saturating_mul(m.div_ceil(tile.rows));
+    [threads.div_ceil(tile.threads), 1, batch]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_tiles_need_vec4_columns_and_depth() {
+        // D-FINE-N's attention product: 8 heads of 300x16 over K = 300.
+        let tile = register_tile(300, 16, 300).expect("aligned");
+        assert_eq!(register_workgroups(tile, 300, 16, 8), [5, 1, 8]);
+        // Rows round up to whole tiles.
+        assert_eq!(register_workgroups(tile, 301, 128, 1), [38, 1, 1]);
+        assert!(register_tile(1200, 1, 33).is_none());
+        assert!(register_tile(300, 64, 6).is_none());
+    }
 
     #[test]
     fn matrix_partitions_keep_short_and_occupied_products_unsplit() {

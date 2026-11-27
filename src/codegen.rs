@@ -1633,6 +1633,75 @@ fn optimizer_module(source: &str) -> ShaderModule {
     ))
 }
 
+/// Generate the direct register-tiled product `C[z] = A[z]·B[z]` for row-major
+/// `A` `[m, k]`, `B` `[k, n]` and `C` `[m, n]`, with image `z` on the grid's Z
+/// axis and the dimensions baked in.
+///
+/// Global thread `g` owns rows `(g / (n/4))·R .. +R` and the vec4 column
+/// `g % (n/4)`. Per four-deep step it reads four vec4 rows of B and one vec4
+/// of A per row, and accumulates `R` vec4s. Rows past `m` read the last row
+/// and are not stored.
+pub(crate) fn generate_register_matmul(
+    [m, n, k]: [u32; 3],
+    tile: crate::kernels::matmul::RegisterTile,
+) -> ShaderModule {
+    use std::fmt::Write;
+    let crate::kernels::matmul::RegisterTile { rows, threads } = tile;
+    let (n4, k4) = (n / 4, k / 4);
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "var<storage> matrix_a: array<vec4<f32>>;\n\
+         var<storage> matrix_b: array<vec4<f32>>;\n\
+         var<storage, read_write> matrix_c: array<vec4<f32>>;\n\n\
+         @compute @workgroup_size({threads})\n\
+         fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n    \
+             let g = wid.x * {threads}u + lid.x;\n    \
+             let col = g % {n4}u;\n    \
+             let r0 = (g / {n4}u) * {rows}u;\n    \
+             let abase = wid.z * {};\n    \
+             let bbase = wid.z * {}u + col;\n    \
+             let cbase = wid.z * {}u + col;",
+        format_args!("{}u", m * k4),
+        k * n4,
+        m * n4,
+    );
+    // Threads past the last row block, and rows past `m`, read the last row.
+    for i in 0..rows {
+        let _ = writeln!(
+            s,
+            "    let a{i} = abase + min(r0 + {i}u, {}u) * {k4}u;",
+            m - 1
+        );
+        let _ = writeln!(s, "    var acc{i} = vec4<f32>();");
+    }
+    let _ = writeln!(
+        s,
+        "    for (var t = 0u; t < {k4}u; t++) {{\n        \
+             let b = bbase + t * {};",
+        4 * n4
+    );
+    for q in 0..4 {
+        let _ = writeln!(s, "        let b{q} = matrix_b[b + {}u];", q * n4);
+    }
+    for i in 0..rows {
+        let _ = writeln!(
+            s,
+            "        let x{i} = matrix_a[a{i} + t];\n        \
+                 acc{i} += x{i}.x * b0 + x{i}.y * b1 + x{i}.z * b2 + x{i}.w * b3;"
+        );
+    }
+    s.push_str("    }\n");
+    for i in 0..rows {
+        let _ = writeln!(
+            s,
+            "    if r0 + {i}u < {m}u {{ matrix_c[cbase + (r0 + {i}u) * {n4}u] = acc{i}; }}"
+        );
+    }
+    s.push_str("}\n");
+    ShaderModule::new(&s)
+}
+
 /// Generate the direct register-blocked forward convolution for `params`
 /// (the dispatch's `[batch, in_channels, in_h, in_w, out_channels, kernel_h,
 /// kernel_w, stride, padding_h, out_h, out_w, padding_w]`), geometry baked in.
