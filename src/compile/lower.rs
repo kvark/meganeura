@@ -15,6 +15,7 @@ use super::{
 use crate::codegen::{
     CoopCaps, CoopConfig, CooperativeMatmulShape, MatrixTypes, WorkgroupMatmulShape,
 };
+use crate::kernels::matmul;
 
 /// Cooperative-matrix precision policy for session construction and target
 /// lowering.
@@ -89,12 +90,13 @@ impl ExecutionPlan {
         target: &LowerTarget<'_>,
     ) -> Option<stages::Preparation> {
         apply_attention_precision(self, target.coop_policy);
-        select_variants(
-            self,
-            target.coop_config,
-            !target.debug,
-            target.coop_policy == CoopPolicy::AllowF16,
-        );
+        let matmul = matmul::Target {
+            cooperative: target.coop_config.copied(),
+            matrix_hardware: target.capabilities.cooperative_matrix.is_supported(),
+            allow_raw_f16: target.coop_policy == CoopPolicy::AllowF16,
+            prefer: self.knobs.prefer_matmul,
+        };
+        select_target_variants(self, &matmul, !target.debug);
         select_workgroup_matmuls(
             self,
             target.capabilities,
@@ -275,16 +277,12 @@ pub(crate) fn select_workgroup_matmuls(
 /// RmsNorm→matmul prologue fusions that depend on cooperative paths run.
 /// Mutates the plan in place. Tuning may replace these initial choices by
 /// measurement, asking the same families what is legal.
-pub(crate) fn select_variants(
-    plan: &mut ExecutionPlan,
-    coop_config: Option<&CoopConfig>,
-    fuse_prologues: bool,
-    allow_raw_f16: bool,
-) {
+fn select_target_variants(plan: &mut ExecutionPlan, target: &matmul::Target, fuse_prologues: bool) {
+    let coop_config = target.cooperative.as_ref();
     reset_workgroup_matmuls(plan);
-    select_conv_paths(plan, coop_config, allow_raw_f16);
-    select_matmul_paths(plan, coop_config, allow_raw_f16);
-    select_batch_register_matmuls(plan, coop_config);
+    select_conv_paths(plan, coop_config, target.allow_raw_f16);
+    select_matmul_paths(plan, target);
+    select_batch_register_matmuls(plan, target);
     let wg = crate::schedule::GridShape::default().workgroup_size;
     for dispatch in &mut plan.dispatches {
         if let Some(dag) = dispatch.pointwise() {
@@ -413,28 +411,21 @@ fn select_conv_paths(
 
 /// Pick each dense product's path from its kernel family, and size its
 /// workgroups and buffers for it.
-fn select_matmul_paths(
-    plan: &mut ExecutionPlan,
-    coop_config: Option<&CoopConfig>,
-    allow_raw_f16: bool,
-) {
-    use crate::kernels::matmul;
-    let target = matmul::Target {
-        cooperative: coop_config.copied(),
-        allow_raw_f16,
-        prefer: plan.knobs.prefer_matmul,
-    };
+fn select_matmul_paths(plan: &mut ExecutionPlan, target: &matmul::Target) {
     for index in 0..plan.dispatches.len() {
         let Some(problem) = matmul::Problem::of(&plan.dispatches[index]) else {
             continue;
         };
         let target = matmul::Target {
             allow_raw_f16: target.allow_raw_f16 && !plan.dispatches[index].requires_full_precision,
-            ..target
+            ..*target
         };
         match matmul::select(&problem, &target) {
             matmul::Path::Cooperative => {
-                let config = coop_config.expect("cooperative paths need a configuration");
+                let config = target
+                    .cooperative
+                    .as_ref()
+                    .expect("cooperative paths need a configuration");
                 let geometry = matmul::cooperative_geometry(&problem, config)
                     .expect("an admitted cooperative product is legal");
                 let dispatch = &mut plan.dispatches[index];
@@ -480,13 +471,7 @@ fn select_matmul_paths(
 /// register kernel by the same rules as [`matmul::Path::Register`]. Runs
 /// before split-K and horizontal packing, which leave the register kernel
 /// alone.
-fn select_batch_register_matmuls(plan: &mut ExecutionPlan, coop_config: Option<&CoopConfig>) {
-    use crate::kernels::matmul;
-    let target = matmul::Target {
-        cooperative: coop_config.copied(),
-        allow_raw_f16: false,
-        prefer: plan.knobs.prefer_matmul,
-    };
+fn select_batch_register_matmuls(plan: &mut ExecutionPlan, target: &matmul::Target) {
     for dispatch in &mut plan.dispatches {
         if dispatch.shader != ShaderEntry::BatchMatMul
             || !matches!(dispatch.kernel, Kernel::Default | Kernel::SmallTile)
@@ -501,7 +486,7 @@ fn select_batch_register_matmuls(plan: &mut ExecutionPlan, coop_config: Option<&
             continue;
         };
         let batch = dispatch.params[3];
-        if let Ok(tile) = matmul::register_admits_product([m, n, k], batch, &target) {
+        if let Ok(tile) = matmul::register_admits_product([m, n, k], batch, target) {
             dispatch.kernel = Kernel::RegisterMatmul(tile);
             dispatch.workgroups = matmul::register_workgroups(tile, m, n, batch);
         }
@@ -523,6 +508,22 @@ fn pad_buffer(plan: &mut ExecutionPlan, buffer: BufferRef, bytes: usize) {
             .extend_from_slice(&plan.buffers[start..]);
     }
     plan.buffers[idx] = bytes;
+}
+
+#[cfg(test)]
+pub(crate) fn select_variants(
+    plan: &mut ExecutionPlan,
+    config: Option<&CoopConfig>,
+    fuse_prologues: bool,
+    allow_raw_f16: bool,
+) {
+    let target = matmul::Target {
+        cooperative: config.copied(),
+        matrix_hardware: config.is_some(),
+        allow_raw_f16,
+        prefer: plan.knobs.prefer_matmul,
+    };
+    select_target_variants(plan, &target, fuse_prologues);
 }
 
 #[cfg(test)]
@@ -567,6 +568,37 @@ mod tests {
         let y = g.matmul(a, b);
         g.set_outputs(vec![y]);
         compile::compile(&g)
+    }
+
+    #[test]
+    fn scalar_splits_survive_register_selection() {
+        for matrix_hardware in [false, true] {
+            let target = matmul::Target {
+                cooperative: None,
+                matrix_hardware,
+                allow_raw_f16: false,
+                prefer: None,
+            };
+            for (m, n, k, splits) in [
+                (256, 1024, 8192, 8),
+                (64, 576, 49152, 48),
+                (32, 1024, 4096, 4),
+            ] {
+                let mut plan = matmul_plan(m, n, k);
+                select_target_variants(&mut plan, &target, false);
+                if !matrix_hardware && k == 4096 {
+                    assert!(matches!(
+                        plan.dispatches[0].kernel,
+                        Kernel::RegisterMatmul(_)
+                    ));
+                } else {
+                    assert!(
+                        matches!(plan.dispatches[0].kernel, Kernel::SplitMatmul { splits: count, .. } if count == splits)
+                    );
+                    assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
+                }
+            }
+        }
     }
 
     #[test]

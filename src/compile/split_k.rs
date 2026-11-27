@@ -106,7 +106,7 @@ impl ExecutionPlan {
                 continue;
             }
             let Some(class) = TuneClass::from_dispatch(dispatch, None)
-                .filter(|c| c.shader.is_matmul() && c.k >= 8192)
+                .filter(|c| c.shader.is_matmul() && c.k >= crate::kernels::matmul::LONG_SCALAR_K)
             else {
                 continue;
             };

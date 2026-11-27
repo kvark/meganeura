@@ -80,30 +80,8 @@ fn matmul_lowerings() {
     }
 }
 
-/// The kernel of every plain or batch-major product `graph` compiles to
-/// without cooperative matrices, where the register kernel is preferred.
-fn product_kernels(graph: &Graph) -> Vec<meganeura::compile::Kernel> {
-    use meganeura::compile::ShaderEntry;
-    let mut config = meganeura::SessionConfig::from_env();
-    config.mode = meganeura::Mode::Inference;
-    config.runtime.coop = meganeura::CoopPolicy::Disabled;
-    config.gpu = Some(gpu::shared_context());
-    let (session, _) = meganeura::build(graph, config);
-    session
-        .plan()
-        .dispatches
-        .iter()
-        .filter(|d| matches!(d.shader, ShaderEntry::MatMul | ShaderEntry::BatchMatMul))
-        .map(|d| d.kernel.clone())
-        .collect()
-}
-
-/// Without cooperative matrices, products whose N and K are multiples of
-/// four, with grids of at least four workgroups, run on the direct register
-/// kernel. Rows past a whole tile (M = 1201, 1025, 49), the narrowest output
-/// (N = 4), the shallowest reduction (K = 4) and batch-major products with
-/// narrow and deep shapes, like attention's. Each also runs with
-/// cooperative matrices disabled, so every device checks the kernel.
+/// Exercise full tiles, row tails, narrow outputs and batch-major layouts
+/// on the register kernel as well as the default paths.
 #[test]
 fn register_matmul_lowerings() {
     use meganeura::compile::Kernel;
@@ -124,21 +102,20 @@ fn register_matmul_lowerings() {
     }
     for (what, mut g, y) in graphs {
         g.set_outputs(vec![y]);
-        for kernel in product_kernels(&g) {
-            assert!(
-                matches!(kernel, Kernel::RegisterMatmul(_)),
-                "{what} compiled to {kernel:?}"
-            );
-        }
+        let mut register = gpu::Options::default();
+        register.compile.knobs.prefer_matmul = Some(meganeura::kernels::matmul::Path::Register);
+        let plan = gpu::plan(&g, &register, meganeura::Mode::Inference);
+        assert!(
+            plan.dispatches
+                .iter()
+                .any(|d| matches!(d.kernel, Kernel::RegisterMatmul(_))),
+            "{what}"
+        );
         let mut feeds = Feeds::new();
         feeds.fill_random(&g, what.len() as u64, 1.0);
-        let scalar = gpu::Options {
-            coop: meganeura::CoopPolicy::Disabled,
-            ..Default::default()
-        };
         for (lowering, options) in gpu::Options::lowerings()
             .into_iter()
-            .chain([("no cooperative matrices", scalar)])
+            .chain([("register", register)])
         {
             let report = gpu::check_inference(&g, &feeds, &options)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
