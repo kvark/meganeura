@@ -292,6 +292,12 @@ fn conv2d_forward() {
         ),
         // Non-square kernel, padding only in H.
         (Conv::new(2, 4, (9, 8), 6, (3, 2), 1, (2, 0)), Conv2dGemm16),
+        // A padded 2×2 at a 16×4 block, which Adreno 740 miscompiled when
+        // the register kernel selected its loads' index and value.
+        (
+            Conv::new(1, 96, (35, 47), 32, (2, 2), 1, (1, 1)),
+            Conv2dGemm16,
+        ),
         // Padding larger than half the kernel: all-padding border outputs.
         (Conv::new(1, 2, (4, 5), 3, (3, 3), 1, (3, 2)), Conv2dGemm16),
     ];

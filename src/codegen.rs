@@ -1695,14 +1695,32 @@ pub(crate) fn generate_register_conv(
                  let tap = c * {window}u + u32(ky * {kw} + kx);",
         h * w,
     );
+    // Without padding every window lies inside the image, so the loads
+    // need no checks. With it, the coordinates are clamped into the image
+    // and the value masked. Adreno 740 (driver 0837.0.9) miscompiled the
+    // earlier form, a load at a `select`ed index under a `select`ed value:
+    // a 2×2 convolution 96 -> 32 at 35×47 with padding 1 and a 16×4 block
+    // came out wrong, while the clamped form matches the reference and runs
+    // as fast.
+    let padded = pad_h != 0 || pad_w != 0;
     for j in 0..pixels {
         let _ = writeln!(
             s,
             "        let y{j} = iy{j} + ky;\n        \
-                 let x{j} = ix{j} + kx;\n        \
-                 let in{j} = y{j} >= 0 && y{j} < {h} && x{j} >= 0 && x{j} < {w};\n        \
-                 let v{j} = select(0.0, src[select(0u, plane + u32(y{j}) * {w}u + u32(x{j}), in{j})], in{j});"
+                 let x{j} = ix{j} + kx;"
         );
+        if padded {
+            let _ = writeln!(
+                s,
+                "        let in{j} = y{j} >= 0 && y{j} < {h} && x{j} >= 0 && x{j} < {w};\n        \
+                     let v{j} = src[plane + u32(clamp(y{j}, 0, {h} - 1)) * {w}u + u32(clamp(x{j}, 0, {w} - 1))] * f32(in{j});"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "        let v{j} = src[plane + u32(y{j}) * {w}u + u32(x{j})];"
+            );
+        }
     }
     for i in 0..channels {
         let _ = writeln!(s, "        let w{i} = weight[row{i} + tap];");
