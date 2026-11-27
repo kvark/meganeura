@@ -7646,6 +7646,12 @@ impl Session {
         self.coop_config
     }
 
+    /// The barrier groups, which [`Self::plan`] leaves out.
+    #[cfg(test)]
+    pub(crate) fn groups(&self) -> &[std::ops::Range<usize>] {
+        &self.groups
+    }
+
     /// Number of barrier groups (compute passes) in the dispatch sequence.
     pub fn num_groups(&self) -> usize {
         self.groups.len()

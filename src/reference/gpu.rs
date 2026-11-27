@@ -112,7 +112,11 @@ fn dispatched(session: &crate::Session) -> Vec<crate::compile::ShaderEntry> {
 }
 
 /// The plan a session for `graph` built with `options` runs before tuning,
-/// on the same device and policy, without building the session.
+/// on the same device and policy, with its barrier groups, without building
+/// the session.
+///
+/// The plan is already lowered for that device. It is for inspection: a
+/// session built from it would lower it a second time.
 pub fn plan(graph: &Graph, options: &Options, mode: Mode) -> crate::compile::ExecutionPlan {
     crate::train::plan(graph, &options.session_config(mode))
 }
