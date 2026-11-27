@@ -459,16 +459,7 @@ pub(crate) fn product_admits(
     if problem.n.saturating_mul(problem.batch) >= FEW_PIXELS {
         return Err("the direct kernel is faster on this many pixels");
     }
-    let product = crate::kernels::matmul::Target {
-        cooperative: target.cooperative,
-        allow_raw_f16: false,
-        prefer: None,
-    };
-    crate::kernels::matmul::register_admits_product(
-        [problem.m, problem.n, problem.k],
-        problem.batch,
-        &product,
-    )
+    crate::kernels::matmul::register_product_tile([problem.m, problem.n, problem.k], problem.batch)
 }
 
 impl Problem {

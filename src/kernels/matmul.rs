@@ -23,6 +23,9 @@ use crate::compile::{
 use crate::schedule::PointwiseDAG;
 use serde::{Deserialize, Serialize};
 
+/// Scalar reductions this long use partial sums to limit F32 rounding error.
+pub(crate) const LONG_SCALAR_K: u32 = 8192;
+
 /// K partitions for a checked typed product: fill a small 32×32 output grid
 /// without making each partition mostly staging work. Storage and
 /// multiplication types do not change the partition contract.
@@ -893,6 +896,8 @@ impl Problem {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Target {
     pub cooperative: Option<CoopConfig>,
+    /// Cooperative-matrix hardware reported before applying the session policy.
+    pub matrix_hardware: bool,
     /// [`CoopPolicy::AllowF16`](crate::CoopPolicy): f16 operands even for
     /// work that requires full precision.
     pub allow_raw_f16: bool,
@@ -905,8 +910,8 @@ pub(crate) struct Target {
 pub enum Path {
     /// Cooperative-matrix tiles in the device's configuration.
     Cooperative,
-    /// The direct register kernel ([`RegisterTile`]), where cooperative
-    /// matrices are absent.
+    /// The direct register kernel ([`RegisterTile`]). Selected by default
+    /// on eligible products on devices without cooperative matrices.
     Register,
     /// 32-wide scalar tiles, for products too small to occupy the device
     /// with 64-wide ones.
@@ -1046,14 +1051,23 @@ pub(crate) fn register_admits_product(
     batch: u32,
     target: &Target,
 ) -> Result<RegisterTile, Rejection> {
-    // Policy: measured only where cooperative matrices are absent (Adreno
-    // 740); devices with them keep their kernels unless tuning measures it.
-    if target.cooperative.is_some() {
-        return Err("measured only where cooperative matrices are absent");
+    // Adreno 740 benefits from this default. On matrix-capable devices
+    // leave register tiles to measured tuning or an explicit preference.
+    if target.matrix_hardware && target.prefer != Some(Path::Register) {
+        return Err("register tiles need measurement or an explicit preference on matrix hardware");
     }
     if target.prefer.is_some_and(|path| path != Path::Register) {
         return Err("another path is preferred");
     }
+    register_product_tile([m, n, k], batch)
+}
+
+/// Register tile whose vector loads and dispatch grid fit this product.
+/// Dense matmul and pointwise convolution select it under their own policies.
+pub(crate) fn register_product_tile(
+    [m, n, k]: [u32; 3],
+    batch: u32,
+) -> Result<RegisterTile, Rejection> {
     let tile = register_tile(m, n, k).ok_or("vec4 loads need N and K multiples of four")?;
     let grid = register_workgroups(tile, m, n, batch);
     if !crate::compile::workgroups_within_portable_limits(grid) {
@@ -1070,6 +1084,8 @@ pub(crate) fn register_admits_product(
 fn register_admits(problem: &Problem, target: &Target) -> Result<(), Rejection> {
     if problem.layout != Layout::Plain {
         Err("the register kernel computes plain products only")
+    } else if problem.k >= LONG_SCALAR_K {
+        Err("long scalar reductions need partial sums")
     } else if problem.pinned || problem.locked {
         Err("the kernel is fixed by a schedule or storage policy")
     } else if problem.reduced_storage {
@@ -1196,16 +1212,14 @@ mod tests {
     fn register_path_states_why_it_declines() {
         let bare = Target {
             cooperative: None,
+            matrix_hardware: false,
             allow_raw_f16: false,
             prefer: None,
         };
         let plain = Problem::plain(Layout::Plain, [300, 128, 512], false);
         assert_eq!(select(&plain, &bare), Path::Register);
         let coop = Target {
-            cooperative: Some(CoopConfig {
-                tile_size: 16,
-                use_f16_input: true,
-            }),
+            matrix_hardware: true,
             ..bare
         };
         let preferred = Target {
@@ -1216,7 +1230,7 @@ mod tests {
             (
                 plain,
                 coop,
-                "measured only where cooperative matrices are absent",
+                "register tiles need measurement or an explicit preference on matrix hardware",
             ),
             (plain, preferred, "another path is preferred"),
             (
@@ -1293,6 +1307,7 @@ mod tests {
     fn target(config: &CoopConfig) -> Target {
         Target {
             cooperative: Some(*config),
+            matrix_hardware: true,
             allow_raw_f16: false,
             prefer: None,
         }
@@ -1302,6 +1317,7 @@ mod tests {
     fn compiled_admits_everything() {
         let bare = Target {
             cooperative: None,
+            matrix_hardware: false,
             allow_raw_f16: false,
             prefer: None,
         };
@@ -1469,11 +1485,6 @@ mod tests {
 
         fn prefer(self, options: &mut crate::reference::gpu::Options) {
             options.compile.knobs.prefer_matmul = Some(self);
-            // The register kernel is offered only without cooperative
-            // matrices; disabling them checks it on every device.
-            if self == Path::Register {
-                options.coop = crate::CoopPolicy::Disabled;
-            }
         }
 
         fn target(
@@ -1482,9 +1493,12 @@ mod tests {
             options: &crate::reference::gpu::Options,
         ) -> Target {
             Target {
-                cooperative: session
-                    .coop_config()
-                    .filter(|_| options.coop != crate::CoopPolicy::Disabled),
+                cooperative: session.coop_config(),
+                matrix_hardware: session
+                    .context()
+                    .capabilities()
+                    .cooperative_matrix
+                    .is_supported(),
                 allow_raw_f16: options.coop == crate::CoopPolicy::AllowF16,
                 prefer: Some(self),
             }

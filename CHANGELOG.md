@@ -25,13 +25,11 @@
   Adreno 740 D-FINE-N's 1×1 convolutions at 15×20 run 1.5–1.7× faster;
   larger images keep the direct convolution kernel, which wins there.
 
-- Plain and batch-major f32 products with N and K multiples of four, which
-  cooperative tiles do not take, run on a direct register kernel instead of
-  the shared-memory tiles: each thread accumulates four rows by one vec4 of
-  columns, with threads enumerating (row block, column) pairs so narrow
-  outputs still fill a workgroup. It needs neither split-K nor horizontal
-  packing. On Adreno 740 (Quest 3S) D-FINE-N's products take 5.1 ms instead
-  of 21.6 ms per frame.
+- On devices without cooperative matrices, eligible plain and batch-major
+  f32 products with N and K multiples of four use a direct register kernel.
+  Each thread accumulates four rows by one vec4 of columns. Plain products
+  with K ≥ 8192 retain the existing long-reduction policy. On Adreno 740
+  (Quest 3S), D-FINE-N's products take 5.1 ms instead of 21.6 ms per frame.
 
 - Forward convolutions that cooperative tiles do not take run on a direct
   register-blocked kernel instead of the shared-memory im2col tiles. Each
