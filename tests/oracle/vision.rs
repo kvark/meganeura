@@ -30,6 +30,32 @@ fn dispatched(graph: &Graph, mode: Mode, options: &gpu::Options) -> Vec<ShaderEn
         .collect()
 }
 
+/// The kernel of every forward convolution `graph` compiles to.
+fn forward_conv_kernels(graph: &Graph, options: &gpu::Options) -> Vec<Kernel> {
+    let mut config = SessionConfig::from_env();
+    config.mode = Mode::Inference;
+    config.options = options.compile.clone();
+    config.optimize = options.optimize;
+    config.runtime.coop = options.coop;
+    config.gpu = Some(gpu::shared_context());
+    let (session, _) = meganeura::build(graph, config);
+    session
+        .plan()
+        .dispatches
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.shader,
+                ShaderEntry::Conv2dGemm
+                    | ShaderEntry::Conv2dGemmSmall
+                    | ShaderEntry::Conv2dGemm16
+                    | ShaderEntry::Conv2dGemmCoopGen(..)
+            )
+        })
+        .map(|d| d.kernel.clone())
+        .collect()
+}
+
 /// Collects failures so one broken case does not hide the others.
 #[derive(Default)]
 struct Failures(Vec<String>);
@@ -283,6 +309,21 @@ fn conv2d_forward() {
             &options,
             &[shader],
         );
+        // What cooperative tiles do not take runs on the direct register
+        // kernel, so the comparison above checked that kernel.
+        for kernel in forward_conv_kernels(&g, &options) {
+            assert!(
+                matches!(
+                    kernel,
+                    Kernel::RegisterConv(_)
+                        | Kernel::Cooperative
+                        | Kernel::CooperativeTyped { .. }
+                        | Kernel::CooperativeWorkgroup { .. }
+                        | Kernel::CooperativeTiled { .. }
+                ),
+                "{c:?} compiled to {kernel:?}"
+            );
+        }
     }
     failures.assert_none();
 }

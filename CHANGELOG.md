@@ -8,6 +8,14 @@
   `compile::emit`, `compile::split_k`, and `train::search` are consolidated
   into one `kernels::occupancy` module with a single `PartitionPolicy`.
 
+- Forward convolutions that cooperative tiles do not take run on a direct
+  register-blocked kernel instead of the shared-memory im2col tiles. Each
+  thread accumulates up to 16 output channels for 2–4 output pixels, with
+  the geometry baked in and no workgroup memory. On Adreno 740 (Quest 3S)
+  D-FINE-N's convolutions take 24 ms instead of 71 ms per frame, and single
+  shapes run 2.3–15× faster (`bench/dfine_shapes.txt` with `op_bench`); an
+  RTX 3050 without cooperative matrices is about 2× faster.
+
 - The ONNX importer runs D-FINE (onnx-community's `dfine_n_coco-ONNX` at a
   fixed 640×640 input). Its logits and boxes match onnxruntime within 4e-4,
   apart from two queries whose near-equal scores select in the other order.

@@ -1618,6 +1618,112 @@ fn optimizer_module(source: &str) -> ShaderModule {
     ))
 }
 
+/// Generate the direct register-blocked forward convolution for `params`
+/// (the dispatch's `[batch, in_channels, in_h, in_w, out_channels, kernel_h,
+/// kernel_w, stride, padding_h, out_h, out_w, padding_w]`), geometry baked in.
+///
+/// Thread `t` of workgroup `(x, y, z)` owns output channels
+/// `y·C .. y·C+C` and the flattened output pixels `(x·T + t)·P .. +P` of image
+/// `z`. Each pixel's input origin is decomposed once; the reduction over
+/// `(ci, ky, kx)` then reads one weight per channel (the same address across
+/// the workgroup) and one bounds-checked input per pixel. Pixels past the
+/// end clamp to the last one, so every thread runs the full loop, and only
+/// the stores are guarded.
+pub(crate) fn generate_register_conv(
+    params: &[u32],
+    block: crate::kernels::conv::RegisterBlock,
+) -> ShaderModule {
+    use std::fmt::Write;
+    let &[_, ci, h, w, co, kh, kw, stride, pad_h, oh, ow, pad_w] = params else {
+        panic!("Conv2d params layout: {params:?}");
+    };
+    let crate::kernels::conv::RegisterBlock {
+        channels,
+        pixels,
+        threads,
+    } = block;
+    let spatial = oh * ow;
+    let window = kh * kw;
+    let reduction = ci * window;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "var<storage> src: array<f32>;\n\
+         var<storage> weight: array<f32>;\n\
+         var<storage, read_write> dst: array<f32>;\n\n\
+         @compute @workgroup_size({threads})\n\
+         fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n    \
+             let first = (wid.x * {threads}u + lid.x) * {pixels}u;\n    \
+             let co0 = wid.y * {channels}u;\n    \
+             let input = wid.z * {}u;\n    \
+             let output = wid.z * {}u;",
+        ci * h * w,
+        co * spatial,
+    );
+    for j in 0..pixels {
+        let _ = writeln!(
+            s,
+            "    let p{j} = min(first + {j}u, {last}u);\n    \
+                 let oy{j} = p{j} / {ow}u;\n    \
+                 let iy{j} = i32(oy{j} * {stride}u) - {pad_h};\n    \
+                 let ix{j} = i32((p{j} - oy{j} * {ow}u) * {stride}u) - {pad_w};",
+            last = spatial - 1,
+        );
+    }
+    // Rows past the output channels read the last row; their sums are
+    // dropped. Clamp only when a block can pass the end: on Adreno 740 the
+    // clamp made a 2×2 convolution 4× slower, presumably because the weight
+    // loads no longer read as uniform across the workgroup.
+    let partial = !co.is_multiple_of(channels);
+    for i in 0..channels {
+        let row = if partial {
+            format!("min(co0 + {i}u, {}u)", co - 1)
+        } else {
+            format!("(co0 + {i}u)")
+        };
+        let _ = writeln!(s, "    let row{i} = {row} * {reduction}u;");
+        for j in 0..pixels {
+            let _ = writeln!(s, "    var acc{i}_{j} = 0.0;");
+        }
+    }
+    let _ = writeln!(
+        s,
+        "    for (var c = 0u; c < {ci}u; c++) {{\n    \
+             let plane = input + c * {}u;\n    \
+             for (var ky = 0; ky < {kh}; ky++) {{\n    \
+             for (var kx = 0; kx < {kw}; kx++) {{\n        \
+                 let tap = c * {window}u + u32(ky * {kw} + kx);",
+        h * w,
+    );
+    for j in 0..pixels {
+        let _ = writeln!(
+            s,
+            "        let y{j} = iy{j} + ky;\n        \
+                 let x{j} = ix{j} + kx;\n        \
+                 let in{j} = y{j} >= 0 && y{j} < {h} && x{j} >= 0 && x{j} < {w};\n        \
+                 let v{j} = select(0.0, src[select(0u, plane + u32(y{j}) * {w}u + u32(x{j}), in{j})], in{j});"
+        );
+    }
+    for i in 0..channels {
+        let _ = writeln!(s, "        let w{i} = weight[row{i} + tap];");
+        for j in 0..pixels {
+            let _ = writeln!(s, "        acc{i}_{j} += w{i} * v{j};");
+        }
+    }
+    s.push_str("    }\n    }\n    }\n");
+    for i in 0..channels {
+        for j in 0..pixels {
+            let _ = writeln!(
+                s,
+                "    if co0 + {i}u < {co}u && first + {j}u < {spatial}u {{ \
+                 dst[output + (co0 + {i}u) * {spatial}u + first + {j}u] = acc{i}_{j}; }}"
+            );
+        }
+    }
+    s.push_str("}\n");
+    ShaderModule::new(&s)
+}
+
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
 pub(crate) fn generate_conv_module(
     group: ShaderGroup,
