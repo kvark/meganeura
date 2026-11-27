@@ -268,6 +268,8 @@ pub(crate) struct Problem {
     pub requires_full_precision: bool,
     /// A fused epilogue that binds buffers of its own.
     pub epilogue_inputs: bool,
+    /// Any fused epilogue, which the register kernel does not apply.
+    pub epilogue: bool,
 }
 
 impl Problem {
@@ -307,6 +309,7 @@ impl Problem {
                 .matmul_epilogue
                 .as_ref()
                 .is_some_and(|epilogue| !epilogue.inputs.is_empty()),
+            epilogue: dispatch.matmul_epilogue.is_some(),
         })
     }
 
@@ -414,8 +417,8 @@ fn register_admits(problem: &Problem, target: &Target) -> Result<(), Rejection> 
         Err("a measurement fixed the kernel")
     } else if problem.reduced_storage {
         Err("packed weights keep their compiled kernel")
-    } else if problem.epilogue_inputs {
-        Err("the epilogue binds buffers of its own")
+    } else if problem.epilogue {
+        Err("the register kernel has no epilogue")
     } else if !crate::compile::workgroups_within_portable_limits(problem.register_workgroups()) {
         Err("grid exceeds the portable dispatch limit")
     } else {
@@ -546,6 +549,7 @@ mod tests {
             reduced_storage: false,
             requires_full_precision: false,
             epilogue_inputs: false,
+            epilogue: false,
         }
     }
 
@@ -617,6 +621,14 @@ mod tests {
                 },
                 bare,
                 "packed weights keep their compiled kernel",
+            ),
+            (
+                Problem {
+                    epilogue: true,
+                    ..p
+                },
+                bare,
+                "the register kernel has no epilogue",
             ),
             (
                 // 2^24 pixels need 65,536 workgroups of 4 × 64.
