@@ -237,12 +237,24 @@ pub enum MatmulTile {
         #[serde(default)]
         specialize: bool,
     },
+    /// The direct register-blocked forward convolution at one block; see
+    /// [`crate::compile::Kernel::RegisterConv`].
+    RegisterConv(crate::kernels::conv::RegisterBlock),
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
     /// Keeps the shader entry and buffer layout. Width and reduction apply
     /// to every storage format; contiguous row grouping also changes the
     /// workgroup count for transposed-B kernels.
     Gemv(crate::codegen::GemvShape),
+}
+
+/// The forward convolution's scalar entries, which the register kernel
+/// replaces.
+fn is_forward_conv(shader: &ShaderEntry) -> bool {
+    matches!(
+        shader,
+        ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16
+    )
 }
 
 fn conv_launched_tile(shader: &ShaderEntry) -> Option<u32> {
@@ -342,6 +354,7 @@ impl MatmulTile {
                     interleave_columns,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
+                Kernel::RegisterConv(block) => Some(Self::RegisterConv(block)),
                 _ => None,
             }
         } else {
@@ -420,7 +433,8 @@ impl MatmulTile {
             | Self::Tile32
             | Self::Tile64
             | Self::Scalar(_)
-            | Self::SpecializedConv { .. } => TileFamily::Scalar,
+            | Self::SpecializedConv { .. }
+            | Self::RegisterConv(_) => TileFamily::Scalar,
             Self::CooperativeF32 { .. }
             | Self::CooperativeF16 { .. }
             | Self::CooperativeWorkgroup { .. }
@@ -495,6 +509,7 @@ impl MatmulTile {
                 k_tile,
                 interleave_columns,
             },
+            Self::RegisterConv(block) => crate::compile::Kernel::RegisterConv(block),
             Self::Gemv(_) | Self::CooperativeChecked { .. } | Self::CooperativeWorkgroup { .. } => {
                 unreachable!()
             }
@@ -550,7 +565,10 @@ impl MatmulTile {
                     crate::kernels::matmul::Variant::Cooperative(self.coop_config()?),
                     1,
                 ),
-                Self::Tile16 | Self::SpecializedConv { .. } | Self::Gemv(_) => return None,
+                Self::Tile16
+                | Self::SpecializedConv { .. }
+                | Self::RegisterConv(_)
+                | Self::Gemv(_) => return None,
             };
             return Some(product.launch(variant, splits).workgroups);
         }
@@ -567,6 +585,15 @@ impl MatmulTile {
                 ]);
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
+            Self::RegisterConv(block) => {
+                let c = class.conv2d?;
+                return Some(crate::kernels::conv::register_workgroups(
+                    block,
+                    c.out_channels,
+                    c.out_h.saturating_mul(c.out_w),
+                    c.batch,
+                ));
+            }
             Self::CooperativeTiled { shape, splits } => {
                 return Some([class.m / 64, class.n / shape.columns, splits]);
             }
@@ -703,6 +730,17 @@ impl MatmulTile {
             return Some(sizes);
         }
         if matches!(self, Self::Tile16) && class.conv2d.is_none() {
+            return None;
+        }
+        if let Self::RegisterConv(block) = self
+            && (class.conv2d.is_none()
+                || !is_forward_conv(&class.shader)
+                || class.weight_format != crate::compile::WeightFormat::F32
+                || class.epilogue.is_some()
+                || !matches!(block.channels, 4 | 8 | 16)
+                || !matches!(block.pixels, 1 | 2 | 4)
+                || !matches!(block.threads, 32 | 64 | 128))
+        {
             return None;
         }
         if let Self::SpecializedConv {
@@ -1136,6 +1174,21 @@ impl TuneClass {
                             k_tile,
                             interleave_columns,
                         });
+                    }
+                }
+            }
+            // The register kernel's blocks around its heuristic choice; it
+            // computes the forward convolution only.
+            if is_forward_conv(&self.shader) {
+                for channels in [4, 8, 16] {
+                    for pixels in [1, 2, 4] {
+                        out.push(MatmulTile::RegisterConv(
+                            crate::kernels::conv::RegisterBlock {
+                                channels,
+                                pixels,
+                                threads: 64,
+                            },
+                        ));
                     }
                 }
             }
@@ -2395,8 +2448,9 @@ mod tests {
             );
             let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)), &[]);
             // Plain tiles and specialized K stages; 32/64-wide tiles also
-            // challenge column interleaving. Exclude the incumbent.
-            assert_eq!(candidates.len(), 12);
+            // challenge column interleaving. Exclude the incumbent. The
+            // forward convolution adds nine register blocks.
+            assert_eq!(candidates.len(), if forward { 21 } else { 12 });
             for candidate in candidates {
                 candidate.apply(&mut d, &class);
                 assert_eq!(MatmulTile::selected(&d, None), Some(candidate));

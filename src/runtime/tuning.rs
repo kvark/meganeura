@@ -466,6 +466,9 @@ pub(super) fn tile_module(
         .0;
     }
     let entry = &dispatch.shader;
+    if let MatmulTile::RegisterConv(block) = tile {
+        return crate::codegen::generate_register_conv(&dispatch.params, block);
+    }
     if let MatmulTile::Scalar(shape) = tile {
         let options = crate::codegen::MatMulOptions {
             format: dispatch.weight_format,

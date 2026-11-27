@@ -283,7 +283,6 @@ pub(crate) fn select_variants(
 ) {
     reset_workgroup_matmuls(plan);
     select_conv_paths(plan, coop_config, allow_raw_f16);
-    select_register_convs(plan);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
     let wg = crate::schedule::GridShape::default().workgroup_size;
     for dispatch in &mut plan.dispatches {
@@ -366,8 +365,20 @@ fn select_conv_paths(
             allow_raw_f16: target.allow_raw_f16 && !plan.dispatches[index].requires_full_precision,
             ..target
         };
-        if conv::select(&problem, &target) != conv::Path::Cooperative {
-            continue;
+        match conv::select(&problem, &target) {
+            conv::Path::Compiled => continue,
+            // The tiles stage an im2col slab through workgroup memory, which
+            // costs more than it saves where no cooperative matrices consume
+            // it: on Adreno 740 the register kernel ran D-FINE-N's
+            // convolutions 3–22× faster, and about 2× on an RTX 3050 without
+            // cooperative matrices.
+            conv::Path::Register => {
+                let dispatch = &mut plan.dispatches[index];
+                dispatch.kernel = Kernel::RegisterConv(problem.register_block());
+                dispatch.workgroups = problem.register_workgroups();
+                continue;
+            }
+            conv::Path::Cooperative => {}
         }
         let config = coop_config.expect("cooperative paths need a configuration");
         let geometry = conv::cooperative_geometry(&problem, config)
@@ -383,32 +394,6 @@ fn select_conv_paths(
         if let Some(extra) = extra {
             pad_buffer(plan, extra, geometry.output_bytes);
         }
-    }
-}
-
-/// Move the forward convolutions still on shared-memory scalar tiles to the
-/// direct register-blocked kernel. The tiles stage an im2col slab through
-/// workgroup memory, which costs more than it saves where no cooperative
-/// matrices consume it: on Adreno 740 the register kernel ran D-FINE-N's
-/// convolutions 3–22× faster, and about 2× on an RTX 3050 without
-/// cooperative matrices. A K stage pinned by tuning keeps its tile.
-fn select_register_convs(plan: &mut ExecutionPlan) {
-    use crate::kernels::conv;
-    for dispatch in &mut plan.dispatches {
-        if !matches!(
-            dispatch.shader,
-            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16
-        ) || dispatch.kernel != conv::exact_kernel()
-            || dispatch.matmul_epilogue.is_some()
-            || dispatch.weight_format.uses_reduced_storage()
-        {
-            continue;
-        }
-        let p = conv::Params::from(&*dispatch);
-        let spatial = p.out_h * p.out_w;
-        let block = conv::register_block(p.out_channels, spatial * p.batch, p.stride);
-        dispatch.kernel = Kernel::RegisterConv(block);
-        dispatch.workgroups = conv::register_workgroups(block, p.out_channels, spatial, p.batch);
     }
 }
 
