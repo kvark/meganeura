@@ -198,8 +198,9 @@ pub struct RegisterBlock {
 }
 
 /// Output pixels (over the batch) below which a convolution takes the
-/// smaller 8 × 2 block, so the grid still has threads to spread over.
-const FEW_PIXELS: u32 = 1024;
+/// smaller 8 × 2 block, so the grid still has threads to spread over, and
+/// a 1×1 convolution takes the register product kernel instead.
+pub(crate) const FEW_PIXELS: u32 = 1024;
 
 /// The register block for a forward convolution with `out_channels`
 /// channels over `pixels` output pixels (all images), at `stride`.

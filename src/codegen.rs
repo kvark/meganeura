@@ -1641,19 +1641,28 @@ fn optimizer_module(source: &str) -> ShaderModule {
 /// `g % (n/4)`. Per four-deep step it reads four vec4 rows of B and one vec4
 /// of A per row, and accumulates `R` vec4s. Rows past `m` read the last row
 /// and are not stored.
+///
+/// A 1×1 convolution is the same product per image, `out[Co, HW] = W[Co, Ci]
+/// · x[Ci, HW]`: it binds its weight as A, shared by every image, its input
+/// as B and its output as C ([`ProductBindings::Conv`]).
 pub(crate) fn generate_register_matmul(
     [m, n, k]: [u32; 3],
     tile: crate::kernels::matmul::RegisterTile,
+    bindings: ProductBindings,
 ) -> ShaderModule {
     use std::fmt::Write;
     let crate::kernels::matmul::RegisterTile { rows, threads } = tile;
     let (n4, k4) = (n / 4, k / 4);
+    let (a, b, c, a_stride) = match bindings {
+        ProductBindings::Matmul => ("matrix_a", "matrix_b", "matrix_c", m * k4),
+        ProductBindings::Conv => ("weight", "src", "dst", 0),
+    };
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "var<storage> matrix_a: array<vec4<f32>>;\n\
-         var<storage> matrix_b: array<vec4<f32>>;\n\
-         var<storage, read_write> matrix_c: array<vec4<f32>>;\n\n\
+        "var<storage> {a}: array<vec4<f32>>;\n\
+         var<storage> {b}: array<vec4<f32>>;\n\
+         var<storage, read_write> {c}: array<vec4<f32>>;\n\n\
          @compute @workgroup_size({threads})\n\
          fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{\n    \
              let g = wid.x * {threads}u + lid.x;\n    \
@@ -1662,7 +1671,7 @@ pub(crate) fn generate_register_matmul(
              let abase = wid.z * {};\n    \
              let bbase = wid.z * {}u + col;\n    \
              let cbase = wid.z * {}u + col;",
-        format_args!("{}u", m * k4),
+        format_args!("{a_stride}u"),
         k * n4,
         m * n4,
     );
@@ -1682,12 +1691,12 @@ pub(crate) fn generate_register_matmul(
         4 * n4
     );
     for q in 0..4 {
-        let _ = writeln!(s, "        let b{q} = matrix_b[b + {}u];", q * n4);
+        let _ = writeln!(s, "        let b{q} = {b}[b + {}u];", q * n4);
     }
     for i in 0..rows {
         let _ = writeln!(
             s,
-            "        let x{i} = matrix_a[a{i} + t];\n        \
+            "        let x{i} = {a}[a{i} + t];\n        \
                  acc{i} += x{i}.x * b0 + x{i}.y * b1 + x{i}.z * b2 + x{i}.w * b3;"
         );
     }
@@ -1695,11 +1704,20 @@ pub(crate) fn generate_register_matmul(
     for i in 0..rows {
         let _ = writeln!(
             s,
-            "    if r0 + {i}u < {m}u {{ matrix_c[cbase + (r0 + {i}u) * {n4}u] = acc{i}; }}"
+            "    if r0 + {i}u < {m}u {{ {c}[cbase + (r0 + {i}u) * {n4}u] = acc{i}; }}"
         );
     }
     s.push_str("}\n");
     ShaderModule::new(&s)
+}
+
+/// Which bindings a register product reads and writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ProductBindings {
+    /// `matrix_a`, `matrix_b`, `matrix_c`, one A per batch entry.
+    Matmul,
+    /// A 1×1 convolution's `weight` (A, shared), `src` (B) and `dst` (C).
+    Conv,
 }
 
 /// Generate the direct register-blocked forward convolution for `params`

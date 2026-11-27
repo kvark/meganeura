@@ -451,7 +451,13 @@ pub(super) fn tile_module(
 ) -> crate::codegen::ShaderModule {
     if let MatmulTile::Register(tile) = tile {
         let (m, n, k) = dispatch.mnk().expect("a register product has dimensions");
-        return crate::codegen::generate_register_matmul([m, n, k], tile);
+        let bindings = match dispatch.shader.shader_group() {
+            crate::codegen::ShaderGroup::MatMul | crate::codegen::ShaderGroup::BatchMatMul => {
+                crate::codegen::ProductBindings::Matmul
+            }
+            _ => crate::codegen::ProductBindings::Conv,
+        };
+        return crate::codegen::generate_register_matmul([m, n, k], tile, bindings);
     }
     if crate::kernels::matmul::Layout::from_entry(&dispatch.shader).is_some() {
         let mut selected = dispatch.clone();
