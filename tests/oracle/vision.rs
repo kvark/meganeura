@@ -307,20 +307,25 @@ fn conv2d_forward() {
             &g,
             &feeds,
             &options,
+            std::slice::from_ref(&shader),
+        );
+        // Without cooperative matrices every forward convolution takes the
+        // direct register kernel; checking that way too runs it everywhere.
+        let scalar = gpu::Options {
+            coop: CoopPolicy::Disabled,
+            ..options.clone()
+        };
+        inference(
+            &mut failures,
+            &format!("{c:?} without cooperative matrices"),
+            &g,
+            &feeds,
+            &scalar,
             &[shader],
         );
-        // What cooperative tiles do not take runs on the direct register
-        // kernel, so the comparison above checked that kernel.
-        for kernel in forward_conv_kernels(&g, &options) {
+        for kernel in forward_conv_kernels(&g, &scalar) {
             assert!(
-                matches!(
-                    kernel,
-                    Kernel::RegisterConv(_)
-                        | Kernel::Cooperative
-                        | Kernel::CooperativeTyped { .. }
-                        | Kernel::CooperativeWorkgroup { .. }
-                        | Kernel::CooperativeTiled { .. }
-                ),
+                matches!(kernel, Kernel::RegisterConv(_)),
                 "{c:?} compiled to {kernel:?}"
             );
         }
