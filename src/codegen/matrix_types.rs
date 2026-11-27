@@ -19,6 +19,8 @@ impl MatrixTypes {
         multiply: DType::F16,
         output: DType::F32,
     };
+    /// Full-range F32 operands, multiplication and result.
+    pub const F32: Self = Self::reduced(DType::F32);
     /// Explicit BF16 operands with an F32 result.
     pub const BF16: Self = Self::reduced(DType::BF16);
 

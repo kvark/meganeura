@@ -49,10 +49,32 @@ const SUBGROUP_TILES: [(u32, u32, u32, u32, u32); 8] = [
 /// Default subgroup width when no device capability overrides it.
 pub(crate) const SUBGROUP_WIDTH: u32 = 32;
 
-/// Subgroup widths supported by the subgroup-tiled cooperative kernels
+/// Subgroup widths supported by the subgroup-tiled tuned product menus
 /// (Intel Xe2 16/32, NVIDIA/Metal 32, AMD/Adreno 64).
 pub(crate) fn supported_subgroup_width(subgroup: u32) -> bool {
     matches!(subgroup, 16 | 32 | 64)
+}
+
+/// Subgroup widths accepted by the low-level `subgroup_kernel` generator
+/// itself, including 8-lane software implementations (lavapipe).
+pub(crate) fn subgroup_kernel_width(subgroup: u32) -> bool {
+    matches!(subgroup, 8 | 16 | 32 | 64)
+}
+
+/// Resolve a caller-supplied subgroup width for `subgroup_kernel`: `0` selects
+/// the default [`SUBGROUP_WIDTH`] (32), while any other value must satisfy
+/// [`subgroup_kernel_width`] (`8 | 16 | 32 | 64`). Refusing unknown widths
+/// prevents silently generating a 32-lane kernel for a device of another width.
+pub(crate) fn checked_subgroup_kernel_width(subgroup: u32) -> u32 {
+    if subgroup == 0 {
+        SUBGROUP_WIDTH
+    } else {
+        assert!(
+            subgroup_kernel_width(subgroup),
+            "unsupported subgroup width {subgroup} for subgroup_kernel (supported: 8, 16, 32, 64)"
+        );
+        subgroup
+    }
 }
 
 /// Native cooperative matrix shape and subgroup width for `multiply` on `caps`.
@@ -64,6 +86,7 @@ pub(crate) fn native_subgroup_shape(
         return None;
     }
     let shapes = match multiply {
+        DType::F32 => &caps.cooperative_matrix.f32_shapes,
         DType::F16 => &caps.cooperative_matrix.f16_f32_shapes,
         DType::BF16 => &caps.cooperative_matrix.bf16_f32_shapes,
         _ => return None,
@@ -148,7 +171,7 @@ impl WorkgroupMatmulShape {
         let [nm, nn, _] = native;
         let wr = self.subgroup_rows;
         if wr == 0
-            || !supported_subgroup_width(subgroup)
+            || !subgroup_kernel_width(subgroup)
             || nm == 0
             || nn == 0
             || self.threads == 0
@@ -280,7 +303,7 @@ impl WorkgroupMatmulShape {
         [[16, 16, 16], [8, 16, 16], [8, 8, 8]]
             .into_iter()
             .any(|native| {
-                [16, 32, 64]
+                [8, 16, 32, 64]
                     .into_iter()
                     .any(|subgroup| self.fits_layout_for(group, native, subgroup, m, n, k))
             })
@@ -407,12 +430,16 @@ pub(crate) fn generate_workgroup_matmul_for_device(
     epilogue: Option<&crate::compile::MatMulEpilogue>,
 ) -> ShaderModule {
     types.validate();
-    assert!(matches!(types.multiply, DType::F16 | DType::BF16));
     if shape.subgroup_rows != 0 {
+        assert!(matches!(
+            types.multiply,
+            DType::F32 | DType::F16 | DType::BF16
+        ));
         return generate_subgroup_matmul(
             group, shape, types, native, subgroup, row_bounds, epilogue,
         );
     }
+    assert!(matches!(types.multiply, DType::F16 | DType::BF16));
     assert!(
         epilogue.is_none(),
         "workgroup-scope matmul does not stage fused epilogues"
@@ -660,8 +687,12 @@ fn generate_subgroup_matmul(
             b: "matrix_b",
             c: "matrix_c",
             addend: addend.then_some("src"),
+            prologue: None,
             epilogue,
             images: None,
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds,
             column_bounds: false,
             gather: [None, None],
@@ -713,6 +744,7 @@ pub(crate) fn generate_subgroup_pointwise_conv(
             b: if backward { "grad_out" } else { "src" },
             c: "dst",
             addend: None,
+            prologue: None,
             epilogue: None,
             images: Some(Images {
                 a: "0u".into(),
@@ -720,6 +752,9 @@ pub(crate) fn generate_subgroup_pointwise_conv(
                 c: "image * m * n".into(),
                 batch: None,
             }),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !spatial.is_multiple_of(shape.columns),
             gather: [None, None],
@@ -762,6 +797,7 @@ pub(crate) fn generate_subgroup_pointwise_weight_grad(
             b: "src",
             c: "dst",
             addend: None,
+            prologue: None,
             epilogue: None,
             images: Some(Images {
                 a: "image * m * k".into(),
@@ -769,6 +805,9 @@ pub(crate) fn generate_subgroup_pointwise_weight_grad(
                 c: "group.z * m * n".into(),
                 batch: Some(params.batch.max(1)),
             }),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),
             gather: [None, None],
@@ -926,6 +965,7 @@ fn gather_x4(_chunk: u32, column: u32, kk0: u32, end: u32) -> vec4<f32> {{
             b: "src",
             c: "dst",
             addend: None,
+            prologue: None,
             epilogue: None,
             // One "image" whose K is the whole batch: workgroup Z is the chunk.
             images: Some(Images {
@@ -934,6 +974,9 @@ fn gather_x4(_chunk: u32, column: u32, kk0: u32, end: u32) -> vec4<f32> {{
                 c: "group.z * m * n".into(),
                 batch: Some(1),
             }),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),
             gather: [
@@ -1052,10 +1095,14 @@ fn gather_x4(image: u32, pos: u32, tap0: u32, end: u32) -> vec4<f32> {{
             b: "src",
             c: "dst",
             addend: None,
+            prologue: None,
             epilogue: None,
             // Split K: workgroup Z is (image, chunk), and each chunk writes its
             // partial at [chunk][image] for the SumRows that follows.
             images: Some(conv_split_images(split, p.batch)),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),
             gather: [
@@ -1136,8 +1183,12 @@ fn gather_dy4(image: u32, pos: u32, co0: u32, end: u32) -> vec4<f32> {{
             b: "grad_out",
             c: "dst",
             addend: None,
+            prologue: None,
             epilogue: None,
             images: Some(conv_split_images(split, p.batch)),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds: !m.is_multiple_of(shape.rows),
             column_bounds: !n.is_multiple_of(shape.columns),
             gather: [
@@ -1444,6 +1495,7 @@ let k = {co_n}u * taps;",
             b: "grad_out",
             c: "dst",
             addend: None,
+            prologue: None,
             epilogue: None,
             images: Some(Images {
                 a: "0u".into(),
@@ -1451,6 +1503,9 @@ let k = {co_n}u * taps;",
                 c: "0u".into(),
                 batch: None,
             }),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             row_bounds: !m.is_multiple_of(shape.rows),
             // Phase sizes differ; every column tile checks its phase's.
             column_bounds: true,
@@ -1551,6 +1606,7 @@ pub(crate) fn generate_subgroup_winograd(
             b: "matrix_b",
             c: "matrix_c",
             addend: None,
+            prologue: None,
             epilogue: None,
             images: Some(Images {
                 a: "image * m * k".into(),
@@ -1558,6 +1614,9 @@ pub(crate) fn generate_subgroup_winograd(
                 c: "image * m * n".into(),
                 batch: None,
             }),
+            fixed_splits: None,
+            unaligned_loads: false,
+            copies: 1,
             // Channels fill whole row tiles; the transform's tile count may end
             // inside a column tile, in whole vectors.
             row_bounds: false,
@@ -1594,7 +1653,7 @@ pub(crate) fn gathered_conv_subgroup_shape(
 ) -> Option<WorkgroupMatmulShape> {
     if super::checked_cooperative_shape(&[native]).is_none()
         || !supported_subgroup_width(subgroup)
-        || !matches!(types.multiply, DType::F16 | DType::BF16)
+        || !matches!(types.multiply, DType::F32 | DType::F16 | DType::BF16)
         || (types.a, types.b, types.output) != (DType::F32, DType::F32, DType::F32)
     {
         return None;
@@ -1703,58 +1762,70 @@ pub(crate) fn conv_product_tile_for(
 }
 
 /// How a subgroup-tiled kernel binds its operands.
-struct SubgroupLayout<'a> {
-    variant: MatMulCoopVariant,
+pub(super) struct SubgroupLayout<'a> {
+    pub(super) variant: MatMulCoopVariant,
     /// Buffer and parameter declarations.
-    header: String,
+    pub(super) header: String,
     /// Statements defining `m`, `n` and `k`.
-    dimensions: String,
-    a: &'static str,
-    b: &'static str,
-    c: &'static str,
-    addend: Option<&'static str>,
+    pub(super) dimensions: String,
+    pub(super) a: &'static str,
+    pub(super) b: &'static str,
+    pub(super) c: &'static str,
+    pub(super) addend: Option<&'static str>,
+    /// Optional fused A-operand prologue (e.g. RmsNorm scale factors) applied
+    /// in registers before staging A into shared memory.
+    pub(super) prologue: Option<&'a crate::compile::MatMulPrologue>,
     /// Optional fused unary elementwise epilogue applied in the store loop.
-    epilogue: Option<&'a crate::compile::MatMulEpilogue>,
+    pub(super) epilogue: Option<&'a crate::compile::MatMulEpilogue>,
     /// Per-image products in place of K partitions over workgroup Z.
-    images: Option<Images>,
-    row_bounds: bool,
-    column_bounds: bool,
+    pub(super) images: Option<Images>,
+    /// Compile-time K partition count in native 16-element blocks, for kernels
+    /// whose `Params` struct has no runtime `splits` field.
+    pub(super) fixed_splits: Option<u32>,
+    /// Allow strides or extents not divisible by 4 by branching on `(ld & 3u) == 0u`
+    /// with a scalar element fallback from the `vec4` storage array.
+    pub(super) unaligned_loads: bool,
+    /// Horizontal batch copies (`1` for ordinary products; `2..=3` to dispatch
+    /// `matrix_b{i}` / `matrix_c{i}` by `workgroup_id.z`).
+    pub(super) copies: u32,
+    pub(super) row_bounds: bool,
+    pub(super) column_bounds: bool,
     /// Gathers for A and B in place of their vector loads: operands with no
     /// contiguous K vectors (an im2col of a strided or padded image). Only
     /// K-contiguous layouts (A rows, BT rows) gather.
-    gather: [Option<Gather>; 2],
+    pub(super) gather: [Option<Gather>; 2],
     /// The element offset in C of output row `r`, column `c`, in place of
     /// `c_base + r * ldc + c`, for outputs whose columns land at scattered
     /// positions (one stride phase of an image). Stores pass through shared
     /// memory.
-    scatter: Option<String>,
+    pub(super) scatter: Option<String>,
 }
 
-/// A WGSL function `fn(image, row, k) -> f32` in a kernel's header that
-/// computes an f32 element of an operand, zero outside it.
+/// A WGSL function `fn(image, row, k) -> T` in a kernel's header that
+/// computes an element of an operand, zero outside it.
 #[derive(Clone, Copy)]
-struct Gather {
-    name: &'static str,
-    /// The header also defines `{name}4(image, row, k0, end) -> vec4<f32>`,
+pub(super) struct Gather {
+    pub(super) name: &'static str,
+    /// The header also defines `{name}4(image, row, k0, end) -> vec4<T>`,
     /// which gathers four consecutive K elements and shares their index work.
-    vector: bool,
+    pub(super) vector: bool,
 }
 
 /// Element offsets of A, B and C for an image, in terms of `image`, `m`,
 /// `n`, `k` and `group`. With `batch`, workgroup Z covers `batch` images
 /// times `num_workgroups.z / batch` K chunks, and each Z layer writes its
 /// own partial product; otherwise Z is the image and K is whole.
-struct Images {
-    a: String,
-    b: String,
-    c: String,
-    batch: Option<u32>,
+pub(super) struct Images {
+    pub(super) a: String,
+    pub(super) b: String,
+    pub(super) c: String,
+    pub(super) batch: Option<u32>,
 }
 
 /// Loads or stores of one staged operand vector at a K index or shared-memory offset.
 type StageEmit = Box<dyn Fn(&str) -> String>;
 
-fn subgroup_kernel(
+pub(super) fn subgroup_kernel(
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
     native: [u32; 3],
@@ -1771,8 +1842,39 @@ fn subgroup_kernel(
     assert!(matches!(ks, 16 | 32 | 64) && ks.is_multiple_of(nk));
     let bf16 = types.multiply == DType::BF16;
     let multiply = MatrixTypes::name(types.multiply);
-    for storage in [types.a, types.b] {
-        assert!(storage == DType::F32 || storage == types.multiply);
+    types.validate();
+    let mut prologue_decls = String::new();
+    let mut prologue_cache_decls = String::new();
+    let mut prologue_cache_init = String::new();
+    let mut prologue_transform = String::new();
+    if let Some(prologue) = layout.prologue {
+        use crate::compile::PrologueLoadKind;
+        let mut has_per_row = false;
+        for (i, factor) in prologue.factors.iter().enumerate() {
+            let buf_name = format!("prologue_buf_{i}");
+            let _ = writeln!(prologue_decls, "var<storage> {buf_name}: array<f32>;");
+            match factor.1 {
+                PrologueLoadKind::PerRow => {
+                    has_per_row = true;
+                    let cache_name = format!("prologue_cache_{i}");
+                    let _ = writeln!(
+                        prologue_cache_decls,
+                        "var<workgroup> {cache_name}: array<f32, {bm}>;"
+                    );
+                    let _ = writeln!(
+                        prologue_cache_init,
+                        "for (var pi = lid; pi < {bm}u; pi += {threads}u) {{ let gr = row + pi; {cache_name}[pi] = select(0.0, {buf_name}[gr], gr < m); }}"
+                    );
+                    let _ = write!(prologue_transform, " * {cache_name}[gr - row]");
+                }
+                PrologueLoadKind::PerKCol => {
+                    let _ = write!(prologue_transform, " * {buf_name}[tc]");
+                }
+            }
+        }
+        if has_per_row {
+            prologue_cache_init += "workgroupBarrier();\n";
+        }
     }
     let (epi_decl, epi_body) = match layout.epilogue {
         Some(epi) => {
@@ -1811,12 +1913,18 @@ fn subgroup_kernel(
         if b_t { "k" } else { "n" },
         "n",
     );
+    let copies = layout.copies.max(1);
+    let split_k = layout.images.is_none() && copies == 1 && layout.fixed_splits != Some(1);
     let (a_off, b_off, c_off) = match layout.images {
         Some(ref images) => (images.a.clone(), images.b.clone(), images.c.clone()),
         None => (
             "0u".to_owned(),
             "0u".to_owned(),
-            "group.z * m * n".to_owned(),
+            if split_k {
+                "group.z * m * n".to_owned()
+            } else {
+                "0u".to_owned()
+            },
         ),
     };
     let mut s = String::from("enable wgpu_cooperative_matrix;\n");
@@ -1828,6 +1936,9 @@ fn subgroup_kernel(
         s += include_str!("../shaders/bf16_round.wgsl");
     }
     s += &layout.header;
+    if !prologue_decls.is_empty() {
+        s += &prologue_decls;
+    }
     if !epi_decl.is_empty() {
         s += &epi_decl;
         s.push('\n');
@@ -1842,6 +1953,9 @@ fn subgroup_kernel(
         "var<workgroup> sb: array<{slot}, {}>;",
         b_stage4 * stages
     );
+    if !prologue_cache_decls.is_empty() {
+        s += &prologue_cache_decls;
+    }
     if scratch {
         let _ = writeln!(
             s,
@@ -1865,6 +1979,14 @@ let end = min(k, first + (base + select(0u, 1u, chunk < extra)) * {ks}u);"
         )
     } else if layout.images.is_some() {
         "let image = group.z;\nlet first = 0u;\nlet end = k;".to_owned()
+    } else if copies > 1 || layout.fixed_splits == Some(1) {
+        "let first = 0u;\nlet end = k;".to_owned()
+    } else if let Some(splits) = layout.fixed_splits {
+        format!(
+            "let chunk = ((k / 16u + {splits}u - 1u) / {splits}u) * 16u;
+let first = group.z * chunk;
+let end = min(k, first + chunk);"
+        )
     } else {
         format!(
             "let blocks = (k + {ks}u - 1u) / {ks}u;
@@ -1874,14 +1996,14 @@ let first = (group.z * base + min(group.z, extra)) * {ks}u;
 let end = min(k, first + (base + select(0u, 1u, group.z < extra)) * {ks}u);"
         )
     };
-    let _ = writeln!(
-        s,
-        "@compute @workgroup_size({threads})
-fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
-{dimensions}
+    let emit_body = |b_buf: &str, c_buf: &str| -> String {
+        let mut body = String::new();
+        let _ = writeln!(
+            body,
+            "{dimensions}
 let row = group.x * {bm}u;
 let col = group.y * {bn}u;
-{range}
+{prologue_cache_init}{range}
 let a_base = {a_off};
 let b_base = {b_off};
 let c_base = {c_off};
@@ -1890,330 +2012,419 @@ let ldb = {ldb};
 let ldc = {ldc};
 let wrow = (sg / {wc}u) * {}u;
 let wcol = (sg % {wc}u) * {}u;",
-        tr * nm,
-        tc * nn,
-        dimensions = layout.dimensions,
-    );
-    for i in 0..tr {
-        for j in 0..tc {
-            let _ = writeln!(s, "var acc{i}_{j} = {c_mat}();");
+            tr * nm,
+            tc * nn,
+            dimensions = layout.dimensions,
+        );
+        for i in 0..tr {
+            for j in 0..tc {
+                let _ = writeln!(body, "var acc{i}_{j} = {c_mat}();");
+            }
         }
-    }
-    // Staging: lines along each operand's strided axis, vectors along its
-    // contiguous one, with (line, column) relative to the tile at stage `t`.
-    struct Plan {
-        name: &'static str,
-        buffer: &'static str,
-        storage: DType,
-        lines: u32,
-        width: u32,
-        pitch: u32,
-        index: &'static str,
-        guard: &'static str,
-    }
-    let plans = [
-        if a_t {
-            Plan {
-                name: "a",
-                buffer: layout.a,
-                storage: types.a,
-                lines: ks,
-                width: bm,
-                pitch: a_pitch,
-                index: "(a_base + (T + L) * lda + row + C) / 4u",
-                guard: "T + L < end && row + C < m",
-            }
-        } else {
-            Plan {
-                name: "a",
-                buffer: layout.a,
-                storage: types.a,
-                lines: bm,
-                width: ks,
-                pitch: a_pitch,
-                index: "(a_base + (row + L) * lda + T + C) / 4u",
-                guard: "row + L < m && T + C < end",
-            }
-        },
-        if b_t {
-            Plan {
-                name: "b",
-                buffer: layout.b,
-                storage: types.b,
-                lines: bn,
-                width: ks,
-                pitch: b_pitch,
-                index: "(b_base + (col + L) * ldb + T + C) / 4u",
-                guard: if layout.column_bounds {
-                    "col + L < n && T + C < end"
-                } else {
-                    "T + C < end"
-                },
-            }
-        } else {
-            Plan {
-                name: "b",
-                buffer: layout.b,
-                storage: types.b,
-                lines: ks,
-                width: bn,
-                pitch: b_pitch,
-                index: "(b_base + (T + L) * ldb + col + C) / 4u",
-                guard: if layout.column_bounds {
-                    "T + L < end && col + C < n"
-                } else {
-                    "T + L < end"
-                },
-            }
-        },
-    ];
-    // With double-buffered prefetch, global loads for stage `t + ks` overlap
-    // with the cooperative products of stage `t`, then write into the idle
-    // shared-memory buffer so each K stage pays one workgroupBarrier() instead
-    // of two.
-    let prefetch = shape.prefetch;
-    let mut stage = String::new();
-    let mut declare = String::new();
-    let mut load_at: Vec<StageEmit> = Vec::new();
-    let mut store_at: Vec<StageEmit> = Vec::new();
-    for plan in &plans {
-        let count = plan.lines * plan.width / 4;
-        let scalar = MatrixTypes::name(plan.storage);
-        let stage_base = if plan.name == "a" { "BASE_A" } else { "BASE_B" };
-        for e in 0..count.div_ceil(threads) {
-            let line = format!("{}l{e}", plan.name);
-            let column = format!("{}c{e}", plan.name);
-            let partial = (e + 1) * threads > count;
-            let _ = writeln!(
-                s,
-                "let {line} = (lid + {o}u) / {w}u;\nlet {column} = ((lid + {o}u) % {w}u) * 4u;",
-                o = e * threads,
-                w = plan.width / 4
-            );
-            let index = plan.index.replace('L', &line).replace('C', &column);
-            let mut guard = plan.guard.replace('L', &line).replace('C', &column);
-            let in_tile = if partial {
-                format!("lid + {}u < {count}u && ", e * threads)
+        // Staging: lines along each operand's strided axis, vectors along its
+        // contiguous one, with (line, column) relative to the tile at stage `t`.
+        struct Plan<'b> {
+            name: &'static str,
+            buffer: &'b str,
+            storage: DType,
+            lines: u32,
+            width: u32,
+            pitch: u32,
+            index: &'static str,
+            guard: &'static str,
+            row_coord: &'static str,
+            row_limit: &'static str,
+            col_coord: &'static str,
+            col_limit: &'static str,
+            ld: &'static str,
+            base: &'static str,
+        }
+        let plans = [
+            if a_t {
+                Plan {
+                    name: "a",
+                    buffer: layout.a,
+                    storage: types.a,
+                    lines: ks,
+                    width: bm,
+                    pitch: a_pitch,
+                    index: "(a_base + (T + L) * lda + row + C) / 4u",
+                    guard: "T + L < end && row + C < m",
+                    row_coord: "T + L",
+                    row_limit: "end",
+                    col_coord: "row + C",
+                    col_limit: "m",
+                    ld: "lda",
+                    base: "a_base",
+                }
             } else {
-                String::new()
-            };
-            let value = format!("v{}{e}", plan.name);
-            let mut loaded = format!("{}[{index}]", plan.buffer);
-            // `T` stands for the stage's first K index until a stage is chosen.
-            if let Some(Gather { name: f, vector }) = layout.gather[usize::from(plan.name == "b")] {
-                assert_eq!(plan.storage, DType::F32, "gathers compute f32 elements");
-                let r = match (plan.name, a_t, b_t) {
-                    ("a", false, _) => format!("row + {line}"),
-                    ("b", _, true) => format!("col + {line}"),
-                    _ => panic!("gathers take K-contiguous operands"),
-                };
-                loaded = if vector {
-                    format!("{f}4(image, {r}, T + {column}, end)")
-                } else {
-                    let parts: Vec<String> = (0..4)
-                        .map(|e| format!("select(0.0, {f}(image, {r}, T + {column} + {e}u), T + {column} + {e}u < end)"))
-                        .collect();
-                    format!("vec4<f32>({})", parts.join(", "))
-                };
-                guard = "true".into();
-            }
-            let _ = writeln!(
-                stage,
-                "var {value} = vec4<{scalar}>(0.0);\nif {in_tile}{} {{ {value} = {}; }}",
-                guard.replace('T', "t"),
-                loaded.replace('T', "t"),
-            );
-            let _ = writeln!(declare, "var {value} = vec4<{scalar}>(0.0);");
-            {
-                let (value, scalar, guard, loaded, in_tile) = (
-                    value.clone(),
-                    scalar.to_owned(),
-                    guard.clone(),
-                    loaded.clone(),
-                    in_tile.clone(),
+                Plan {
+                    name: "a",
+                    buffer: layout.a,
+                    storage: types.a,
+                    lines: bm,
+                    width: ks,
+                    pitch: a_pitch,
+                    index: "(a_base + (row + L) * lda + T + C) / 4u",
+                    guard: "row + L < m && T + C < end",
+                    row_coord: "row + L",
+                    row_limit: "m",
+                    col_coord: "T + C",
+                    col_limit: "end",
+                    ld: "lda",
+                    base: "a_base",
+                }
+            },
+            if b_t {
+                Plan {
+                    name: "b",
+                    buffer: b_buf,
+                    storage: types.b,
+                    lines: bn,
+                    width: ks,
+                    pitch: b_pitch,
+                    index: "(b_base + (col + L) * ldb + T + C) / 4u",
+                    guard: if layout.column_bounds {
+                        "col + L < n && T + C < end"
+                    } else {
+                        "T + C < end"
+                    },
+                    row_coord: "col + L",
+                    row_limit: "n",
+                    col_coord: "T + C",
+                    col_limit: "end",
+                    ld: "ldb",
+                    base: "b_base",
+                }
+            } else {
+                Plan {
+                    name: "b",
+                    buffer: b_buf,
+                    storage: types.b,
+                    lines: ks,
+                    width: bn,
+                    pitch: b_pitch,
+                    index: "(b_base + (T + L) * ldb + col + C) / 4u",
+                    guard: if layout.column_bounds {
+                        "T + L < end && col + C < n"
+                    } else {
+                        "T + L < end"
+                    },
+                    row_coord: "T + L",
+                    row_limit: "end",
+                    col_coord: "col + C",
+                    col_limit: "n",
+                    ld: "ldb",
+                    base: "b_base",
+                }
+            },
+        ];
+        // With double-buffered prefetch, global loads for stage `t + ks` overlap
+        // with the cooperative products of stage `t`, then write into the idle
+        // shared-memory buffer so each K stage pays one workgroupBarrier() instead
+        // of two.
+        let prefetch = shape.prefetch;
+        let mut stage = String::new();
+        let mut declare = String::new();
+        let mut load_at: Vec<StageEmit> = Vec::new();
+        let mut store_at: Vec<StageEmit> = Vec::new();
+        for plan in &plans {
+            let count = plan.lines * plan.width / 4;
+            let scalar = MatrixTypes::name(plan.storage);
+            let stage_base = if plan.name == "a" { "BASE_A" } else { "BASE_B" };
+            for e in 0..count.div_ceil(threads) {
+                let line = format!("{}l{e}", plan.name);
+                let column = format!("{}c{e}", plan.name);
+                let partial = (e + 1) * threads > count;
+                let _ = writeln!(
+                    body,
+                    "let {line} = (lid + {o}u) / {w}u;\nlet {column} = ((lid + {o}u) % {w}u) * 4u;",
+                    o = e * threads,
+                    w = plan.width / 4
                 );
-                load_at.push(Box::new(move |k: &str| {
+                let in_tile = if partial {
+                    format!("lid + {}u < {count}u && ", e * threads)
+                } else {
+                    String::new()
+                };
+                let value = format!("v{}{e}", plan.name);
+                let prologue_stmt = if plan.name == "a" && !prologue_transform.is_empty() {
+                    let mut stmt = String::new();
+                    for (lane_idx, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+                        let (gr, tc) = if a_t {
+                            (
+                                format!("row + {column} + {lane_idx}u"),
+                                format!("T + {line}"),
+                            )
+                        } else {
+                            (
+                                format!("row + {line}"),
+                                format!("T + {column} + {lane_idx}u"),
+                            )
+                        };
+                        let _ = write!(
+                            stmt,
+                            " {{ let gr = {gr}; let tc = {tc}; if gr < m && tc < end {{ {value}.{comp} = {value}.{comp}{prologue_transform}; }} }}"
+                        );
+                    }
+                    stmt
+                } else {
+                    String::new()
+                };
+                let gather = layout.gather[usize::from(plan.name == "b")];
+                let load_block = if gather.is_none() && layout.unaligned_loads {
+                    let rc = plan.row_coord.replace('L', &line).replace('C', &column);
+                    let cc = plan.col_coord.replace('L', &line).replace('C', &column);
+                    let rl = plan.row_limit;
+                    let cl = plan.col_limit;
+                    let ld = plan.ld;
+                    let base = plan.base;
+                    let buf = plan.buffer;
                     format!(
-                        "{value} = vec4<{scalar}>(0.0);\nif {in_tile}{} {{ {value} = {}; }}\n",
-                        guard.replace('T', k),
-                        loaded.replace('T', k)
+                        "if {in_tile}({rc}) < {rl} {{\n\
+                         if ({ld} & 3u) == 0u && ({cc}) + 4u <= {cl} {{\n\
+                         {value} = {buf}[({base} + ({rc}) * {ld} + ({cc})) >> 2u];\n\
+                         }} else {{\n\
+                         for (var u = 0u; u < 4u; u++) {{\n\
+                         if ({cc}) + u < {cl} {{\n\
+                         let flat = {base} + ({rc}) * {ld} + ({cc}) + u;\n\
+                         {value}[u] = {buf}[flat >> 2u][flat & 3u];\n\
+                         }}\n\
+                         }}\n\
+                         }}{prologue_stmt}\n\
+                         }}"
                     )
-                }));
-            }
-            let at = format!("{line} * {}u + {column}", plan.pitch);
-            let shared = format!("s{}", plan.name);
-            let rhs = if bf16 && plan.storage == DType::F32 {
-                format!(
-                    "vec4<bf16>(round_bf16({value}.x), round_bf16({value}.y), round_bf16({value}.z), round_bf16({value}.w))"
-                )
-            } else {
-                format!("vec4<{multiply}>({value})")
-            };
-            let plain_store = format!("{shared}[({at}) / 4u] = {rhs};");
-            if partial {
+                } else {
+                    let index = plan.index.replace('L', &line).replace('C', &column);
+                    let mut guard = plan.guard.replace('L', &line).replace('C', &column);
+                    let mut loaded = format!("{}[{index}]", plan.buffer);
+                    // `T` stands for the stage's first K index until a stage is chosen.
+                    if let Some(Gather { name: f, vector }) = gather {
+                        let r = match (plan.name, a_t, b_t) {
+                            ("a", false, _) => format!("row + {line}"),
+                            ("b", _, true) => format!("col + {line}"),
+                            _ => panic!("gathers take K-contiguous operands"),
+                        };
+                        let img = if layout.images.is_some() {
+                            "image"
+                        } else {
+                            "0u"
+                        };
+                        loaded = if vector {
+                            format!("{f}4({img}, {r}, T + {column}, end)")
+                        } else {
+                            let parts: Vec<String> = (0..4)
+                                .map(|e| format!("select({scalar}(0.0), {f}({img}, {r}, T + {column} + {e}u), T + {column} + {e}u < end)"))
+                                .collect();
+                            format!("vec4<{scalar}>({})", parts.join(", "))
+                        };
+                        guard = "true".into();
+                    }
+                    format!("if {in_tile}{guard} {{ {value} = {loaded};{prologue_stmt} }}")
+                };
                 let _ = writeln!(
                     stage,
-                    "if lid + {}u < {count}u {{ {plain_store} }}",
-                    e * threads
+                    "var {value} = vec4<{scalar}>(0.0);\n{}",
+                    load_block.replace('T', "t"),
                 );
-            } else {
-                let _ = writeln!(stage, "{plain_store}");
-            }
-            let off_expr = format!("({at}) / 4u");
-            let offset_threads = e * threads;
-            store_at.push(Box::new(move |bases: &str| {
-                // `bases` is "0u|0u" or "nxt_a|nxt_b".
-                let (ba, bb) = bases.split_once('|').unwrap();
-                let base = if stage_base == "BASE_A" { ba } else { bb };
-                let idx = if base == "0u" {
-                    off_expr.clone()
-                } else {
-                    format!("{base} + {off_expr}")
-                };
-                let stmt = format!("{shared}[{idx}] = {rhs};");
-                if partial {
-                    format!("if lid + {offset_threads}u < {count}u {{ {stmt} }}\n")
-                } else {
-                    format!("{stmt}\n")
+                let _ = writeln!(declare, "var {value} = vec4<{scalar}>(0.0);");
+                {
+                    let (value, scalar, load_block) =
+                        (value.clone(), scalar.to_owned(), load_block.clone());
+                    load_at.push(Box::new(move |k: &str| {
+                        format!(
+                            "{value} = vec4<{scalar}>(0.0);\n{}\n",
+                            load_block.replace('T', k),
+                        )
+                    }));
                 }
-            }));
-        }
-    }
-    let emit_product = |base_a: &str, base_b: &str| -> String {
-        let mut product = String::new();
-        for q in 0..ks / nk {
-            for i in 0..tr {
-                let (load, offset, stride) = if a_t {
-                    (
-                        "coopLoad",
-                        format!("{}u * {a_pitch}u + wrow + {}u", q * nk, i * nm),
-                        a_pitch,
+                let at = format!("{line} * {}u + {column}", plan.pitch);
+                let shared = format!("s{}", plan.name);
+                let rhs = if bf16 && plan.storage == DType::F32 {
+                    format!(
+                        "vec4<bf16>(round_bf16({value}.x), round_bf16({value}.y), round_bf16({value}.z), round_bf16({value}.w))"
                     )
                 } else {
-                    (
-                        "coopLoadT",
-                        format!("(wrow + {}u) * {a_pitch}u + {}u", i * nm, q * nk),
-                        a_pitch,
-                    )
+                    format!("vec4<{multiply}>({value})")
                 };
-                let idx = if base_a.is_empty() {
-                    format!("({offset}) / {lanes}u")
+                let plain_store = format!("{shared}[({at}) / 4u] = {rhs};");
+                if partial {
+                    let _ = writeln!(
+                        stage,
+                        "if lid + {}u < {count}u {{ {plain_store} }}",
+                        e * threads
+                    );
                 } else {
-                    format!("{base_a} + ({offset}) / {lanes}u")
-                };
-                let _ = writeln!(
-                    product,
-                    "let a{i}_{q} = {load}<{a_mat}>(&sa[{idx}], {}u);",
-                    stride / lanes
-                );
+                    let _ = writeln!(stage, "{plain_store}");
+                }
+                let off_expr = format!("({at}) / 4u");
+                let offset_threads = e * threads;
+                store_at.push(Box::new(move |bases: &str| {
+                    // `bases` is "0u|0u" or "nxt_a|nxt_b".
+                    let (ba, bb) = bases.split_once('|').unwrap();
+                    let base = if stage_base == "BASE_A" { ba } else { bb };
+                    let idx = if base == "0u" {
+                        off_expr.clone()
+                    } else {
+                        format!("{base} + {off_expr}")
+                    };
+                    let stmt = format!("{shared}[{idx}] = {rhs};");
+                    if partial {
+                        format!("if lid + {offset_threads}u < {count}u {{ {stmt} }}\n")
+                    } else {
+                        format!("{stmt}\n")
+                    }
+                }));
             }
-            for j in 0..tc {
-                let (load, offset, stride) = if b_t {
-                    (
-                        "coopLoad",
-                        format!("(wcol + {}u) * {b_pitch}u + {}u", j * nn, q * nk),
-                        b_pitch,
-                    )
-                } else {
-                    (
-                        "coopLoadT",
-                        format!("{}u * {b_pitch}u + wcol + {}u", q * nk, j * nn),
-                        b_pitch,
-                    )
-                };
-                let idx = if base_b.is_empty() {
-                    format!("({offset}) / {lanes}u")
-                } else {
-                    format!("{base_b} + ({offset}) / {lanes}u")
-                };
-                let _ = writeln!(
-                    product,
-                    "let b{j}_{q} = {load}<{b_mat}>(&sb[{idx}], {}u);",
-                    stride / lanes
-                );
+        }
+        let emit_product = |base_a: &str, base_b: &str| -> String {
+            let mut product = String::new();
+            for q in 0..ks / nk {
+                for i in 0..tr {
+                    let (load, offset, stride) = if a_t {
+                        (
+                            "coopLoad",
+                            format!("{}u * {a_pitch}u + wrow + {}u", q * nk, i * nm),
+                            a_pitch,
+                        )
+                    } else {
+                        (
+                            "coopLoadT",
+                            format!("(wrow + {}u) * {a_pitch}u + {}u", i * nm, q * nk),
+                            a_pitch,
+                        )
+                    };
+                    let idx = if base_a.is_empty() {
+                        format!("({offset}) / {lanes}u")
+                    } else {
+                        format!("{base_a} + ({offset}) / {lanes}u")
+                    };
+                    let _ = writeln!(
+                        product,
+                        "let a{i}_{q} = {load}<{a_mat}>(&sa[{idx}], {}u);",
+                        stride / lanes
+                    );
+                }
+                for j in 0..tc {
+                    let (load, offset, stride) = if b_t {
+                        (
+                            "coopLoad",
+                            format!("(wcol + {}u) * {b_pitch}u + {}u", j * nn, q * nk),
+                            b_pitch,
+                        )
+                    } else {
+                        (
+                            "coopLoadT",
+                            format!("{}u * {b_pitch}u + wcol + {}u", q * nk, j * nn),
+                            b_pitch,
+                        )
+                    };
+                    let idx = if base_b.is_empty() {
+                        format!("({offset}) / {lanes}u")
+                    } else {
+                        format!("{base_b} + ({offset}) / {lanes}u")
+                    };
+                    let _ = writeln!(
+                        product,
+                        "let b{j}_{q} = {load}<{b_mat}>(&sb[{idx}], {}u);",
+                        stride / lanes
+                    );
+                }
+                for i in 0..tr {
+                    for j in 0..tc {
+                        let _ = writeln!(
+                            product,
+                            "acc{i}_{j} = coopMultiplyAdd(a{i}_{q}, b{j}_{q}, acc{i}_{j});"
+                        );
+                    }
+                }
+            }
+            product
+        };
+        if prefetch {
+            let first_load: String = load_at.iter().map(|f| f("first")).collect();
+            let first_store: String = store_at.iter().map(|f| f("0u|0u")).collect();
+            let next_load: String = load_at.iter().map(|f| f("tn")).collect();
+            let next_store: String = store_at.iter().map(|f| f("nxt_a|nxt_b")).collect();
+            let product = emit_product("cur_a", "cur_b");
+            let _ = writeln!(
+                body,
+                "{declare}if first < end {{\n{first_load}{first_store}}}\nworkgroupBarrier();\nvar buf = 0u;\nfor (var t = first; t < end; t += {ks}u) {{\nlet tn = t + {ks}u;\nlet cur_a = buf * {a_stage4}u;\nlet cur_b = buf * {b_stage4}u;\nlet nxt = 1u - buf;\nlet nxt_a = nxt * {a_stage4}u;\nlet nxt_b = nxt * {b_stage4}u;\nif tn < end {{\n{next_load}}}\n{product}if tn < end {{\n{next_store}}}\nworkgroupBarrier();\nbuf = nxt;\n}}"
+            );
+        } else {
+            let product = emit_product("", "");
+            let _ = writeln!(
+                body,
+                "for (var t = first; t < end; t += {ks}u) {{\n{stage}workgroupBarrier();\n{product}workgroupBarrier();\n}}"
+            );
+        }
+        let tile_origin = |i: u32, j: u32| {
+            (
+                format!("row + wrow + {}u", i * nm),
+                format!("col + wcol + {}u", j * nn),
+            )
+        };
+        let mut direct = String::new();
+        if let Some(src) = layout.addend {
+            if split_k {
+                direct += "if group.z == 0u {\n";
             }
             for i in 0..tr {
                 for j in 0..tc {
+                    let (r, cc) = tile_origin(i, j);
                     let _ = writeln!(
-                        product,
-                        "acc{i}_{j} = coopMultiplyAdd(a{i}_{q}, b{j}_{q}, acc{i}_{j});"
+                        direct,
+                        "acc{i}_{j} = acc{i}_{j} + coopLoadT<{c_mat}>(&{src}[({r}) * ldc + {cc}], ldc);"
                     );
                 }
             }
-        }
-        product
-    };
-    if prefetch {
-        let first_load: String = load_at.iter().map(|f| f("first")).collect();
-        let first_store: String = store_at.iter().map(|f| f("0u|0u")).collect();
-        let next_load: String = load_at.iter().map(|f| f("tn")).collect();
-        let next_store: String = store_at.iter().map(|f| f("nxt_a|nxt_b")).collect();
-        let product = emit_product("cur_a", "cur_b");
-        let _ = writeln!(
-            s,
-            "{declare}if first < end {{\n{first_load}{first_store}}}\nworkgroupBarrier();\nvar buf = 0u;\nfor (var t = first; t < end; t += {ks}u) {{\nlet tn = t + {ks}u;\nlet cur_a = buf * {a_stage4}u;\nlet cur_b = buf * {b_stage4}u;\nlet nxt = 1u - buf;\nlet nxt_a = nxt * {a_stage4}u;\nlet nxt_b = nxt * {b_stage4}u;\nif tn < end {{\n{next_load}}}\n{product}if tn < end {{\n{next_store}}}\nworkgroupBarrier();\nbuf = nxt;\n}}"
-        );
-    } else {
-        let product = emit_product("", "");
-        let _ = writeln!(
-            s,
-            "for (var t = first; t < end; t += {ks}u) {{\n{stage}workgroupBarrier();\n{product}workgroupBarrier();\n}}"
-        );
-    }
-    let tile_origin = |i: u32, j: u32| {
-        (
-            format!("row + wrow + {}u", i * nm),
-            format!("col + wcol + {}u", j * nn),
-        )
-    };
-    let c = layout.c;
-    let mut direct = String::new();
-    for i in 0..tr {
-        for j in 0..tc {
-            let (r, cc) = tile_origin(i, j);
-            if let Some(src) = layout.addend {
-                let _ = writeln!(
-                    direct,
-                    "acc{i}_{j} = acc{i}_{j} + coopLoadT<{c_mat}>(&{src}[({r}) * ldc + {cc}], ldc);"
-                );
+            if split_k {
+                direct += "}\n";
             }
-            let _ = writeln!(
-                direct,
-                "coopStoreT(acc{i}_{j}, &{c}[c_base + ({r}) * ldc + {cc}], ldc);"
-            );
         }
-    }
-    let mut staged = String::new();
-    if scratch {
         for i in 0..tr {
             for j in 0..tc {
                 let (r, cc) = tile_origin(i, j);
-                let stored = format!("scratch[sg * {tile_elems}u + e]");
-                let base_val = match layout.addend {
-                    Some(src) => format!("{stored} + {src}[r * ldc + c]"),
-                    None => stored,
-                };
-                let index = layout.scatter.as_deref().unwrap_or("c_base + r * ldc + c");
-                let apply = if layout.epilogue.is_some() {
-                    let final_val = match types.output {
-                        DType::F32 => "val".to_owned(),
-                        DType::BF16 => "round_bf16(val)".to_owned(),
-                        dtype => format!("{}(val)", MatrixTypes::name(dtype)),
-                    };
-                    format!(
-                        "if r < m && c < n {{ let idx = r * ldc + c; let col = c; var val = {base_val};\n{epi_body}\n{c}[{index}] = {final_val}; }}"
-                    )
-                } else {
-                    let value = match types.output {
-                        DType::F32 => base_val,
-                        DType::BF16 => format!("round_bf16({base_val})"),
-                        dtype => format!("{}({base_val})", MatrixTypes::name(dtype)),
-                    };
-                    format!("if r < m && c < n {{ {c}[{index}] = {value}; }}")
-                };
                 let _ = writeln!(
-                    staged,
-                    "coopStoreT(acc{i}_{j}, &scratch[sg * {tile_elems}u], {nn}u);
+                    direct,
+                    "coopStoreT(acc{i}_{j}, &{c_buf}[c_base + ({r}) * ldc + {cc}], ldc);"
+                );
+            }
+        }
+        let mut staged = String::new();
+        if scratch {
+            for i in 0..tr {
+                for j in 0..tc {
+                    let (r, cc) = tile_origin(i, j);
+                    let stored = format!("scratch[sg * {tile_elems}u + e]");
+                    let base_val = match layout.addend {
+                        Some(src) if split_k => {
+                            format!("{stored} + select(0.0, {src}[r * ldc + c], group.z == 0u)")
+                        }
+                        Some(src) => format!("{stored} + {src}[r * ldc + c]"),
+                        None => stored,
+                    };
+                    let index = layout.scatter.as_deref().unwrap_or("c_base + r * ldc + c");
+                    let apply = if layout.epilogue.is_some() {
+                        let final_val = match types.output {
+                            DType::F32 => "val".to_owned(),
+                            DType::BF16 => "round_bf16(val)".to_owned(),
+                            dtype => format!("{}(val)", MatrixTypes::name(dtype)),
+                        };
+                        format!(
+                            "if r < m && c < n {{ let idx = r * ldc + c; let col = c; var val = {base_val};\n{epi_body}\n{c_buf}[{index}] = {final_val}; }}"
+                        )
+                    } else {
+                        let value = match types.output {
+                            DType::F32 => base_val,
+                            DType::BF16 => format!("round_bf16({base_val})"),
+                            dtype => format!("{}({base_val})", MatrixTypes::name(dtype)),
+                        };
+                        format!("if r < m && c < n {{ {c_buf}[{index}] = {value}; }}")
+                    };
+                    let _ = writeln!(
+                        staged,
+                        "coopStoreT(acc{i}_{j}, &scratch[sg * {tile_elems}u], {nn}u);
 workgroupBarrier();
 for (var e = lane; e < {tile_elems}u; e += {subgroup}u) {{
 let r = {r} + e / {nn}u;
@@ -2221,32 +2432,74 @@ let c = {cc} + e % {nn}u;
 {apply}
 }}
 workgroupBarrier();"
-                );
+                    );
+                }
             }
         }
-    }
-    if !scratch {
-        s += &direct;
-    } else if types.output == DType::F32 && layout.scatter.is_none() && layout.epilogue.is_none() {
-        // Only the last row and column of workgroups are ragged; the branch
-        // is uniform. `&&` would lower through a local variable, which
-        // naga's uniformity analysis treats as varying.
-        let mut whole = Vec::new();
-        if layout.row_bounds {
-            whole.push(format!("(row + {bm}u <= m)"));
+        if !scratch {
+            body += &direct;
+        } else if types.output == DType::F32
+            && layout.scatter.is_none()
+            && layout.epilogue.is_none()
+        {
+            // Only the last row and column of workgroups are ragged; the branch
+            // is uniform. `&&` would lower through a local variable, which
+            // naga's uniformity analysis treats as varying.
+            let mut whole = Vec::new();
+            if layout.row_bounds {
+                whole.push(format!("(row + {bm}u <= m)"));
+            }
+            if layout.column_bounds {
+                whole.push(format!("(col + {bn}u <= n)"));
+            }
+            let _ = writeln!(
+                body,
+                "if {} {{\n{direct}}} else {{\n{staged}}}",
+                whole.join(" & ")
+            );
+        } else {
+            body += &staged;
         }
-        if layout.column_bounds {
-            whole.push(format!("(col + {bn}u <= n)"));
+        body
+    };
+    if copies == 1 {
+        let body = emit_body(layout.b, layout.c);
+        let _ = writeln!(
+            s,
+            "@compute @workgroup_size({threads})
+fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+{body}}}"
+        );
+    } else {
+        let mut dispatch_calls = String::new();
+        for copy in 0..copies {
+            let b_buf = format!("{}{copy}", layout.b);
+            let c_buf = format!("{}{copy}", layout.c);
+            let body = emit_body(&b_buf, &c_buf);
+            let _ = writeln!(
+                s,
+                "fn horiz_{copy}(group: vec3<u32>, groups: vec3<u32>, lid: u32, sg: u32, lane: u32) {{
+{body}}}"
+            );
+            let cond = if copy == 0 {
+                "if group.z == 0u".to_owned()
+            } else if copy + 1 == copies {
+                "else".to_owned()
+            } else {
+                format!("else if group.z == {copy}u")
+            };
+            let _ = writeln!(
+                dispatch_calls,
+                "{cond} {{ horiz_{copy}(group, groups, lid, sg, lane); }}"
+            );
         }
         let _ = writeln!(
             s,
-            "if {} {{\n{direct}}} else {{\n{staged}}}",
-            whole.join(" & ")
+            "@compute @workgroup_size({threads})
+fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+{dispatch_calls}}}"
         );
-    } else {
-        s += &staged;
     }
-    s += "}\n";
     ShaderModule::with_hint(s, "subgroup-matmul").with_subgroup(subgroup, [threads, 1, 1])
 }
 
@@ -2600,6 +2853,105 @@ mod tests {
                         )
                         .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
                     }
+                }
+            }
+        }
+    }
+
+    /// Unified `subgroup_kernel` lowering of native F32 tiled products (with
+    /// addend, split-K, prefetch and RmsNorm prologue), specialized cooperative
+    /// convolutions (forward & input gradient, F32 & F16), and horizontal
+    /// 2/3-copy cooperative matmuls validate and emit SPIR-V across 16-, 32-
+    /// and 64-lane subgroups.
+    #[test]
+    fn unified_subgroup_product_generators_validate_and_emit_spirv() {
+        use crate::codegen::{
+            Conv2dCoopDirection, CoopConfig, CooperativeMatmulShape, generate_conv2d_coop_module,
+            generate_horizontal_matmul, generate_tiled_coop_matmul,
+        };
+        use crate::compile::{BufferRef, MatMulPrologue, PrologueLoadKind};
+        let capabilities = naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        let prologue = MatMulPrologue {
+            factors: vec![
+                (BufferRef(3), PrologueLoadKind::PerRow),
+                (BufferRef(4), PrologueLoadKind::PerKCol),
+            ],
+        };
+        for subgroup in [8u32, 16, 32, 64] {
+            for (idx, group) in [
+                ShaderGroup::MatMul,
+                ShaderGroup::MatMulAT,
+                ShaderGroup::MatMulBT,
+                ShaderGroup::MatMulAdd,
+                ShaderGroup::MatMulATAdd,
+                ShaderGroup::MatMulBTAdd,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let shape = CooperativeMatmulShape {
+                    columns: [64, 128][idx % 2],
+                    k_stage: [16, 32][(idx / 2) % 2],
+                    prefetch: idx % 3 == 0,
+                };
+                let has_add = matches!(
+                    group,
+                    ShaderGroup::MatMulAdd | ShaderGroup::MatMulATAdd | ShaderGroup::MatMulBTAdd
+                );
+                let mut module = generate_tiled_coop_matmul(
+                    group,
+                    shape,
+                    if idx % 2 == 0 { 1 } else { 4 },
+                    (!has_add).then_some(&prologue),
+                    subgroup,
+                );
+                super::super::validate_shader_for_test(&mut module.module, capabilities, (1, 6))
+                    .unwrap_or_else(|e| panic!("tiled {group:?} sg={subgroup}: {e}"));
+            }
+            for config in [
+                CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: false,
+                },
+                CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: true,
+                },
+            ] {
+                for (kh, kw, stride, dir) in [
+                    (1, 1, 1, Conv2dCoopDirection::Forward),
+                    (3, 3, 1, Conv2dCoopDirection::Forward),
+                    (3, 3, 2, Conv2dCoopDirection::GradInput),
+                    (7, 7, 2, Conv2dCoopDirection::Forward),
+                ] {
+                    let mut module =
+                        generate_conv2d_coop_module(kh, kw, stride, dir, &config, subgroup);
+                    super::super::validate_shader_for_test(
+                        &mut module.module,
+                        capabilities,
+                        (1, 6),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("conv {kh}x{kw}s{stride} {dir:?} {config:?} sg={subgroup}: {e}")
+                    });
+                }
+                for copies in [2, 3] {
+                    let mut module = generate_horizontal_matmul(
+                        ShaderGroup::MatMul,
+                        copies,
+                        Some(&config),
+                        subgroup,
+                    );
+                    super::super::validate_shader_for_test(
+                        &mut module.module,
+                        capabilities,
+                        (1, 6),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("horiz copies={copies} {config:?} sg={subgroup}: {e}")
+                    });
                 }
             }
         }

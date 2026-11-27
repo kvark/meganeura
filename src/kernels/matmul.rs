@@ -722,12 +722,14 @@ pub(crate) fn module(
         }
         CodeImpl::Cooperative => {
             let config = cooperative();
+            let subgroup = target.capabilities.subgroup_size;
             if let Some(ref epi) = epi {
                 crate::codegen::generate_coop_matmul_with_dag_epilogue(
                     group,
                     &config,
                     epi,
                     code.weights,
+                    subgroup,
                 )
             } else if let Some(ref pro) = pro {
                 let (add, variant) =
@@ -738,9 +740,15 @@ pub(crate) fn module(
                     &config,
                     pro,
                     code.weights,
+                    subgroup,
                 )
             } else {
-                crate::codegen::generate_module_coop_weighted(group, &config, code.weights)
+                crate::codegen::generate_module_coop_weighted(
+                    group,
+                    &config,
+                    code.weights,
+                    subgroup,
+                )
             }
         }
         CodeImpl::CooperativeTiled { shape, splits } => {
@@ -754,7 +762,13 @@ pub(crate) fn module(
             {
                 return Err("tiled cooperative matmul exceeds device shared memory".to_owned());
             }
-            crate::codegen::generate_tiled_coop_matmul(group, shape, splits, pro.as_ref())
+            crate::codegen::generate_tiled_coop_matmul(
+                group,
+                shape,
+                splits,
+                pro.as_ref(),
+                target.capabilities.subgroup_size,
+            )
         }
         CodeImpl::CooperativeTyped { types, staging } => {
             let native = crate::codegen::checked_cooperative_shape(cooperative_shapes(

@@ -1,5 +1,17 @@
 # Unreleased
 
+- Cooperative dense matrix products (`coop_tiled.rs`, `gen_matmul_coop_stored`,
+  horizontal batched cooperative matmuls) and cooperative 2D convolutions
+  (`conv_coop.rs`) now all lower through the single subgroup-tiled product
+  kernel (`codegen::workgroup::subgroup_kernel`), retiring `matmul_coop.wgsl`,
+  `matmul_coop_tiled.wgsl`, and ~950 lines of duplicate WGSL codegen.
+  `subgroup_kernel` now supports full-range F32 cooperative multiply, fused
+  A-operand prologues (`MatMulPrologue`), uniform fast-path vector loads with
+  unaligned scalar tail fallback, horizontal multi-copy dispatch, and
+  split-K-safe addend seeding. Fixed-program mode on RTX 5070 improves across
+  all five cohort models (ResNet-50 inference −10.7%, SmolVLA −9.8%,
+  SmolLM2-135M −8.2%, Whisper-tiny −2.7%).
+
 - Occupancy thresholds (`SCALAR_OCCUPIED`, `MIN_F16_COOP_WORKGROUPS`,
   `MIN_F32_COOP_WORKGROUPS`, `MIN_GRAD_INPUT_WORKGROUPS`,
   `SMALL_TILE_BELOW_WORKGROUPS`), device-scaled workgroup targets, widest-tile

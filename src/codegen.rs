@@ -15,7 +15,7 @@ pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
 pub(crate) use workgroup::{
     ConvProduct, conv_product_tile, conv_tile, conv_tile_for, generate_workgroup_matmul_for_device,
-    native_subgroup_shape,
+    native_subgroup_shape, subgroup_kernel_width,
 };
 pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
@@ -1061,8 +1061,11 @@ pub(crate) fn coop_shape(group: ShaderGroup) -> Option<(bool, MatMulCoopVariant)
 /// Generate the cooperative-matrix form of a shader group, with the given
 /// tile config. Takes the scalar group: cooperative execution is a
 /// modifier on a dispatch, not a group of its own.
+///
+/// Builds for 32-lane subgroups (4 subgroups = 128 threads); the runtime
+/// specializes to the device's actual subgroup width internally.
 pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
-    generate_module_coop_weighted(group, config, WeightFormat::F32)
+    generate_module_coop_weighted(group, config, WeightFormat::F32, workgroup::SUBGROUP_WIDTH)
 }
 
 /// Checked cooperative matmul with explicit operand, multiplication and
@@ -1195,6 +1198,7 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             1,
             WeightFormat::F32,
             Some((types, layout)),
+            subgroup,
         );
     }
     cooperative::generate(group, types, shape, subgroup, layout)
@@ -1354,31 +1358,40 @@ pub(crate) fn generate_subgroup_weight_grad(
     ))
 }
 
-/// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
-/// tiles, where staging loads the stored half values without a conversion.
+/// [`generate_module_coop`] reading B in `format` (`F32`, or `F16` with
+/// f16-input tiles, where staging loads the stored half values without a
+/// conversion), specialized to `subgroup`-wide subgroups (8, 16, 32, or 64;
+/// `0` defaults to 32).
 pub fn generate_module_coop_weighted(
     group: ShaderGroup,
     config: &CoopConfig,
     format: WeightFormat,
+    subgroup: u32,
 ) -> ShaderModule {
     let (fused_add, variant) =
         coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1, format)
+    gen_matmul_coop_stored(
+        fused_add, variant, config, None, None, 1, format, None, subgroup,
+    )
 }
 
 /// Pack `count` same-A matmuls into one dispatch (`workgroups.z = count`).
 /// Each z-slice uses `matrix_b{i}` / `matrix_c{i}`.
+///
+/// When `coop` is `Some`, specializes to `subgroup`-wide subgroups (8, 16, 32,
+/// or 64; `0` defaults to 32).
 pub fn generate_horizontal_matmul(
     group: ShaderGroup,
     count: u32,
     coop: Option<&CoopConfig>,
+    subgroup: u32,
 ) -> ShaderModule {
     assert!((2..=3).contains(&count));
     match coop {
         Some(config) => {
             let (fused_add, variant) =
                 coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
-            gen_matmul_coop_wgsl_full(
+            gen_matmul_coop_stored(
                 fused_add,
                 variant,
                 config,
@@ -1386,6 +1399,8 @@ pub fn generate_horizontal_matmul(
                 None,
                 count,
                 WeightFormat::F32,
+                None,
+                subgroup,
             )
         }
         None => generate_partitioned_matmul(group, None, MatMulOptions::default(), 1, count),
@@ -2984,19 +2999,32 @@ pub(crate) fn generate_module_gemv_int_dot(
     }
 }
 
-/// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
+/// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`],
+/// specialized to `subgroup`-wide subgroups (8, 16, 32, or 64; `0` defaults to 32).
 pub fn gen_matmul_coop_with_prologue(
     fused_add: bool,
     variant: MatMulCoopVariant,
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
     format: WeightFormat,
+    subgroup: u32,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1, format)
+    gen_matmul_coop_stored(
+        fused_add,
+        variant,
+        config,
+        Some(prologue),
+        None,
+        1,
+        format,
+        None,
+        subgroup,
+    )
 }
 
 /// Generate a cooperative matmul that stages its f32 accumulators through
-/// workgroup memory before applying a scalar PointwiseDAG epilogue.
+/// workgroup memory before applying a scalar PointwiseDAG epilogue,
+/// specialized to `subgroup`-wide subgroups (8, 16, 32, or 64; `0` defaults to 32).
 ///
 /// Cooperative matrix stores do not expose individual accumulator lanes.
 /// The workgroup staging step is therefore the portable bridge between the
@@ -3008,6 +3036,7 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     config: &CoopConfig,
     epilogue: &crate::compile::MatMulEpilogue,
     format: WeightFormat,
+    subgroup: u32,
 ) -> ShaderModule {
     assert!(
         epilogue.inputs.is_empty(),
@@ -3015,9 +3044,20 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     );
     let (fused_add, variant) = coop_shape(group)
         .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1, format)
+    gen_matmul_coop_stored(
+        fused_add,
+        variant,
+        config,
+        None,
+        Some(epilogue),
+        1,
+        format,
+        None,
+        subgroup,
+    )
 }
 
+#[cfg(test)]
 fn gen_matmul_coop_wgsl_full(
     fused_add: bool,
     variant: MatMulCoopVariant,
@@ -3028,12 +3068,21 @@ fn gen_matmul_coop_wgsl_full(
     b_format: WeightFormat,
 ) -> ShaderModule {
     gen_matmul_coop_stored(
-        fused_add, variant, config, prologue, epilogue, copies, b_format, None,
+        fused_add,
+        variant,
+        config,
+        prologue,
+        epilogue,
+        copies,
+        b_format,
+        None,
+        workgroup::SUBGROUP_WIDTH,
     )
 }
 
-/// One staging and 2x2 register-tile implementation for promoted F32 operands
-/// and explicit F16/BF16 storage. Precision is independent of tile geometry.
+/// One subgroup-tiled cooperative implementation for promoted F32/F16 operands
+/// and explicit F16/BF16 storage, lowered through `workgroup::subgroup_kernel`.
+#[allow(clippy::too_many_arguments)]
 fn gen_matmul_coop_stored(
     fused_add: bool,
     variant: MatMulCoopVariant,
@@ -3043,7 +3092,9 @@ fn gen_matmul_coop_stored(
     copies: u32,
     b_format: WeightFormat,
     typed: Option<(MatrixTypes, TypedMatmulLayout)>,
+    subgroup: u32,
 ) -> ShaderModule {
+    use crate::DType;
     if let Some((types, layout)) = typed {
         types.validate();
         assert!(
@@ -3052,7 +3103,7 @@ fn gen_matmul_coop_stored(
         );
         assert!(config.tile_size == 16 && copies == 1);
         assert!(prologue.is_none() && epilogue.is_none());
-        assert!(!layout.direct_output || (types.output == crate::DType::F32 && !fused_add));
+        assert!(!layout.direct_output || (types.output == DType::F32 && !fused_add));
     }
     let b_f16 = match b_format {
         WeightFormat::F32 => false,
@@ -3070,666 +3121,88 @@ fn gen_matmul_coop_stored(
     }
     let tile = config.tile_size;
     let output_tile = config.output_tile();
-    let shared_size = tile * tile;
-    let wg_size: u32 = 64;
-    let staging_iters = shared_size / wg_size;
-    let row_stride = wg_size / tile;
-    let tile_mask = tile - 1;
-    let tile_shift = tile.trailing_zeros();
-
-    let (elem_type, enable_f16) = if let Some((types, _)) = typed {
-        let extensions = match (
-            types.uses(crate::DType::F16),
-            types.uses(crate::DType::BF16),
-        ) {
-            (true, true) => "enable f16;\nenable wgpu_bfloat16;",
-            (true, false) => "enable f16;",
-            (false, true) => "enable wgpu_bfloat16;",
-            (false, false) => "",
-        };
-        (MatrixTypes::name(types.multiply), extensions)
-    } else if config.use_f16_input {
-        ("f16", "enable f16;")
-    } else {
-        ("f32", "")
-    };
-    let stage = |shared: &str, idx: &str, f32_expr: &str, storage: crate::DType| -> String {
-        if let Some((types, _)) = typed {
-            let cast = if storage == crate::DType::F32 && types.multiply == crate::DType::BF16 {
-                "round_bf16"
+    let subgroup = workgroup::checked_subgroup_kernel_width(subgroup);
+    let types = match typed {
+        Some((types, _)) => types,
+        None => MatrixTypes {
+            a: DType::F32,
+            b: if b_f16 { DType::F16 } else { DType::F32 },
+            multiply: if config.use_f16_input {
+                DType::F16
             } else {
-                elem_type
-            };
-            format!("{shared}[{idx}] = {cast}({f32_expr});")
-        } else if config.use_f16_input {
-            format!("{shared}[{idx}] = f16({f32_expr});")
-        } else {
-            format!("{shared}[{idx}] = {f32_expr};")
-        }
-    };
-    let ab_type = elem_type;
-    // `coop_mat{columns}x{rows}`. Square tiles pass the same extent three times.
-    let (tile_m, tile_n, tile_k) = (tile, tile, tile);
-    let coop_ab = format!("coop_mat{tile_k}x{tile_m}<{ab_type},A>");
-    let coop_ba = format!("coop_mat{tile_n}x{tile_k}<{ab_type},B>");
-    let coop_c = format!("coop_mat{tile_n}x{tile_m}<f32,C>");
-
-    let (prologue_decl, prologue_cache_decl, prologue_cache_init, a_transform) = match prologue {
-        Some(p) => matmul_prologue_to_wgsl(p, output_tile),
-        None => (String::new(), String::new(), String::new(), String::new()),
-    };
-    let (epilogue_decl, epilogue_body) = match epilogue {
-        Some(e) => matmul_epilogue_to_wgsl(e),
-        None => (String::new(), String::new()),
-    };
-
-    // Vec4 staging loads four adjacent elements: 128 bits for F32 storage,
-    // 64 for F16/BF16 (64 threads × 4 = 256 = 16×16).
-    // "Direct" vec4: load along the shared-memory column axis (consecutive writes).
-    //   B: Normal/AT (B[K,N], load along N)
-    //   A: Normal/BT (A[M,K], load along K)
-    // "Transposed" vec4: load along the contiguous global-memory axis, write strided.
-    //   B: BT (B[N,K], load along K, write rows-of-shared)
-    //   A: AT (A[K,M], load along M, write rows-of-shared)
-    let use_vec4 = tile >= 16;
-    // All variants use vec4 for both A and B (direct or transposed).
-    // Transposed staging writes strided into shared (4 rows × 1 col per thread).
-    // `vec4_b` is the "direct" staging that assumes B is [K,N]; it must be
-    // FALSE for BT so the `vec4_b_transposed` branch is taken. Same reasoning
-    // for `vec4_a` vs `vec4_a_transposed` on the AT variant.
-    let vec4_b_transposed = use_vec4 && variant == MatMulCoopVariant::BT;
-    let vec4_a_transposed = use_vec4 && variant == MatMulCoopVariant::AT && prologue.is_none();
-    let vec4_b = use_vec4 && !vec4_b_transposed;
-    let vec4_a = use_vec4 && prologue.is_none() && !vec4_a_transposed;
-
-    // Vector bindings must contain whole vectors, including the final row.
-    // Typed products with incomplete vectors use the checked fallback instead.
-    let a_type = typed.map_or("f32", |(types, _)| MatrixTypes::name(types.a));
-    let a_storage = if vec4_a || vec4_a_transposed {
-        format!("array<vec4<{a_type}>>")
-    } else {
-        format!("array<{a_type}>")
-    };
-    let b_type = typed.map_or(if b_f16 { "f16" } else { "f32" }, |(types, _)| {
-        MatrixTypes::name(types.b)
-    });
-    let b_storage = if vec4_b || vec4_b_transposed {
-        format!("array<vec4<{b_type}>>")
-    } else {
-        format!("array<{b_type}>")
-    };
-
-    // Generate hoisted staging index variables
-    let staging_vars = {
-        let mut s = String::new();
-        if use_vec4 {
-            s += "let v4_row = lid.x >> 2u;\n    let v4_col = (lid.x & 3u) << 2u;";
-        }
-        if !vec4_b || !vec4_a {
-            if !s.is_empty() {
-                s += "\n    ";
-            }
-            s += &format!(
-                "let src_col = lid.x & {}u;\n    let base_row = lid.x >> {}u;",
-                tile_mask, tile_shift
-            );
-        }
-        if !vec4_b {
-            s += &format!(
-                "\n    let cc = tile_col + src_col;\
-                 \n    let in_n = cc < n;\
-                 \n    let cc1 = cc + {}u;\
-                 \n    let in_n1 = cc1 < n;",
-                tile
-            );
-        }
-        s
-    };
-
-    // Generate B staging blocks (shared_a0, shared_a1)
-    let store_b = |shared: &str, idx: &str, expr: &str| {
-        stage(
-            shared,
-            idx,
-            expr,
-            typed.map_or(crate::DType::F32, |(types, _)| types.b),
-        )
-    };
-    let (b_stage_0, b_stage_1) = if vec4_b {
-        // Normal/AT: B[K,N], load vec4 along N (consecutive in memory).
-        //
-        // The fast vec4 packs the 4 lanes as four consecutive N-elements
-        // for the same K-row, valid when `n % 4 == 0` and the tile fits.
-        // Per-lane fallback handles non-multiple-of-4 N, but note that the
-        // *output store* (`coopStoreT` with stride `n` for a 16-wide tile)
-        // can still corrupt adjacent rows when N is not a multiple of 16.
-        // The runtime auto-switch in runtime.rs refuses coop for non-16-
-        // aligned N to keep the store safe — the slow-staging path here
-        // is only exercised when N >= 16 but N % 4 != 0 (e.g., N=20).
-        let gen_vec4_b = |shared: &str, col_offset: &str| -> String {
-            let st_x = store_b(shared, "flat", "v.x");
-            let st_y = store_b(shared, "flat + 1u", "v.y");
-            let st_z = store_b(shared, "flat + 2u", "v.z");
-            let st_w = store_b(shared, "flat + 3u", "v.w");
-            let st_m0 = store_b(shared, "flat", "select(0.0, v0, m0)");
-            let st_m1 = store_b(shared, "flat + 1u", "select(0.0, v1, m1)");
-            let st_m2 = store_b(shared, "flat + 2u", "select(0.0, v2, m2)");
-            let st_m3 = store_b(shared, "flat + 3u", "select(0.0, v3, m3)");
-            let st_z0 = store_b(shared, "flat", "0.0");
-            let st_z1 = store_b(shared, "flat + 1u", "0.0");
-            let st_z2 = store_b(shared, "flat + 2u", "0.0");
-            let st_z3 = store_b(shared, "flat + 3u", "0.0");
-            format!(
-                "{{\
-               \n            let tr = t + v4_row;\
-               \n            let cc4 = {col} + v4_col;\
-               \n            let flat = v4_row * {t}u + v4_col;\
-               \n            if tr < k && (cc4 + 4u) <= n && (n & 3u) == 0u {{\
-               \n                let v = $B_BUFFER[(tr * n + cc4) >> 2u];\
-               \n                {st_x}\
-               \n                {st_y}\
-               \n                {st_z}\
-               \n                {st_w}\
-               \n            }} else if tr < k {{\
-               \n                let m0 = (cc4 + 0u) < n;\
-               \n                let m1 = (cc4 + 1u) < n;\
-               \n                let m2 = (cc4 + 2u) < n;\
-               \n                let m3 = (cc4 + 3u) < n;\
-               \n                let lastn = n - 1u;\
-               \n                let a0 = tr * n + min(cc4 + 0u, lastn);\
-               \n                let a1 = tr * n + min(cc4 + 1u, lastn);\
-               \n                let a2 = tr * n + min(cc4 + 2u, lastn);\
-               \n                let a3 = tr * n + min(cc4 + 3u, lastn);\
-               \n                let v0 = $B_BUFFER[a0 >> 2u][a0 & 3u];\
-               \n                let v1 = $B_BUFFER[a1 >> 2u][a1 & 3u];\
-               \n                let v2 = $B_BUFFER[a2 >> 2u][a2 & 3u];\
-               \n                let v3 = $B_BUFFER[a3 >> 2u][a3 & 3u];\
-               \n                {st_m0}\
-               \n                {st_m1}\
-               \n                {st_m2}\
-               \n                {st_m3}\
-               \n            }} else {{\
-               \n                {st_z0}\
-               \n                {st_z1}\
-               \n                {st_z2}\
-               \n                {st_z3}\
-               \n            }}\
-               \n        }}",
-                col = col_offset,
-                t = tile,
-            )
-        };
-        (
-            gen_vec4_b("shared_a0", "tile_col"),
-            gen_vec4_b("shared_a1", &format!("(tile_col + {}u)", tile)),
-        )
-    } else if vec4_b_transposed {
-        // BT: B[N,K], load vec4 along K (consecutive in memory), write
-        // transposed to shared.
-        //
-        // v4_row → N (cc direction, shared col), v4_col → K (tr direction,
-        // shared rows). shared[row * tile + col] where row = K-offset,
-        // col = N-offset.
-        //
-        // The fast vec4 load `$B_BUFFER[(cc * k + tr4) >> 2u]` packs the
-        // 4 lanes as four consecutive K-elements for the same N-row. That
-        // packing is only correct when `k % 4 == 0` (else the lanes pull
-        // from the next N-row and the kernel misinterprets memory) *and*
-        // the tile fully fits in K (`tr4 + 4 <= k`). For backward passes
-        // where K is small (e.g. K=1 in MatMulBT(d_loss/d_pred [N,1],
-        // w_out [hidden,1])) or non-multiple-of-4, take the slow path: a
-        // per-lane scalar load through `array<vec4<f32>>` indexed by
-        // `(addr >> 2u)[addr & 3u]` with K-bounds masking.
-        let gen_vec4_bt = |shared: &str, col_offset: &str| -> String {
-            let ix0 = format!("v4_col * {tile}u + v4_row");
-            let ix1 = format!("(v4_col + 1u) * {tile}u + v4_row");
-            let ix2 = format!("(v4_col + 2u) * {tile}u + v4_row");
-            let ix3 = format!("(v4_col + 3u) * {tile}u + v4_row");
-            let st_x = store_b(shared, &ix0, "v.x");
-            let st_y = store_b(shared, &ix1, "v.y");
-            let st_z = store_b(shared, &ix2, "v.z");
-            let st_w = store_b(shared, &ix3, "v.w");
-            let st_m0 = store_b(shared, &ix0, "select(0.0, v0, m0)");
-            let st_m1 = store_b(shared, &ix1, "select(0.0, v1, m1)");
-            let st_m2 = store_b(shared, &ix2, "select(0.0, v2, m2)");
-            let st_m3 = store_b(shared, &ix3, "select(0.0, v3, m3)");
-            let st_z0 = store_b(shared, &ix0, "0.0");
-            let st_z1 = store_b(shared, &ix1, "0.0");
-            let st_z2 = store_b(shared, &ix2, "0.0");
-            let st_z3 = store_b(shared, &ix3, "0.0");
-            format!(
-                "{{\
-               \n            let cc = {col} + v4_row;\
-               \n            let tr4 = t + v4_col;\
-               \n            if cc < n && (tr4 + 4u) <= k && (k & 3u) == 0u {{\
-               \n                let v = $B_BUFFER[(cc * k + tr4) >> 2u];\
-               \n                {st_x}\
-               \n                {st_y}\
-               \n                {st_z}\
-               \n                {st_w}\
-               \n            }} else if cc < n {{\
-               \n                let m0 = (tr4 + 0u) < k;\
-               \n                let m1 = (tr4 + 1u) < k;\
-               \n                let m2 = (tr4 + 2u) < k;\
-               \n                let m3 = (tr4 + 3u) < k;\
-               \n                let lastk = k - 1u;\
-               \n                let a0 = cc * k + min(tr4 + 0u, lastk);\
-               \n                let a1 = cc * k + min(tr4 + 1u, lastk);\
-               \n                let a2 = cc * k + min(tr4 + 2u, lastk);\
-               \n                let a3 = cc * k + min(tr4 + 3u, lastk);\
-               \n                let v0 = $B_BUFFER[a0 >> 2u][a0 & 3u];\
-               \n                let v1 = $B_BUFFER[a1 >> 2u][a1 & 3u];\
-               \n                let v2 = $B_BUFFER[a2 >> 2u][a2 & 3u];\
-               \n                let v3 = $B_BUFFER[a3 >> 2u][a3 & 3u];\
-               \n                {st_m0}\
-               \n                {st_m1}\
-               \n                {st_m2}\
-               \n                {st_m3}\
-               \n            }} else {{\
-               \n                {st_z0}\
-               \n                {st_z1}\
-               \n                {st_z2}\
-               \n                {st_z3}\
-               \n            }}\
-               \n        }}",
-                col = col_offset,
-            )
-        };
-        (
-            gen_vec4_bt("shared_a0", "tile_col"),
-            gen_vec4_bt("shared_a1", &format!("(tile_col + {}u)", tile)),
-        )
-    } else {
-        // Scalar B staging (tile_size < 16 fallback)
-        let (bi0, bi1) = match variant {
-            MatMulCoopVariant::Normal | MatMulCoopVariant::AT => ("tr * n + cc", "tr * n + cc1"),
-            MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
-        };
-        let gen_scalar_b = |shared: &str, in_col: &str, b_index: &str| -> String {
-            let st = store_b(shared, "flat", &format!("$B_BUFFER[{b_index}]"));
-            let stz = store_b(shared, "flat", "0.0");
-            format!(
-                "{{\
-               \n            for (var e = 0u; e < {iters}u; e++) {{\
-               \n                let flat = lid.x + e * 64u;\
-               \n                let tr = t + base_row + e * {stride}u;\
-               \n                let in_bounds = (tr < k) && {ic};\
-               \n                if in_bounds {{\
-               \n                    {st}\
-               \n                }} else {{\
-               \n                    {stz}\
-               \n                }}\
-               \n            }}\
-               \n        }}",
-                iters = staging_iters,
-                stride = row_stride,
-                ic = in_col,
-            )
-        };
-        (
-            gen_scalar_b("shared_a0", "in_n", bi0),
-            gen_scalar_b("shared_a1", "in_n1", bi1),
-        )
-    };
-
-    // Generate A staging blocks (shared_b0, shared_b1)
-    let store_a = |shared: &str, idx: &str, expr: &str| {
-        stage(
-            shared,
-            idx,
-            expr,
-            typed.map_or(crate::DType::F32, |(types, _)| types.a),
-        )
-    };
-    let (a_stage_0, a_stage_1) = if vec4_a {
-        // Normal/BT: A[M,K], load vec4 along K (consecutive in memory).
-        //
-        // The fast vec4 path packs 4 lanes as 4 consecutive K-elements for
-        // the same M-row, which is only correct when `k % 4 == 0` and the
-        // full vec4 lies within bounds. Otherwise fall back to per-lane
-        // scalar loads via `(addr >> 2u)[addr & 3u]` with K-bounds masking.
-        // Required for backward passes whose effective K is small (e.g.
-        // d_loss/d_pred has shape [N, 1] in the BT of an MLP output head).
-        let gen_vec4_a = |shared: &str, row_offset: &str| -> String {
-            let st_x = store_a(shared, "flat", "v.x");
-            let st_y = store_a(shared, "flat + 1u", "v.y");
-            let st_z = store_a(shared, "flat + 2u", "v.z");
-            let st_w = store_a(shared, "flat + 3u", "v.w");
-            let st_m0 = store_a(shared, "flat", "select(0.0, v0, m0)");
-            let st_m1 = store_a(shared, "flat + 1u", "select(0.0, v1, m1)");
-            let st_m2 = store_a(shared, "flat + 2u", "select(0.0, v2, m2)");
-            let st_m3 = store_a(shared, "flat + 3u", "select(0.0, v3, m3)");
-            let st_z0 = store_a(shared, "flat", "0.0");
-            let st_z1 = store_a(shared, "flat + 1u", "0.0");
-            let st_z2 = store_a(shared, "flat + 2u", "0.0");
-            let st_z3 = store_a(shared, "flat + 3u", "0.0");
-            format!(
-                "{{\
-               \n            let gr = {row} + v4_row;\
-               \n            let tc4 = t + v4_col;\
-               \n            let flat = v4_row * {t}u + v4_col;\
-               \n            if gr < m && (tc4 + 4u) <= k && (k & 3u) == 0u {{\
-               \n                let v = matrix_a[(gr * k + tc4) >> 2u];\
-               \n                {st_x}\
-               \n                {st_y}\
-               \n                {st_z}\
-               \n                {st_w}\
-               \n            }} else if gr < m {{\
-               \n                let m0 = (tc4 + 0u) < k;\
-               \n                let m1 = (tc4 + 1u) < k;\
-               \n                let m2 = (tc4 + 2u) < k;\
-               \n                let m3 = (tc4 + 3u) < k;\
-               \n                let lastk = k - 1u;\
-               \n                let a0 = gr * k + min(tc4 + 0u, lastk);\
-               \n                let a1 = gr * k + min(tc4 + 1u, lastk);\
-               \n                let a2 = gr * k + min(tc4 + 2u, lastk);\
-               \n                let a3 = gr * k + min(tc4 + 3u, lastk);\
-               \n                let v0 = matrix_a[a0 >> 2u][a0 & 3u];\
-               \n                let v1 = matrix_a[a1 >> 2u][a1 & 3u];\
-               \n                let v2 = matrix_a[a2 >> 2u][a2 & 3u];\
-               \n                let v3 = matrix_a[a3 >> 2u][a3 & 3u];\
-               \n                {st_m0}\
-               \n                {st_m1}\
-               \n                {st_m2}\
-               \n                {st_m3}\
-               \n            }} else {{\
-               \n                {st_z0}\
-               \n                {st_z1}\
-               \n                {st_z2}\
-               \n                {st_z3}\
-               \n            }}\
-               \n        }}",
-                row = row_offset,
-                t = tile,
-            )
-        };
-        (
-            gen_vec4_a("shared_b0", "tile_row"),
-            gen_vec4_a("shared_b1", &format!("(tile_row + {}u)", tile)),
-        )
-    } else if vec4_a_transposed {
-        // AT: A[K,M], load vec4 along M (consecutive in memory), write
-        // transposed to shared. The packed vec4 load is valid only when M is
-        // divisible by four: otherwise successive K rows start at different
-        // lanes of the storage vec4. Partial rows and unaligned row strides
-        // use scalar lane extraction, mirroring the Normal/BT staging paths.
-        let gen_vec4_at = |shared: &str, row_offset: &str| -> String {
-            let ix0 = format!("v4_col * {tile}u + v4_row");
-            let ix1 = format!("(v4_col + 1u) * {tile}u + v4_row");
-            let ix2 = format!("(v4_col + 2u) * {tile}u + v4_row");
-            let ix3 = format!("(v4_col + 3u) * {tile}u + v4_row");
-            let st_x = store_a(shared, &ix0, "v.x");
-            let st_y = store_a(shared, &ix1, "v.y");
-            let st_z = store_a(shared, &ix2, "v.z");
-            let st_w = store_a(shared, &ix3, "v.w");
-            let st_m0 = store_a(shared, &ix0, "select(0.0, v0, m0)");
-            let st_m1 = store_a(shared, &ix1, "select(0.0, v1, m1)");
-            let st_m2 = store_a(shared, &ix2, "select(0.0, v2, m2)");
-            let st_m3 = store_a(shared, &ix3, "select(0.0, v3, m3)");
-            let st_z0 = store_a(shared, &ix0, "0.0");
-            let st_z1 = store_a(shared, &ix1, "0.0");
-            let st_z2 = store_a(shared, &ix2, "0.0");
-            let st_z3 = store_a(shared, &ix3, "0.0");
-            format!(
-                "{{\
-               \n            let tc = t + v4_row;\
-               \n            let gr4 = {row} + v4_col;\
-               \n            if tc < k && (gr4 + 4u) <= m && (m & 3u) == 0u {{\
-               \n                let v = matrix_a[(tc * m + gr4) >> 2u];\
-               \n                {st_x}\
-               \n                {st_y}\
-               \n                {st_z}\
-               \n                {st_w}\
-               \n            }} else if tc < k {{\
-               \n                let m0 = (gr4 + 0u) < m;\
-               \n                let m1 = (gr4 + 1u) < m;\
-               \n                let m2 = (gr4 + 2u) < m;\
-               \n                let m3 = (gr4 + 3u) < m;\
-               \n                let last = m - 1u;\
-               \n                let a0 = tc * m + min(gr4 + 0u, last);\
-               \n                let a1 = tc * m + min(gr4 + 1u, last);\
-               \n                let a2 = tc * m + min(gr4 + 2u, last);\
-               \n                let a3 = tc * m + min(gr4 + 3u, last);\
-               \n                let v0 = matrix_a[a0 >> 2u][a0 & 3u];\
-               \n                let v1 = matrix_a[a1 >> 2u][a1 & 3u];\
-               \n                let v2 = matrix_a[a2 >> 2u][a2 & 3u];\
-               \n                let v3 = matrix_a[a3 >> 2u][a3 & 3u];\
-               \n                {st_m0}\
-               \n                {st_m1}\
-               \n                {st_m2}\
-               \n                {st_m3}\
-               \n            }} else {{\
-               \n                {st_z0}\
-               \n                {st_z1}\
-               \n                {st_z2}\
-               \n                {st_z3}\
-               \n            }}\
-               \n        }}",
-                row = row_offset,
-            )
-        };
-        (
-            gen_vec4_at("shared_b0", "tile_row"),
-            gen_vec4_at("shared_b1", &format!("(tile_row + {}u)", tile)),
-        )
-    } else {
-        // Scalar A staging (prologue or tile_size < 16)
-        let a_idx = match variant {
-            MatMulCoopVariant::Normal | MatMulCoopVariant::BT => "gr * k + tc",
-            MatMulCoopVariant::AT => "tc * m + gr",
-        };
-        let gen_scalar_a = |shared: &str, row_offset: &str| -> String {
-            let st = store_a(shared, "flat", &format!("a_val{a_transform}"));
-            let stz = store_a(shared, "flat", "0.0");
-            format!(
-                "{{\
-               \n            let tc = t + src_col;\
-               \n            let in_k = tc < k;\
-               \n            for (var e = 0u; e < {iters}u; e++) {{\
-               \n                let flat = lid.x + e * 64u;\
-               \n                let gr = {row} + base_row + e * {stride}u;\
-               \n                let in_bounds = (gr < m) && in_k;\
-               \n                if in_bounds {{\
-               \n                    let a_val = matrix_a[{ai}];\
-               \n                    {st}\
-               \n                }} else {{\
-               \n                    {stz}\
-               \n                }}\
-               \n            }}\
-               \n        }}",
-                iters = staging_iters,
-                stride = row_stride,
-                row = row_offset,
-                ai = a_idx,
-            )
-        };
-        (
-            gen_scalar_a("shared_b0", "tile_row"),
-            gen_scalar_a("shared_b1", &format!("(tile_row + {}u)", tile)),
-        )
-    };
-
-    let (fused_decl, acc_init) = if fused_add && typed.is_none() {
-        (
-            "var<storage> src: array<f32>;".to_string(),
-            format!(
-                "var acc00 = coopLoadT<{coop_c}>(&src[c00], n);\n\
-                 \x20   var acc01 = coopLoadT<{coop_c}>(&src[c01], n);\n\
-                 \x20   var acc10 = coopLoadT<{coop_c}>(&src[c10], n);\n\
-                 \x20   var acc11 = coopLoadT<{coop_c}>(&src[c11], n);"
-            ),
-        )
-    } else {
-        (
-            if fused_add {
-                "var<storage> src: array<f32>;".to_owned()
-            } else {
-                String::new()
+                DType::F32
             },
-            format!(
-                "var acc00 = {coop_c}();\n\
-                 \x20   var acc01 = {coop_c}();\n\
-                 \x20   var acc10 = {coop_c}();\n\
-                 \x20   var acc11 = {coop_c}();"
-            ),
-        )
+            output: DType::F32,
+        },
     };
-
-    let output_tile_u = format!("{}u", output_tile);
-    let tile_size_u = format!("{}u", tile);
-    let shared_size_s = format!("{}", shared_size);
-    let result_shared_size = output_tile * output_tile;
-    let result_index = if typed.is_some() {
-        "(wgid.z * m + row) * n + col"
-    } else {
-        "row * n + col"
+    let k_stage = if types.multiply == DType::F32 { 16 } else { 32 };
+    let shape = workgroup::WorkgroupMatmulShape {
+        rows: output_tile,
+        columns: output_tile,
+        k_stage,
+        threads: 4 * subgroup,
+        stage_operands: false,
+        subgroup_rows: 2,
+        prefetch: false,
     };
-    let result_value = if let Some((types, _)) = typed {
-        let value = if fused_add { "val + src[idx]" } else { "val" };
-        let cast = if types.output == crate::DType::BF16 {
-            "round_bf16"
-        } else {
-            MatrixTypes::name(types.output)
-        };
-        format!("{cast}({value})")
-    } else {
-        "val".to_owned()
-    };
-    let (result_shared_decl, result_store) =
-        if epilogue.is_some() || typed.is_some_and(|(_, layout)| !layout.direct_output) {
-            // Cooperative matrices are subgroup-scoped. Only one subgroup may
-            // store these shared tiles; every invocation still reaches the barrier.
-            let store_iters = result_shared_size.div_ceil(wg_size);
-            (
-                format!(
-                    "var<workgroup> shared_c: array<f32, {}>;",
-                    result_shared_size
-                ),
-                format!(
-                    "if sg == 0u {{\n\
-                 \x20   coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
-                 \x20   coopStoreT(acc01, &shared_c[{tile}u], {output_tile}u);\n\
-                 \x20   coopStoreT(acc10, &shared_c[{}u], {output_tile}u);\n\
-                 \x20   coopStoreT(acc11, &shared_c[{}u], {output_tile}u);\n\
-                 \x20   }}\n\
-                 \x20   workgroupBarrier();\n\
-                 \n\
-                 \x20   for (var e = 0u; e < {store_iters}u; e++) {{\n\
-                 \x20       let local_idx = lid.x + e * {wg_size}u;\n\
-                 \x20       if local_idx < {result_shared_size}u {{\n\
-                 \x20           let local_row = local_idx / {output_tile}u;\n\
-                 \x20           let local_col = local_idx - local_row * {output_tile}u;\n\
-                 \x20           let row = tile_row + local_row;\n\
-                 \x20           let col = tile_col + local_col;\n\
-                 \x20           if row < m && col < n {{\n\
-                 \x20               let idx = {result_index};\n\
-                 \x20               var val = shared_c[local_idx];\n\
-                 \x20               {epilogue_body}\n\
-                 \x20               $C_BUFFER[idx] = {result_value};\n\
-                 \x20           }}\n\
-                 \x20       }}\n\
-                 \x20   }}",
-                    tile * output_tile,
-                    tile * output_tile + tile,
-                ),
-            )
-        } else {
-            (
-                String::new(),
-                "if sg == 0u {\n\
-             \x20   coopStoreT(acc00, &$C_BUFFER[c00], n);\n\
-             \x20   if n1_valid {\n\
-             \x20       coopStoreT(acc01, &$C_BUFFER[c01], n);\n\
-             \x20   }\n\
-             \x20   if m1_valid {\n\
-             \x20       coopStoreT(acc10, &$C_BUFFER[c10], n);\n\
-             \x20   }\n\
-             \x20   if n1_valid && m1_valid {\n\
-             \x20       coopStoreT(acc11, &$C_BUFFER[c11], n);\n\
-             \x20   }\n\
-             \x20   }"
-                    .to_string(),
-            )
-        };
-
-    let src = include_str!("shaders/matmul_coop.wgsl");
-    let src = preprocess(
-        src,
-        &[
-            (
-                "$PARTITION_FIELD",
-                if typed.is_some() { "splits" } else { "_pad" },
-            ),
-            (
-                "$K_RANGE",
-                if typed.is_some() {
-                    cooperative::SPLIT_RANGE
-                } else {
-                    ""
-                },
-            ),
-            ("$K_START", if typed.is_some() { "first" } else { "0u" }),
-            ("$K_END", if typed.is_some() { "end" } else { "k" }),
-            (
-                "$OUTPUT_OFFSET",
-                if typed.is_some() {
-                    "wgid.z * m * n"
-                } else {
-                    "0u"
-                },
-            ),
-            ("$ENABLE_F16", enable_f16),
-            ("$ELEM_TYPE", elem_type),
-            ("$SHARED_SIZE", &shared_size_s),
-            ("$OUTPUT_M_U", &output_tile_u),
-            ("$OUTPUT_N_U", &output_tile_u),
-            ("$TILE_M_U", &tile_size_u),
-            ("$TILE_N_U", &tile_size_u),
-            ("$TILE_K_U", &tile_size_u),
-            ("$COOP_AB", &coop_ab),
-            ("$COOP_BA", &coop_ba),
-            ("$A_STORAGE", &a_storage),
-            ("$STAGING_VARS", &staging_vars),
-            ("$B_STAGE_0", &b_stage_0),
-            ("$B_STAGE_1", &b_stage_1),
-            ("$A_STAGE_0", &a_stage_0),
-            ("$A_STAGE_1", &a_stage_1),
-            ("$PROLOGUE_DECL", &prologue_decl),
-            ("$EPILOGUE_DECL", &epilogue_decl),
-            ("$PROLOGUE_CACHE_DECL", &prologue_cache_decl),
-            ("$PROLOGUE_CACHE_INIT", &prologue_cache_init),
-            ("$FUSED_ADD_DECL", &fused_decl),
-            ("$ACC_INIT", &acc_init),
-            ("$RESULT_SHARED_DECL", &result_shared_decl),
-            ("$RESULT_STORE", &result_store),
-        ],
+    let partition_field = if typed.is_some() { "splits" } else { "_pad" };
+    let a_type = MatrixTypes::name(types.a);
+    let b_type = MatrixTypes::name(types.b);
+    let out_type = MatrixTypes::name(types.output);
+    let mut header = format!(
+        "struct Params {{ m: u32, n: u32, k: u32, {partition_field}: u32 }}
+         var<storage> matrix_a: array<vec4<{a_type}>>;
+"
     );
-
-    if let Some((types, _)) = typed {
-        let output = MatrixTypes::name(types.output);
-        let rounding = if types.uses(crate::DType::BF16) {
-            include_str!("shaders/bf16_round.wgsl")
-        } else {
-            ""
-        };
-        let bindings = format!(
-            "var<storage> matrix_b: {b_storage};\nvar<storage, read_write> matrix_c: array<{output}>;\n{rounding}"
+    if copies == 1 {
+        header += &format!(
+            "var<storage> matrix_b: array<vec4<{b_type}>>;
+             var<storage, read_write> matrix_c: array<{out_type}>;
+"
         );
-        return ShaderModule::new(&preprocess(
-            &src,
-            &[
-                ("$MATRIX_BINDINGS", &bindings),
-                ("$B_BUFFER", "matrix_b"),
-                ("$C_BUFFER", "matrix_c"),
-                (
-                    "$ENTRY_SIGNATURE",
-                    "@compute @workgroup_size(64) fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32)",
-                ),
-            ],
-        ))
-        .with_subgroup(0, [64, 1, 1]);
+    } else {
+        for i in 0..copies {
+            header += &format!(
+                "var<storage> matrix_b{i}: array<vec4<{b_type}>>;
+                 var<storage, read_write> matrix_c{i}: array<{out_type}>;
+"
+            );
+        }
     }
-    matmul_module(&src, &b_storage, Some(wg_size), copies)
+    if fused_add {
+        header += "var<storage> src: array<f32>;
+";
+    }
+    header += "var<uniform> params: Params;
+";
+    workgroup::subgroup_kernel(
+        shape,
+        types,
+        [tile, tile, tile],
+        subgroup,
+        &workgroup::SubgroupLayout {
+            variant,
+            header,
+            dimensions: "let m = params.m;
+let n = params.n;
+let k = params.k;"
+                .into(),
+            a: "matrix_a",
+            b: "matrix_b",
+            c: "matrix_c",
+            addend: fused_add.then_some("src"),
+            prologue,
+            epilogue,
+            images: None,
+            fixed_splits: if typed.is_some() { None } else { Some(1) },
+            unaligned_loads: true,
+            copies,
+            row_bounds: true,
+            column_bounds: true,
+            gather: [None, None],
+            scatter: None,
+        },
+    )
 }
 
 /// F32 8x8 cooperative matrices: four SIMD groups own disjoint
@@ -4614,14 +4087,20 @@ mod tests {
                 ShaderGroup::MatMulAT,
                 ShaderGroup::MatMulBT,
             ] {
-                let module = generate_horizontal_matmul(group, count, None);
+                let module =
+                    generate_horizontal_matmul(group, count, None, workgroup::SUBGROUP_WIDTH);
                 assert!(module.source.contains("matrix_b0"));
                 assert!(module.source.contains("horiz_0"));
                 Validator::new(flags, Capabilities::empty())
                     .validate(&module.module)
                     .unwrap_or_else(|e| panic!("horizontal {group:?} {count} failed: {e:#?}"));
             }
-            let module = generate_horizontal_matmul(ShaderGroup::MatMul, count, Some(&coop));
+            let module = generate_horizontal_matmul(
+                ShaderGroup::MatMul,
+                count,
+                Some(&coop),
+                workgroup::SUBGROUP_WIDTH,
+            );
             assert!(module.source.contains("matrix_b0"));
             Validator::new(
                 flags,
@@ -4735,9 +4214,10 @@ mod tests {
                 &config,
                 &epilogue,
                 WeightFormat::F32,
+                workgroup::SUBGROUP_WIDTH,
             );
-            assert!(module.source.contains("shared_c"));
-            assert!(module.source.contains("var val = shared_c[local_idx]"));
+            assert!(module.source.contains("var<workgroup> scratch: array<f32,"));
+            assert!(module.source.contains("var val = scratch["));
             Validator::new(flags, capabilities)
                 .validate(&module.module)
                 .unwrap_or_else(|error| {
@@ -4783,17 +4263,29 @@ mod tests {
             ShaderGroup::MatMulBT,
             ShaderGroup::MatMulBTAdd,
         ] {
-            let plain = generate_module_coop_weighted(group, &config, WeightFormat::F16);
+            let plain = generate_module_coop_weighted(
+                group,
+                &config,
+                WeightFormat::F16,
+                workgroup::SUBGROUP_WIDTH,
+            );
             assert!(plain.source.contains("vec4<f16>"), "{group:?}");
             let fused = generate_coop_matmul_with_dag_epilogue(
                 group,
                 &config,
                 &epilogue,
                 WeightFormat::F16,
+                workgroup::SUBGROUP_WIDTH,
             );
             let (add, variant) = coop_shape(group).unwrap();
-            let with_prologue =
-                gen_matmul_coop_with_prologue(add, variant, &config, &prologue, WeightFormat::F16);
+            let with_prologue = gen_matmul_coop_with_prologue(
+                add,
+                variant,
+                &config,
+                &prologue,
+                WeightFormat::F16,
+                workgroup::SUBGROUP_WIDTH,
+            );
             for module in [plain, fused, with_prologue] {
                 Validator::new(flags, capabilities)
                     .validate(&module.module)
@@ -5415,7 +4907,14 @@ mod tests {
 
         for config in configs {
             for &(kh, kw, stride, direction) in &cases {
-                let sm = generate_conv2d_coop_module(kh, kw, stride, direction, &config);
+                let sm = generate_conv2d_coop_module(
+                    kh,
+                    kw,
+                    stride,
+                    direction,
+                    &config,
+                    workgroup::SUBGROUP_WIDTH,
+                );
                 let mut validator = Validator::new(flags, coop_caps);
                 let result = validator.validate(&sm.module);
                 assert!(
@@ -5424,17 +4923,15 @@ mod tests {
                     config.tile_size,
                     result.err()
                 );
-                // f32 grad-input kernels store only fully covered
-                // workgroups directly; edge workgroups (right or bottom) go
-                // through bounds-checked scalar stores.
-                let full_tile_gate = ") <= n_total && (tile_row + ";
-                if !config.use_f16_input && direction == Conv2dCoopDirection::GradInput {
-                    assert!(sm.source.contains(full_tile_gate));
-                    assert!(sm.source.contains(") <= m_total {"));
-                    assert!(sm.source.contains("shared_b0[flat]"));
-                } else {
-                    assert!(!sm.source.contains(full_tile_gate));
-                }
+                // Every direction stores fully covered workgroups directly and
+                // stages ragged edge tiles through shared memory with bounds
+                // checks.
+                let tile = config.output_tile();
+                assert!(
+                    sm.source
+                        .contains(&format!("if (row + {tile}u <= m) & (col + {tile}u <= n)"))
+                );
+                assert!(sm.source.contains("var<workgroup> scratch: array<f32,"));
             }
         }
     }
