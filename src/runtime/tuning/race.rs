@@ -566,6 +566,9 @@ fn qualify_finalists(
             outcome.selected = incumbent;
             continue;
         }
+        let f16_staged = class.key.weight_format.is_quantized()
+            && (matches!(incumbent, MatmulTile::CooperativeWorkgroup { .. })
+                || matches!(tiles[winner + 1], MatmulTile::CooperativeWorkgroup { .. }));
         let checked = qualify(
             scratch,
             class,
@@ -576,6 +579,7 @@ fn qualify_finalists(
                 runs[winner + 1].as_ref().unwrap(),
             ],
             &mut reference,
+            f16_staged,
             start,
             options.max_time,
         );
@@ -846,6 +850,7 @@ enum QualificationFailure {
 /// Qualify both patterns with the sequential comparison's numerical checks.
 /// Keep incumbent outputs across finalists; check deadlines between transfers
 /// and dispatches, including after the final validation before installation.
+#[allow(clippy::too_many_arguments)]
 fn qualify(
     scratch: &mut Scratch<'_, '_>,
     class: &SearchClass,
@@ -853,6 +858,7 @@ fn qualify(
     sizes: &[usize],
     [incumbent, challenger]: [&Run<'_>; 2],
     reference: &mut [Option<Vec<f32>>; 2],
+    f16_staged: bool,
     start: Instant,
     budget: Duration,
 ) -> Result<(), QualificationFailure> {
@@ -884,7 +890,7 @@ fn qualify(
             scratch.run(incumbent, 1);
             check_budget()?;
             let output = scratch.read_output(&mut times);
-            if !output_qualifies(&class.key, &inputs, &output, None, pattern) {
+            if !output_qualifies(class, &inputs, &output, None, pattern, f16_staged) {
                 return Err(QualificationFailure::Output {
                     by_incumbent: true,
                     failure: format!("incumbent, input pattern {pattern}: reference mismatch"),
@@ -901,7 +907,7 @@ fn qualify(
         let expected = reference[slot]
             .as_deref()
             .expect("qualified incumbent output");
-        if !output_qualifies(&class.key, &inputs, &output, Some(expected), pattern) {
+        if !output_qualifies(class, &inputs, &output, Some(expected), pattern, f16_staged) {
             return Err(QualificationFailure::Output {
                 by_incumbent: false,
                 failure: format!("input pattern {pattern}: reference or cross-variant mismatch"),

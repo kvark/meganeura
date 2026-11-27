@@ -570,18 +570,38 @@ pub(super) fn tile_module(
                     super::workgroup_matmul_epilogue_supported(shape, epilogue),
                     "unsupported epilogue on workgroup cooperative product"
                 );
-                let (native, subgroup) =
-                    super::workgroup_matmul_shape_and_subgroup(shape, types, caps)
-                        .unwrap_or(([16, 16, 16], 32));
-                crate::codegen::generate_workgroup_matmul_for_device(
-                    entry.shader_group(),
-                    shape,
-                    types,
-                    native,
-                    subgroup,
-                    dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
-                    epilogue,
-                )
+                if dispatch.weight_format.is_quantized() {
+                    let (row_bounds, column_bounds) = dispatch
+                        .mnk()
+                        .map(|(m, n, _)| (shape.ragged_rows(m), !n.is_multiple_of(shape.columns)))
+                        .unwrap_or((false, false));
+                    let (native, subgroup) =
+                        crate::codegen::native_subgroup_shape(caps, types.multiply)
+                            .unwrap_or(([16, 16, 16], 32));
+                    crate::codegen::generate_subgroup_quantized_matmul(
+                        entry.shader_group(),
+                        dispatch.weight_format,
+                        shape,
+                        native,
+                        subgroup,
+                        row_bounds,
+                        column_bounds,
+                        epilogue,
+                    )
+                } else {
+                    let (native, subgroup) =
+                        super::workgroup_matmul_shape_and_subgroup(shape, types, caps)
+                            .unwrap_or(([16, 16, 16], 32));
+                    crate::codegen::generate_workgroup_matmul_for_device(
+                        entry.shader_group(),
+                        shape,
+                        types,
+                        native,
+                        subgroup,
+                        dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
+                        epilogue,
+                    )
+                }
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()
@@ -612,6 +632,16 @@ struct SearchClass {
 }
 
 impl SearchClass {
+    /// Whether this class evaluates a quantized F16-staged cooperative tile.
+    fn has_quantized_f16_tile(&self) -> bool {
+        self.key.weight_format.is_quantized()
+            && (matches!(self.initial, MatmulTile::CooperativeWorkgroup { .. })
+                || self
+                    .challengers
+                    .iter()
+                    .any(|t| matches!(t, MatmulTile::CooperativeWorkgroup { .. })))
+    }
+
     /// Install `tile` on every member, with each split member's SumRows
     /// adding exactly the partitions the tile writes.
     fn install(&self, dispatches: &mut [Dispatch], tile: MatmulTile) {
@@ -644,16 +674,26 @@ fn retain_tunable_classes(
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
-                class.key.effective_matrix_types().is_some_and(|types| {
-                    shape.supports_layout(
+                if class.key.weight_format.is_quantized() {
+                    shape.supports_quantized(
                         capabilities,
-                        types,
-                        Some(class.key.shader.shader_group()),
                         class.key.m,
                         class.key.n,
                         class.key.k,
+                        class.key.epilogue.is_some(),
                     )
-                })
+                } else {
+                    class.key.effective_matrix_types().is_some_and(|types| {
+                        shape.supports_layout(
+                            capabilities,
+                            types,
+                            Some(class.key.shader.shader_group()),
+                            class.key.m,
+                            class.key.n,
+                            class.key.k,
+                        )
+                    })
+                }
             }
             _ => true,
         });
@@ -728,11 +768,22 @@ fn selection_swaps(
     Ok(swaps)
 }
 
+#[cfg(test)]
 fn collect_classes(
     plan: &crate::compile::ExecutionPlan,
     alias: &crate::memplan::AliasPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
     capabilities: &bg::Capabilities,
+) -> (Vec<SearchClass>, usize) {
+    collect_classes_with_policy(plan, alias, coop_config, capabilities, false)
+}
+
+fn collect_classes_with_policy(
+    plan: &crate::compile::ExecutionPlan,
+    alias: &crate::memplan::AliasPlan,
+    coop_config: Option<&crate::codegen::CoopConfig>,
+    capabilities: &bg::Capabilities,
+    quantized_coop_f16: bool,
 ) -> (Vec<SearchClass>, usize) {
     let mut classes: Vec<SearchClass> = Vec::new();
     let mut indices = HashMap::new();
@@ -818,6 +869,7 @@ fn collect_classes(
                 coop_config,
                 native_shapes,
                 capabilities.subgroup_size,
+                quantized_coop_f16,
             )
             .into_iter()
             .filter(|candidate| Some(*candidate) != equivalent)
@@ -881,18 +933,27 @@ impl Session {
                 "tuning swap requires compatible sessions on one context",
             ));
         }
-        let left_classes = collect_classes(
+        let capabilities = self.gpu.capabilities();
+        let quantized_coop_f16 = self.quantized_coop_f16_enabled(&capabilities);
+        if quantized_coop_f16 != other.quantized_coop_f16_enabled(&capabilities) {
+            return Err(TuneError(
+                "tuning swap requires matching quantized cooperative policy",
+            ));
+        }
+        let left_classes = collect_classes_with_policy(
             &self.plan,
             &self.alias,
             self.coop_config.as_ref(),
-            &self.gpu.capabilities(),
+            &capabilities,
+            quantized_coop_f16,
         )
         .0;
-        let right_classes = collect_classes(
+        let right_classes = collect_classes_with_policy(
             &other.plan,
             &other.alias,
             other.coop_config.as_ref(),
-            &other.gpu.capabilities(),
+            &capabilities,
+            quantized_coop_f16,
         )
         .0;
         let swaps = selection_swaps(
@@ -964,14 +1025,25 @@ impl Session {
         self.tune_with_memo(options, None)
     }
 
+    /// Whether quantized cooperative F16 candidates are enabled for tuning.
+    /// Runs the once-per-context F16 subnormal probe only under `AllowF16` when
+    /// the plan actually contains a quantized prefill candidate.
+    fn quantized_coop_f16_enabled(&self, capabilities: &bg::Capabilities) -> bool {
+        self.coop_policy == crate::compile::CoopPolicy::AllowF16
+            && crate::compile::lower::has_quantized_coop_candidate(&self.plan, capabilities)
+            && super::typed_matrix_supported(&self.gpu, crate::DType::F16)
+    }
+
     /// Eligible classes in search order, and the dispatches outside them.
     fn tune_classes(&self, options: &TuneOptions) -> (Vec<SearchClass>, usize) {
         let capabilities = self.gpu.capabilities();
-        let (mut classes, excluded_dispatches) = collect_classes(
+        let quantized_coop_f16 = self.quantized_coop_f16_enabled(&capabilities);
+        let (mut classes, excluded_dispatches) = collect_classes_with_policy(
             &self.plan,
             &self.alias,
             self.coop_config.as_ref(),
             &capabilities,
+            quantized_coop_f16,
         );
         let left_out = retain_tunable_classes(&mut classes, &options.scope, &capabilities);
         if options.strategy == TuneStrategy::Race {
@@ -1433,140 +1505,165 @@ impl Session {
                 && baseline.binding_bytes == sizes
         });
         let baseline_reused = cached_baseline.is_some();
+        let mut baseline_complete = baseline_reused;
         let mut baseline_outputs = cached_baseline
             .map(|baseline| baseline.outputs)
             .unwrap_or_default();
         let mut candidate_outputs: [Vec<f32>; 2] = Default::default();
-        let mut scratch = Scratch::new(
-            &device_local,
-            &sizes,
-            (&class.key, output_index),
-            bytes,
-            staging,
-            prep,
-            &mut phases.cleanup,
-        );
-        outcome.scratch = Some(TuneScratchUsage {
-            binding_bytes: sizes.clone(),
-            staging_bytes: scratch.staging.stats.retained_staging_bytes,
-            staging_reused: scratch.staging_reused,
-            input_b_reused: scratch.input_b_reused,
-            baseline_reused,
-        });
-        let bindings = PhaseTimer::new(&mut prep.bindings);
-        let sequences: Vec<Vec<_>> = variants
-            .iter()
-            .enumerate()
-            .map(|(i, sequence)| {
-                sequence
-                    .iter()
-                    .enumerate()
-                    .map(|(position, dispatch)| {
-                        let key = if position > 0 {
-                            Pipelines::key(dispatch, &capabilities)
-                        } else {
-                            tile_variant(
-                                dispatch,
-                                [outcome.initial, outcome.candidate][i],
-                                &capabilities,
-                            )
-                        };
-                        (&self.pipelines.map[&key].raw, dispatch)
-                    })
-                    .collect()
-            })
-            .collect();
-        drop(bindings);
-        drop(preparation);
-        phases.qualification_breakdown = Some(Default::default());
-        let details = phases.qualification_breakdown.as_mut().unwrap();
-        let qualification = PhaseTimer::new(&mut phases.qualification);
-        let mut inputs = Vec::new();
-        // Finish on ordinary inputs so warmup can use the qualified buffers.
-        for pattern in [1, 0] {
-            if start.elapsed() >= options.max_time {
-                outcome.decision = TuneDecision::TimeBudget;
-                return;
-            }
-            {
-                let _timer = PhaseTimer::new(&mut details.input_preparation);
-                class_inputs(&mut inputs, class, &logical_sizes, &sizes, pattern as u32);
-            }
-            for (index, data) in inputs.iter().enumerate() {
-                // B is identical across this class, both patterns and warmup.
-                if index != 1 || (pattern == 1 && !scratch.input_b_reused) {
-                    scratch.upload(index, data, Some(&mut *details));
-                }
-            }
-            scratch.input_b_uploaded = true;
-            for variant in 0..2 {
-                if variant == 0 && baseline_reused {
-                    continue;
-                }
-                if start.elapsed() >= options.max_time {
-                    outcome.decision = TuneDecision::TimeBudget;
-                    return;
-                }
-                scratch.poison_outputs(&sizes, details);
-                {
-                    let _timer = PhaseTimer::new(&mut details.dispatch);
-                    scratch.run(&sequences[variant], 1);
-                }
-                let output = scratch.read_output(details);
-                // The incumbent output has already passed the reference,
-                // finiteness and extent checks for this exact input pattern.
-                let reference = (variant == 1).then_some(&baseline_outputs[pattern][..]);
-                let valid = {
-                    let _timer = PhaseTimer::new(&mut details.validation);
-                    output_qualifies(&class.key, &inputs, &output, reference, pattern as u32)
-                };
-                if !valid {
-                    outcome.decision = TuneDecision::InvalidOutput;
-                    outcome.failure = Some(format!(
-                        "variant {variant}, {:?}, input pattern {pattern}: reference or cross-variant mismatch",
-                        [outcome.initial, outcome.candidate][variant]
-                    ));
-                    return;
-                }
-                if variant == 0 {
-                    baseline_outputs[pattern] = output;
-                } else {
-                    candidate_outputs[pattern] = output;
-                }
-            }
-        }
-        outcome.qualified = true;
-        drop(qualification);
-        let warmup = PhaseTimer::new(&mut phases.warmup);
-        drop(inputs);
-        let mut warmup_ms = [f64::INFINITY; 2];
-        for _ in 0..options.warmup_runs {
-            for variant in 0..2 {
-                if start.elapsed() >= options.max_time {
-                    outcome.decision = TuneDecision::TimeBudget;
-                    return;
-                }
-                let ms = scratch.run(&sequences[variant], 1);
-                warmup_ms[variant] = warmup_ms[variant].min(ms);
-            }
-        }
-        drop(warmup);
-        let repetitions = options.sample_repetitions(warmup_ms);
-        outcome.sample_repetitions = Some(repetitions);
-        let sampling = PhaseTimer::new(&mut phases.sampling);
-        (outcome.baseline_ms, outcome.candidate_ms) =
-            measure_pairs(options.sample_pairs, |alternative| {
-                if start.elapsed() >= options.max_time {
-                    return None;
-                }
-                let index = usize::from(alternative);
-                let ms = scratch.run(&sequences[index], repetitions);
-                // Do not accept a last pair that only finished after the deadline.
-                (start.elapsed() < options.max_time).then_some(ms / repetitions as f64)
+        'measure: {
+            let mut scratch = Scratch::new(
+                &device_local,
+                &sizes,
+                (&class.key, output_index),
+                bytes,
+                staging,
+                prep,
+                &mut phases.cleanup,
+            );
+            outcome.scratch = Some(TuneScratchUsage {
+                binding_bytes: sizes.clone(),
+                staging_bytes: scratch.staging.stats.retained_staging_bytes,
+                staging_reused: scratch.staging_reused,
+                input_b_reused: scratch.input_b_reused,
+                baseline_reused,
             });
-        drop(sampling);
-        drop(scratch);
-        decide(outcome, options);
+            let bindings = PhaseTimer::new(&mut prep.bindings);
+            let sequences: Vec<Vec<_>> = variants
+                .iter()
+                .enumerate()
+                .map(|(i, sequence)| {
+                    sequence
+                        .iter()
+                        .enumerate()
+                        .map(|(position, dispatch)| {
+                            let key = if position > 0 {
+                                Pipelines::key(dispatch, &capabilities)
+                            } else {
+                                tile_variant(
+                                    dispatch,
+                                    [outcome.initial, outcome.candidate][i],
+                                    &capabilities,
+                                )
+                            };
+                            (&self.pipelines.map[&key].raw, dispatch)
+                        })
+                        .collect()
+                })
+                .collect();
+            drop(bindings);
+            drop(preparation);
+            phases.qualification_breakdown = Some(Default::default());
+            let details = phases.qualification_breakdown.as_mut().unwrap();
+            let qualification = PhaseTimer::new(&mut phases.qualification);
+            let mut inputs = Vec::new();
+            // Finish on ordinary inputs so warmup can use the qualified buffers.
+            for pattern in [1, 0] {
+                if start.elapsed() >= options.max_time {
+                    outcome.decision = TuneDecision::TimeBudget;
+                    break 'measure;
+                }
+                {
+                    let _timer = PhaseTimer::new(&mut details.input_preparation);
+                    class_inputs(&mut inputs, class, &logical_sizes, &sizes, pattern as u32);
+                }
+                for (index, data) in inputs.iter().enumerate() {
+                    // B is identical across this class, both patterns and warmup.
+                    if index != 1 || (pattern == 1 && !scratch.input_b_reused) {
+                        scratch.upload(index, data, Some(&mut *details));
+                    }
+                }
+                scratch.input_b_uploaded = true;
+                for variant in 0..2 {
+                    if variant == 0 && baseline_reused {
+                        continue;
+                    }
+                    if start.elapsed() >= options.max_time {
+                        outcome.decision = TuneDecision::TimeBudget;
+                        break 'measure;
+                    }
+                    scratch.poison_outputs(&sizes, details);
+                    {
+                        let _timer = PhaseTimer::new(&mut details.dispatch);
+                        scratch.run(&sequences[variant], 1);
+                    }
+                    let output = scratch.read_output(details);
+                    // The incumbent output has already passed the reference,
+                    // finiteness and extent checks for this exact input pattern.
+                    let reference = (variant == 1).then_some(&baseline_outputs[pattern][..]);
+                    let f16_staged = class.key.weight_format.is_quantized()
+                        && (matches!(outcome.initial, MatmulTile::CooperativeWorkgroup { .. })
+                            || matches!(
+                                outcome.candidate,
+                                MatmulTile::CooperativeWorkgroup { .. }
+                            ));
+                    let valid = {
+                        let _timer = PhaseTimer::new(&mut details.validation);
+                        output_qualifies(
+                            class,
+                            &inputs,
+                            &output,
+                            reference,
+                            pattern as u32,
+                            f16_staged,
+                        )
+                    };
+                    if !valid {
+                        outcome.decision = TuneDecision::InvalidOutput;
+                        outcome.failure = Some(format!(
+                            "variant {variant}, {:?}, input pattern {pattern}: reference or cross-variant mismatch",
+                            [outcome.initial, outcome.candidate][variant]
+                        ));
+                        break 'measure;
+                    }
+                    if variant == 0 {
+                        baseline_outputs[pattern] = output;
+                        if pattern == 0 {
+                            baseline_complete = true;
+                        }
+                    } else {
+                        candidate_outputs[pattern] = output;
+                    }
+                }
+            }
+            outcome.qualified = true;
+            drop(qualification);
+            let warmup = PhaseTimer::new(&mut phases.warmup);
+            drop(inputs);
+            let mut warmup_ms = [f64::INFINITY; 2];
+            for _ in 0..options.warmup_runs {
+                for variant in 0..2 {
+                    if start.elapsed() >= options.max_time {
+                        outcome.decision = TuneDecision::TimeBudget;
+                        break 'measure;
+                    }
+                    let ms = scratch.run(&sequences[variant], 1);
+                    warmup_ms[variant] = warmup_ms[variant].min(ms);
+                }
+            }
+            drop(warmup);
+            let repetitions = options.sample_repetitions(warmup_ms);
+            outcome.sample_repetitions = Some(repetitions);
+            let sampling = PhaseTimer::new(&mut phases.sampling);
+            (outcome.baseline_ms, outcome.candidate_ms) =
+                measure_pairs(options.sample_pairs, |alternative| {
+                    if start.elapsed() >= options.max_time {
+                        return None;
+                    }
+                    let index = usize::from(alternative);
+                    let ms = scratch.run(&sequences[index], repetitions);
+                    // Do not accept a last pair that only finished after the deadline.
+                    (start.elapsed() < options.max_time).then_some(ms / repetitions as f64)
+                });
+            drop(sampling);
+            drop(scratch);
+            decide(outcome, options);
+        }
+        // Keep the exact scalar baseline output as the qualification reference
+        // across quantized F16-staged tiles so staging noise cannot compound
+        // from one winning tile to the next, and retain a valid incumbent
+        // baseline across rejected or timed-out challengers.
+        let keep_scalar_reference = class.key.weight_format.is_quantized()
+            && matches!(outcome.selected, MatmulTile::CooperativeWorkgroup { .. });
         if matches!(
             outcome.decision,
             TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
@@ -1575,11 +1672,18 @@ impl Session {
                 class: class.key.clone(),
                 tile: outcome.selected,
                 binding_bytes: sizes,
-                outputs: if outcome.selected == outcome.candidate {
+                outputs: if outcome.selected == outcome.candidate && !keep_scalar_reference {
                     candidate_outputs
                 } else {
                     baseline_outputs
                 },
+            });
+        } else if baseline_complete {
+            staging.baseline = Some(QualifiedBaseline {
+                class: class.key.clone(),
+                tile: outcome.initial,
+                binding_bytes: sizes,
+                outputs: baseline_outputs,
             });
         }
     }
@@ -1672,12 +1776,23 @@ fn class_inputs(
     sizes: &[usize],
     pattern: u32,
 ) {
+    let small_scale = if class.has_quantized_f16_tile() {
+        1.0 / 1024.0
+    } else {
+        1.0e-12
+    };
     if let Some(types) = class.key.effective_matrix_types() {
         *inputs = typed_inputs(&class.key, types, pattern, sizes);
     } else if inputs.is_empty() {
-        *inputs = prepared_inputs(logical_sizes, sizes, pattern, class.key.weight_format);
+        *inputs = prepared_inputs_with_scale(
+            logical_sizes,
+            sizes,
+            pattern,
+            class.key.weight_format,
+            small_scale,
+        );
     } else {
-        update_input_pattern(inputs, logical_sizes, pattern);
+        update_input_pattern_with_scale(inputs, logical_sizes, pattern, small_scale);
     }
 }
 
@@ -1685,27 +1800,35 @@ fn class_inputs(
 /// `reference` bit for bit, or it passes the reference checks and agrees with
 /// any `reference` within the class's bound.
 fn output_qualifies(
-    class: &TuneClass,
+    class: &SearchClass,
     inputs: &[Vec<f32>],
     output: &[f32],
     reference: Option<&[f32]>,
     pattern: u32,
+    f16_staged: bool,
 ) -> bool {
+    // Match `class_inputs`'s pattern-1 scale for the whole class (including
+    // scalar-vs-scalar pairs inside a class that also evaluates F16-staged
+    // quantized tiles), while keeping strict scalar tolerance for those pairs.
     let scale = if pattern == 0 {
         1.0
+    } else if class.has_quantized_f16_tile() {
+        1.0 / 1024.0
     } else {
-        small_pattern_scale(class)
+        small_pattern_scale(&class.key)
     };
     let identical = reference.is_some_and(|reference| {
         bytemuck::cast_slice::<f32, u8>(reference) == bytemuck::cast_slice::<f32, u8>(output)
     });
-    let agree = if class.split_k {
+    let agree = if f16_staged {
+        f16_staged_outputs_agree
+    } else if class.key.split_k {
         reordered_outputs_agree
     } else {
         outputs_agree
     };
     identical
-        || (qualify_output(class, inputs, output, scale)
+        || (qualify_output(&class.key, inputs, output, scale)
             && reference.is_none_or(|reference| agree(reference, output, scale)))
 }
 
@@ -2191,13 +2314,24 @@ impl Drop for Scratch<'_, '_> {
 /// Qualification and timing both go through here. They must see identical
 /// bytes: a candidate qualified on tamed block scales and then timed on wild
 /// ones was not measured on the workload it was checked against.
+#[cfg(test)]
 fn prepared_inputs(
     logical_sizes: &[usize],
     sizes: &[usize],
     pattern: u32,
     weight_format: crate::compile::WeightFormat,
 ) -> Vec<Vec<f32>> {
-    let mut inputs = test_inputs(logical_sizes, pattern);
+    prepared_inputs_with_scale(logical_sizes, sizes, pattern, weight_format, 1.0e-12)
+}
+
+fn prepared_inputs_with_scale(
+    logical_sizes: &[usize],
+    sizes: &[usize],
+    pattern: u32,
+    weight_format: crate::compile::WeightFormat,
+    small_scale: f32,
+) -> Vec<Vec<f32>> {
+    let mut inputs = test_inputs_with_scale(logical_sizes, pattern, small_scale);
     for (index, data) in inputs.iter_mut().enumerate() {
         data.resize(sizes[index] / 4, 0.0);
     }
@@ -2207,18 +2341,23 @@ fn prepared_inputs(
     inputs
 }
 
-fn pattern_scale(pattern: u32, operand: usize) -> f32 {
+fn pattern_scale(pattern: u32, operand: usize, small_scale: f32) -> f32 {
     if pattern == 1 && operand != 1 {
-        1.0e-12
+        small_scale
     } else {
         1.0
     }
 }
 
+#[cfg(test)]
 fn test_inputs(sizes: &[usize], pattern: u32) -> Vec<Vec<f32>> {
+    test_inputs_with_scale(sizes, pattern, 1.0e-12)
+}
+
+fn test_inputs_with_scale(sizes: &[usize], pattern: u32, small_scale: f32) -> Vec<Vec<f32>> {
     (0..sizes.len() - 1)
         .map(|operand| {
-            let scale = pattern_scale(pattern, operand);
+            let scale = pattern_scale(pattern, operand, small_scale);
             (0..sizes[operand] / 4)
                 .map(|index| test_input_value(index, operand) * scale)
                 .collect()
@@ -2311,12 +2450,22 @@ fn typed_inputs(
         .collect()
 }
 
+#[cfg(test)]
 fn update_input_pattern(inputs: &mut [Vec<f32>], logical_sizes: &[usize], pattern: u32) {
+    update_input_pattern_with_scale(inputs, logical_sizes, pattern, 1.0e-12);
+}
+
+fn update_input_pattern_with_scale(
+    inputs: &mut [Vec<f32>],
+    logical_sizes: &[usize],
+    pattern: u32,
+    small_scale: f32,
+) {
     for (operand, data) in inputs.iter_mut().enumerate() {
         if operand == 1 {
             continue;
         }
-        let scale = pattern_scale(pattern, operand);
+        let scale = pattern_scale(pattern, operand, small_scale);
         let elements = logical_sizes[operand] / 4;
         for (index, value) in data[..elements].iter_mut().enumerate() {
             *value = test_input_value(index, operand) * scale;
@@ -2336,6 +2485,31 @@ fn outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
             .iter()
             .zip(actual)
             .all(|(&a, &b)| close(a as f64, b, scale))
+}
+
+/// Agreement when comparing a quantized scalar F32 kernel against an F16-staged
+/// subgroup-tiled cooperative kernel. Rounding F32 activations to F16 introduces
+/// ~2^-11 relative noise per term, so both overall L2 error and per-element
+/// worst-case error are checked.
+fn f16_staged_outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
+    if reference.len() != actual.len() || actual.iter().any(|x| !x.is_finite()) {
+        return false;
+    }
+    let largest = reference
+        .iter()
+        .fold(0.0f64, |acc, &v| acc.max(f64::from(v).abs()));
+    let elem_tol = scale * 1.0e-3 + largest * 1.5e-2;
+    let mut diff_sq = 0.0f64;
+    let mut ref_sq = 0.0f64;
+    for (&a, &b) in reference.iter().zip(actual) {
+        let diff = (f64::from(a) - f64::from(b)).abs();
+        if diff > elem_tol {
+            return false;
+        }
+        diff_sq += diff * diff;
+        ref_sq += f64::from(a) * f64::from(a);
+    }
+    diff_sq.sqrt() <= scale * 1.0e-3 + ref_sq.sqrt() * 2.5e-3
 }
 
 /// Agreement between alternatives that add the same products in another

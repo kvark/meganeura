@@ -14,8 +14,9 @@ mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
 pub(crate) use workgroup::{
-    ConvProduct, conv_product_tile, conv_tile, conv_tile_for, generate_workgroup_matmul_for_device,
-    native_subgroup_shape,
+    ConvProduct, conv_product_tile, conv_tile, conv_tile_for, generate_subgroup_quantized_matmul,
+    generate_workgroup_matmul_for_device, has_quantized_matmul_shape, native_subgroup_shape,
+    quantized_matmul_shapes_for_subgroup,
 };
 pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 

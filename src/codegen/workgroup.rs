@@ -334,6 +334,47 @@ impl WorkgroupMatmulShape {
         !m.is_multiple_of(self.rows)
     }
 
+    /// Whether this subgroup-tiled shape can execute a block-quantized forward
+    /// matmul (`MatMul` / `FusedMatMulAdd`) on `caps`.
+    ///
+    /// Quantized weights are column-major blocked along K (`k` is always a
+    /// multiple of the block size ≥ 32, hence of 4) and decoded on the fly
+    /// during shared-memory staging, so both `m` and `n` may be ragged.
+    pub(crate) fn supports_quantized(
+        self,
+        caps: &blade_graphics::Capabilities,
+        m: u32,
+        n: u32,
+        k: u32,
+        has_epilogue: bool,
+    ) -> bool {
+        if self.subgroup_rows == 0 || self.stage_operands {
+            return false;
+        }
+        let Some((native, subgroup)) = native_subgroup_shape(caps, DType::F16) else {
+            return false;
+        };
+        let types = MatrixTypes::F32_AS_F16;
+        let needs_scratch = self.ragged_rows(m) || !n.is_multiple_of(self.columns) || has_epilogue;
+        m != 0
+            && n != 0
+            && k != 0
+            && k.is_multiple_of(4)
+            && caps.shader_float16
+            && self.subgroup_grid_for(native, subgroup).is_some()
+            && matches!(self.k_stage, 16 | 32 | 64)
+            && self.k_stage.is_multiple_of(native[2])
+            && self.threads <= 256
+            && crate::compile::workgroups_within_portable_limits([
+                m.div_ceil(self.rows),
+                n.div_ceil(self.columns),
+                1,
+            ])
+            && self
+                .subgroup_shared_bytes_for(types, native, subgroup, needs_scratch)
+                .is_some_and(|bytes| bytes <= caps.max_compute_shared_memory_size)
+    }
+
     fn stages(self, storage: DType, multiply: DType) -> bool {
         self.stage_operands || storage != multiply
     }
@@ -612,6 +653,263 @@ fn conv_split_images(split: bool, batch: u32) -> Images {
             batch: None,
         }
     }
+}
+
+/// Candidate 2×2-subgroup (4-subgroup, ≤ 256-thread) F16 cooperative tiles for
+/// a block-quantized forward prefill matmul `A[m, k] · B[k, n]`.
+///
+/// Each shape uses `k_stage = 32` so every K stage covers one whole 32-element
+/// block (or K-quant sub-block) per column. Admitted as tuner candidates under
+/// explicit `CoopPolicy::AllowF16` so measurement decides whether a shape beats
+/// scalar dequantization on the active GPU.
+pub(crate) fn quantized_matmul_shapes_for_subgroup(subgroup: u32) -> [WorkgroupMatmulShape; 4] {
+    [(64, 64), (64, 32), (32, 64), (32, 32)].map(|(rows, columns)| WorkgroupMatmulShape {
+        rows,
+        columns,
+        k_stage: 32,
+        threads: 4 * subgroup,
+        stage_operands: false,
+        subgroup_rows: 2,
+        prefetch: false,
+    })
+}
+
+/// Whether at least one candidate tile from
+/// [`quantized_matmul_shapes_for_subgroup`] is supported on `caps` for
+/// `A[m, k] · B[k, n]`.
+pub(crate) fn has_quantized_matmul_shape(
+    caps: &blade_graphics::Capabilities,
+    m: u32,
+    n: u32,
+    k: u32,
+    has_epilogue: bool,
+) -> bool {
+    let Some((_, subgroup)) = native_subgroup_shape(caps, DType::F16) else {
+        return false;
+    };
+    quantized_matmul_shapes_for_subgroup(subgroup)
+        .into_iter()
+        .any(|s| s.supports_quantized(caps, m, n, k, has_epilogue))
+}
+
+/// Subgroup-tiled cooperative F16 GEMM for block-quantized weights (`Q4`,
+/// `Q8`, `Q40`, `Q4K`, `Q5K`, `Q6K`, `Q3K`) with F32 accumulation.
+///
+/// Activations `A[m, k]` stage directly as `vec4<f32> -> vec4<f16>` while each
+/// column of quantized weights `B[k, n]` dequantizes four consecutive 4-aligned
+/// K elements at once (`gather_b4`) into `sb: array<vec4<f16>>`, sharing block
+/// headers and scale/min decodes across all four lanes before tensor-core MMA.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_subgroup_quantized_matmul(
+    group: ShaderGroup,
+    format: crate::compile::WeightFormat,
+    shape: WorkgroupMatmulShape,
+    native: [u32; 3],
+    subgroup: u32,
+    row_bounds: bool,
+    column_bounds: bool,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
+) -> ShaderModule {
+    use crate::compile::WeightFormat;
+    assert!(
+        format.is_quantized(),
+        "expected quantized weight format, got {format:?}"
+    );
+    let addend = match group {
+        ShaderGroup::MatMul => false,
+        ShaderGroup::MatMulAdd => true,
+        _ => panic!("quantized subgroup matmul only supports MatMul and MatMulAdd, got {group:?}"),
+    };
+    let mut header = String::from(
+        "struct Params { m: u32, n: u32, k: u32, splits: u32 }\nvar<uniform> params: Params;\n\
+         var<storage> matrix_a: array<vec4<f32>>;\n\
+         var<storage> matrix_b: array<u32>;\n\
+         var<storage, read_write> matrix_c: array<f32>;\n",
+    );
+    if addend {
+        header += "var<storage> src: array<f32>;\n";
+    }
+    header += super::F16_DECODE_FN;
+    header.push('\n');
+    let gather_b4 = match format {
+        WeightFormat::Q4 => {
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let blocks_per_col = params.k / 32u;
+    let num_blocks = blocks_per_col * params.n;
+    let block = n_idx * blocks_per_col + k0 / 32u;
+    let dm = decode_f16_pair(matrix_b[block]);
+    let in_block = k0 % 32u;
+    let w = matrix_b[num_blocks + block * 4u + in_block / 8u] >> ((in_block % 8u) * 4u);
+    let q = vec4<f32>(
+        f32(w & 0xFu),
+        f32((w >> 4u) & 0xFu),
+        f32((w >> 8u) & 0xFu),
+        f32((w >> 12u) & 0xFu),
+    );
+    return q * dm.x + vec4<f32>(dm.y);
+}
+"
+        }
+        WeightFormat::Q8 => {
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let block = n_idx * (params.k / 32u) + k0 / 32u;
+    let block_base = block * 9u;
+    let scale = decode_f16(matrix_b[block_base] & 0xFFFFu);
+    let w = matrix_b[block_base + 1u + (k0 % 32u) / 4u];
+    let b0 = w & 0xFFu;
+    let b1 = (w >> 8u) & 0xFFu;
+    let b2 = (w >> 16u) & 0xFFu;
+    let b3 = (w >> 24u) & 0xFFu;
+    return vec4<f32>(
+        f32(i32(b0) - select(0, 256, b0 >= 128u)),
+        f32(i32(b1) - select(0, 256, b1 >= 128u)),
+        f32(i32(b2) - select(0, 256, b2 >= 128u)),
+        f32(i32(b3) - select(0, 256, b3 >= 128u)),
+    ) * scale;
+}
+"
+        }
+        WeightFormat::Q40 => {
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let byte_base = (n_idx * (params.k / 32u) + k0 / 32u) * 18u;
+    let d = decode_f16(matrix_b[byte_base / 4u] >> ((byte_base % 4u) * 8u));
+    let e = k0 % 32u;
+    let at = byte_base + 2u + (e % 16u);
+    let idx = at / 4u;
+    var w: u32;
+    if (at & 2u) == 0u {
+        w = matrix_b[idx];
+    } else {
+        w = (matrix_b[idx] >> 16u) | (matrix_b[idx + 1u] << 16u);
+    }
+    let shift = select(0u, 4u, e >= 16u);
+    return vec4<f32>(
+        f32(i32((w >> shift) & 0xFu) - 8),
+        f32(i32((w >> (8u + shift)) & 0xFu) - 8),
+        f32(i32((w >> (16u + shift)) & 0xFu) - 8),
+        f32(i32((w >> (24u + shift)) & 0xFu) - 8),
+    ) * d;
+}
+"
+        }
+        WeightFormat::Q4K => {
+            header += super::K_SCALE_MIN_FN;
+            header.push('\n');
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let base = (n_idx * (params.k / 256u) + k0 / 256u) * 36u;
+    let hdr = decode_f16_pair(matrix_b[base]);
+    let e = k0 % 256u;
+    let sm = kq_scale_min(base, e / 32u);
+    let scale = hdr.x * sm.x;
+    let offset = hdr.y * sm.y;
+    let w = matrix_b[base + (16u + (e / 64u) * 32u + (e % 32u)) / 4u];
+    let shift = select(4u, 0u, (e % 64u) < 32u);
+    let q = vec4<f32>(
+        f32((w >> shift) & 0xFu),
+        f32((w >> (8u + shift)) & 0xFu),
+        f32((w >> (16u + shift)) & 0xFu),
+        f32((w >> (24u + shift)) & 0xFu),
+    );
+    return q * scale - vec4<f32>(offset);
+}
+"
+        }
+        WeightFormat::Q5K => {
+            header += super::K_SCALE_MIN_FN;
+            header.push('\n');
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let base = (n_idx * (params.k / 256u) + k0 / 256u) * 44u;
+    let hdr = decode_f16_pair(matrix_b[base]);
+    let e = k0 % 256u;
+    let sm = kq_scale_min(base, e / 32u);
+    let scale = hdr.x * sm.x;
+    let offset = hdr.y * sm.y;
+    let l = e % 32u;
+    let qs = matrix_b[base + (48u + (e / 64u) * 32u + l) / 4u];
+    let qh = matrix_b[base + (16u + l) / 4u];
+    let shift = select(4u, 0u, (e % 64u) < 32u);
+    let hi_shift = e / 32u;
+    var q = vec4<f32>(0.0);
+    for (var i = 0u; i < 4u; i++) {
+        let nib = (qs >> (i * 8u + shift)) & 0xFu;
+        let hi = ((qh >> (i * 8u + hi_shift)) & 1u) << 4u;
+        q[i] = f32(nib + hi);
+    }
+    return q * scale - vec4<f32>(offset);
+}
+"
+        }
+        WeightFormat::Q6K => {
+            header += super::Q6K_DEQUANT_FN;
+            header.push('\n');
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let byte_base = (n_idx * (params.k / 256u) + k0 / 256u) * 210u;
+    let e = k0 % 256u;
+    let scale = q6k_d(byte_base) * q6k_scale(byte_base, q6k_scale_index(e));
+    return vec4<f32>(
+        f32(q6k_quant(byte_base, e)),
+        f32(q6k_quant(byte_base, e + 1u)),
+        f32(q6k_quant(byte_base, e + 2u)),
+        f32(q6k_quant(byte_base, e + 3u)),
+    ) * scale;
+}
+"
+        }
+        WeightFormat::Q3K => {
+            header += super::Q3K_DEQUANT_FN;
+            header.push('\n');
+            "fn gather_b4(_img: u32, n_idx: u32, k0: u32, end: u32) -> vec4<f32> {
+    if n_idx >= params.n || k0 >= end { return vec4<f32>(0.0); }
+    let byte_base = (n_idx * (params.k / 256u) + k0 / 256u) * 110u;
+    let e = k0 % 256u;
+    let scale = q3k_d(byte_base) * q3k_scale(byte_base, e / 16u);
+    return vec4<f32>(
+        f32(q3k_quant(byte_base, e)),
+        f32(q3k_quant(byte_base, e + 1u)),
+        f32(q3k_quant(byte_base, e + 2u)),
+        f32(q3k_quant(byte_base, e + 3u)),
+    ) * scale;
+}
+"
+        }
+        WeightFormat::F32 | WeightFormat::F16 => unreachable!(),
+    };
+    header += gather_b4;
+    subgroup_kernel(
+        shape,
+        MatrixTypes::F32_AS_F16,
+        native,
+        subgroup,
+        &SubgroupLayout {
+            // Quantized B is column-major along K: staging each column as a
+            // contiguous K row matches `MatMulCoopVariant::BT`'s `sb` layout.
+            variant: MatMulCoopVariant::BT,
+            header,
+            dimensions: "let m = params.m;\nlet n = params.n;\nlet k = params.k;".into(),
+            a: "matrix_a",
+            b: "matrix_b",
+            c: "matrix_c",
+            addend: addend.then_some("src"),
+            epilogue,
+            images: None,
+            row_bounds,
+            column_bounds,
+            gather: [
+                None,
+                Some(Gather {
+                    name: "gather_b",
+                    vector: true,
+                }),
+            ],
+            scatter: None,
+        },
+    )
 }
 
 /// Subgroup-tiled NN/AT/BT products: `threads / subgroup` subgroups in a
@@ -2007,11 +2305,20 @@ let wcol = (sg % {wc}u) * {}u;",
                     ("b", _, true) => format!("col + {line}"),
                     _ => panic!("gathers take K-contiguous operands"),
                 };
+                let img = if layout.images.is_some() {
+                    "image"
+                } else {
+                    "0u"
+                };
                 loaded = if vector {
-                    format!("{f}4(image, {r}, T + {column}, end)")
+                    format!("{f}4({img}, {r}, T + {column}, end)")
                 } else {
                     let parts: Vec<String> = (0..4)
-                        .map(|e| format!("select(0.0, {f}(image, {r}, T + {column} + {e}u), T + {column} + {e}u < end)"))
+                        .map(|e| {
+                            format!(
+                                "select(0.0, {f}({img}, {r}, T + {column} + {e}u), T + {column} + {e}u < end)"
+                            )
+                        })
                         .collect();
                     format!("vec4<f32>({})", parts.join(", "))
                 };
@@ -2599,6 +2906,88 @@ mod tests {
                             (1, 6),
                         )
                         .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Quantized subgroup-tiled cooperative GEMM validates to SPIR-V for every
+    /// packed format, plain & fused-add groups, ragged M/N bounds, unary
+    /// epilogues, and all supported `(native, subgroup)` targets.
+    #[test]
+    fn subgroup_quantized_matmuls_validate_all_formats() {
+        use crate::compile::WeightFormat;
+        let capabilities = naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        let relu = crate::compile::MatMulEpilogue {
+            dag: crate::schedule::PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![
+                    crate::schedule::Pw::LoadInput(0),
+                    crate::schedule::Pw::Relu(0),
+                ],
+                output: 1,
+            },
+            inputs: Vec::new(),
+        };
+        let formats = [
+            WeightFormat::Q4,
+            WeightFormat::Q8,
+            WeightFormat::Q40,
+            WeightFormat::Q4K,
+            WeightFormat::Q5K,
+            WeightFormat::Q6K,
+            WeightFormat::Q3K,
+        ];
+        let targets = [
+            ([16, 16, 16], 32u32),
+            ([16, 16, 16], 64),
+            ([8, 16, 16], 16),
+            ([8, 8, 8], 32),
+        ];
+        for (idx, &format) in formats.iter().enumerate() {
+            let (native, subgroup) = targets[idx % targets.len()];
+            let shape = WorkgroupMatmulShape {
+                rows: if idx % 2 == 0 { 64 } else { 32 },
+                columns: if idx % 3 == 0 { 64 } else { 32 },
+                k_stage: 32,
+                threads: 4 * subgroup,
+                stage_operands: false,
+                subgroup_rows: 2,
+                prefetch: false,
+            };
+            for group in [ShaderGroup::MatMul, ShaderGroup::MatMulAdd] {
+                for row_bounds in [false, true] {
+                    for column_bounds in [false, true] {
+                        let epilogue = (group == ShaderGroup::MatMul
+                            && row_bounds
+                            && column_bounds
+                            && idx % 2 == 0)
+                            .then_some(&relu);
+                        let mut module = generate_subgroup_quantized_matmul(
+                            group,
+                            format,
+                            shape,
+                            native,
+                            subgroup,
+                            row_bounds,
+                            column_bounds,
+                            epilogue,
+                        );
+                        super::super::validate_shader_for_test(
+                            &mut module.module,
+                            capabilities,
+                            (1, 6),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{format:?} {group:?} {native:?}/{subgroup} {shape:?} \
+                                 row_bounds={row_bounds} col_bounds={column_bounds}: {error}"
+                            )
+                        });
                     }
                 }
             }

@@ -165,7 +165,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | Variable | Effect |
 |---|---|
 | `MEGANEURA_DISABLE_COOP` | Force the portable scalar matmul path (regression diagnosis). |
-| `MEGANEURA_COOP_F16` | Allow f16-input cooperative tiles even for precision-sensitive derivative work; requires numerical validation. Default `Auto` protects derivatives and can already use f16 tiles for forward work. |
+| `MEGANEURA_COOP_F16` | Allow f16-input cooperative tiles for derivative work, and admit F16-staged subgroup-tiled cooperative candidates for block-quantized prefill matmuls during kernel tuning (`MEGANEURA_TUNE=1`; F16 activation staging can overflow for `\|x\| > 65504`). Default `Auto` protects derivatives and keeps block-quantized products on exact-F32 scalar paths. |
 | `MEGANEURA_FLASH_FWD_COOP=0` | Disable only cooperative flash-attention forward. |
 | `MEGANEURA_FLASH_BWD_COOP` | Enable the experimental reduced-precision flash backward. |
 | `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |

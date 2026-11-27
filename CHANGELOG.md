@@ -1,5 +1,14 @@
 # Unreleased
 
+- Subgroup-tiled cooperative F16 GEMM is now a kernel-tuning candidate
+  (`Session::tune_with` / `MEGANEURA_TUNE=1`) for batched block-quantized
+  prefill products (`Q4`, `Q8`, `Q40`, `Q4K`, `Q5K`, `Q6K`, `Q3K`) under
+  explicit `CoopPolicy::AllowF16` (`MEGANEURA_COOP_F16=1`), staging
+  activations as F16 (values with `|x| > 65504` overflow; untuned sessions and
+  default `Auto` stay on exact-F32 scalar paths). `Session::swap_tuning_with`
+  requires matching quantized cooperative policy when quantized prefill
+  candidates are enabled.
+
 - Occupancy thresholds (`SCALAR_OCCUPIED`, `MIN_F16_COOP_WORKGROUPS`,
   `MIN_F32_COOP_WORKGROUPS`, `MIN_GRAD_INPUT_WORKGROUPS`,
   `SMALL_TILE_BELOW_WORKGROUPS`), device-scaled workgroup targets, widest-tile

@@ -532,7 +532,11 @@ impl MatmulTile {
             Self::CooperativeWorkgroup { shape, splits } => {
                 return [
                     class.m.div_ceil(shape.rows),
-                    class.n / shape.columns,
+                    if class.weight_format.is_quantized() {
+                        class.n.div_ceil(shape.columns)
+                    } else {
+                        class.n / shape.columns
+                    },
                     splits,
                 ];
             }
@@ -568,6 +572,33 @@ impl MatmulTile {
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
         if let Self::CooperativeWorkgroup { shape, splits } = self {
+            if class.weight_format.is_quantized() {
+                if class.requires_full_precision
+                    || class.conv2d.is_some()
+                    || !matches!(
+                        class.shader,
+                        ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd
+                    )
+                    || class.m < 16
+                    || class.n < 16
+                    || !class.k.is_multiple_of(4)
+                    || splits != 1
+                    || class.split_k
+                    || shape.subgroup_rows != 2
+                    || shape.k_stage != 32
+                    || shape.stage_operands
+                    || shape.prefetch
+                    || !matches!(
+                        (shape.rows, shape.columns),
+                        (64, 64) | (64, 32) | (32, 64) | (32, 32)
+                    )
+                {
+                    return None;
+                }
+                let sizes = class.buffer_sizes()?;
+                return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
+                    .then_some(sizes);
+            }
             let types = class.effective_matrix_types()?;
             if !matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
                 || class.conv2d.is_some()
@@ -761,7 +792,13 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemm
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
-        ) || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
+        ) || (dispatch.use_coop()
+            && dispatch.weight_format.uses_reduced_storage()
+            && !matches!(
+                dispatch.kernel,
+                crate::compile::Kernel::CooperativeWorkgroup { types: None, .. }
+                    if dispatch.weight_format.is_quantized()
+            ))
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch
@@ -874,11 +911,12 @@ impl TuneClass {
                 .unwrap_or(0),
             split_k: partitions > 1,
             matrix_types,
-            cooperative_f16: matches!(
-                dispatch.kernel,
-                crate::compile::Kernel::CooperativeWorkgroup { types: None, .. }
-            ) || (dispatch.kernel == crate::compile::Kernel::Cooperative
-                && config.is_some_and(|c| c.use_f16_input)),
+            cooperative_f16: !dispatch.weight_format.is_quantized()
+                && (matches!(
+                    dispatch.kernel,
+                    crate::compile::Kernel::CooperativeWorkgroup { types: None, .. }
+                ) || (dispatch.kernel == crate::compile::Kernel::Cooperative
+                    && config.is_some_and(|c| c.use_f16_input))),
             epilogue: dispatch.matmul_epilogue.as_ref().map(|epi| epi.dag.clone()),
             device_local: [false; 4],
             binding_bytes: Vec::new(),
@@ -1023,7 +1061,7 @@ impl TuneClass {
         config: Option<&CoopConfig>,
         native_shapes: &[[u32; 3]],
     ) -> Vec<MatmulTile> {
-        self.challengers_for_device(initial, config, native_shapes, 32)
+        self.challengers_for_device(initial, config, native_shapes, 32, false)
     }
 
     pub(crate) fn challengers_for_device(
@@ -1032,6 +1070,7 @@ impl TuneClass {
         config: Option<&CoopConfig>,
         native_shapes: &[[u32; 3]],
         subgroup_size: u32,
+        quantized_coop_f16: bool,
     ) -> Vec<MatmulTile> {
         if let MatmulTile::Gemv(shape) = initial {
             use crate::codegen::{GemvReduction, GemvShape};
@@ -1193,6 +1232,23 @@ impl TuneClass {
         .into_iter()
         .flatten()
         .collect();
+        if self.weight_format.is_quantized()
+            && quantized_coop_f16
+            && !self.requires_full_precision
+            && matches!(
+                self.shader,
+                ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd
+            )
+            && self.m >= 16
+            && self.n >= 16
+            && matches!(subgroup_size, 16 | 32 | 64)
+        {
+            candidates.extend(
+                crate::codegen::quantized_matmul_shapes_for_subgroup(subgroup_size)
+                    .into_iter()
+                    .map(|shape| MatmulTile::CooperativeWorkgroup { shape, splits: 1 }),
+            );
+        }
         if !self.weight_format.is_quantized() && self.epilogue.is_none() {
             candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
             if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input) {
@@ -2887,6 +2943,7 @@ mod tests {
             Some(&f16),
             &[[16, 16, 16]],
             32,
+            false,
         );
         assert!(coop_challengers.iter().any(|t| matches!(
             t,
