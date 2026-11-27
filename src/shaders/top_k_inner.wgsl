@@ -8,12 +8,16 @@
 // lowest first, which an exclusive scan of the per-chunk counts orders. The
 // selection is sorted by (key descending, column ascending) with a bitonic
 // network in workgroup memory, padded to a power of two.
+//
+// Short rows take the narrow mode (`narrow != 0`) instead: one thread per
+// row, each pick the best entry that comes after the previous pick in
+// result order, k scans of the row with no shared state.
 
 struct Params {
     rows: u32,
     cols: u32,
     k: u32,
-    _pad: u32,
+    narrow: u32,
 }
 
 var<storage> src: array<f32>;
@@ -50,11 +54,40 @@ fn first(key_a: u32, column_a: u32, key_b: u32, column_b: u32) -> bool {
     return key_a > key_b || (key_a == key_b && column_a < column_b);
 }
 
+// The best entry of a short row that comes after (prev_key, prev_column)
+// in result order, scanning every column. Picks are strictly ordered, so
+// nothing needs marking as taken.
+fn pick_after(base: u32, cols: u32, first_pick: bool, prev_key: u32, prev_column: u32) -> vec2<u32> {
+    var best_key = 0u;
+    var best_column = 0xffffffffu;
+    for (var c = 0u; c < cols; c++) {
+        let key = sort_key(src[base + c]);
+        let after = first_pick || first(prev_key, prev_column, key, c);
+        if after && (best_column == 0xffffffffu || first(key, c, best_key, best_column)) {
+            best_key = key;
+            best_column = c;
+        }
+    }
+    return vec2<u32>(best_key, best_column);
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-    let row = wid.x;
     let cols = params.cols;
     let k = params.k;
+    // Uniform across the dispatch, so the barriers below stay uniform.
+    if params.narrow != 0u {
+        let row = wid.x * THREADS + t;
+        if row < params.rows {
+            var pick = vec2<u32>(0u, 0u);
+            for (var i = 0u; i < k; i++) {
+                pick = pick_after(row * cols, cols, i == 0u, pick.x, pick.y);
+                dst[row * k + i] = f32(pick.y);
+            }
+        }
+        return;
+    }
+    let row = wid.x;
     let base = row * cols;
 
     if t == 0u {

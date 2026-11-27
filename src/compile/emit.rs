@@ -4,6 +4,10 @@ use super::*;
 use crate::kernels::attention_grad::{self, AttentionGrad, Part};
 use crate::kernels::conv;
 
+/// Reads per row (`k × columns`) up to which [`Op::TopKInner`] gives each
+/// row a thread of its own instead of a workgroup.
+const TOP_K_NARROW_WORK: u32 = 8192;
+
 fn scalar_flash_attention(shader: &ShaderEntry) -> bool {
     match *shader {
         ShaderEntry::FlashAttention => true,
@@ -1518,14 +1522,19 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let (rows, cols) = (in_shape[0] as u32, in_shape[1] as u32);
-                // One workgroup per row; see shaders/top_k_inner.wgsl.
+                // A short row is a thread's k scans; a long one a
+                // workgroup's select and sort (shaders/top_k_inner.wgsl).
+                // D-FINE-N's 4 of 33 over 1,200 rows took 6 ms on Adreno 740
+                // with a workgroup per row.
+                let narrow = k * cols <= TOP_K_NARROW_WORK;
+                let workgroups = if narrow { rows.div_ceil(256) } else { rows };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::TopKInner,
-                    workgroups: [rows, 1, 1],
+                    workgroups: [workgroups, 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![rows, cols, k, 0],
+                    params: vec![rows, cols, k, u32::from(narrow)],
                     ..Default::default()
                 });
             }

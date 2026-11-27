@@ -642,9 +642,10 @@ fn argmax_inner() {
     }
 }
 
-/// One workgroup per row selects and sorts: tied rows keep columns in
-/// order, signed zeros tie, k ranges from one to the whole row, and the
-/// widest case is D-FINE's 300 of 24,000 scores.
+/// Short rows take a thread each, long ones a workgroup that selects and
+/// sorts: tied rows keep columns in order, signed zeros tie, k ranges from
+/// one to the whole row, and D-FINE's 4 of 33 over 1,200 rows and 300 of
+/// 24,000 scores are both here.
 #[test]
 fn top_k_inner() {
     for (rows, cols, k) in [
@@ -652,6 +653,7 @@ fn top_k_inner() {
         (8, 3, 3),
         (9, 5, 2),
         (12, 32, 7),
+        (1200, 33, 4),
         (8, 300, 300),
         (3, 1500, 1024),
         (1, 24_000, 300),
