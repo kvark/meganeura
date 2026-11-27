@@ -253,9 +253,12 @@ pub(crate) struct Problem {
     pub kind: Kind,
     /// The 64-wide entry, the one with a cooperative form.
     pub wide: bool,
-    /// Still on the kernel the compiler emitted (or the register one), so
-    /// no measurement has fixed it.
+    /// Still on the kernel the compiler emitted (or a register one), so no
+    /// measurement has fixed it.
     pub compiled: bool,
+    /// A 1×1 convolution that keeps its extent, with vec4-aligned input
+    /// channels and pixels: a product per image ([`Params::vectorized_forward`]).
+    pub vectorized: bool,
     pub m: u32,
     pub n: u32,
     pub k: u32,
@@ -297,7 +300,11 @@ impl Problem {
                 ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
             ),
             compiled: dispatch.kernel == exact_kernel()
-                || matches!(dispatch.kernel, Kernel::RegisterConv(_)),
+                || matches!(
+                    dispatch.kernel,
+                    Kernel::RegisterConv(_) | Kernel::RegisterMatmul(_)
+                ),
+            vectorized: kind == Kind::Forward && Params::from(dispatch).vectorized_forward(),
             m,
             n,
             k,
@@ -338,6 +345,8 @@ pub(crate) struct Target {
 pub(crate) enum Path {
     /// A generated cooperative-matrix kernel for the window.
     Cooperative,
+    /// A small 1×1 convolution as the register product kernel, weight as A.
+    Product,
     /// The direct register-blocked forward kernel, [`register_block`].
     Register,
     /// The scalar kernel the compiler emitted. The fallback.
@@ -347,11 +356,17 @@ pub(crate) enum Path {
 impl Family for Path {
     type Problem = Problem;
     type Target = Target;
-    const PREFERENCE: &'static [Self] = &[Path::Cooperative, Path::Register, Path::Compiled];
+    const PREFERENCE: &'static [Self] = &[
+        Path::Cooperative,
+        Path::Product,
+        Path::Register,
+        Path::Compiled,
+    ];
 
     fn tile(self, problem: &Problem, target: &Target) -> Option<[u32; 2]> {
         Some(match self {
             Path::Cooperative => [target.cooperative?.output_tile(); 2],
+            Path::Product => [4, 4],
             Path::Register => {
                 let block = problem.register_block();
                 [block.channels, block.pixels * block.threads]
@@ -364,6 +379,7 @@ impl Family for Path {
         match self {
             Path::Compiled => return Ok(()),
             Path::Register => return register_admits(problem, target),
+            Path::Product => return product_admits(problem, target).map(|_| ()),
             Path::Cooperative => {}
         }
         if !problem.wide {
@@ -425,6 +441,34 @@ fn register_admits(problem: &Problem, target: &Target) -> Result<(), Rejection> 
     } else {
         Ok(())
     }
+}
+
+/// A 1×1 convolution that keeps its extent is a product per image. On
+/// small images the register product kernel, which reads both operands as
+/// vec4 and spreads threads over rows too, beats the direct kernel:
+/// D-FINE-N's 1×1 convolutions at 15×20 ran 1.5–1.7× faster on Adreno 740.
+/// From 30×40 up the direct kernel won, by up to 2.8× at 60×80.
+pub(crate) fn product_admits(
+    problem: &Problem,
+    target: &Target,
+) -> Result<crate::kernels::matmul::RegisterTile, Rejection> {
+    register_admits(problem, target)?;
+    if !problem.vectorized {
+        return Err("not a vec4-aligned 1x1 convolution");
+    }
+    if problem.n.saturating_mul(problem.batch) >= FEW_PIXELS {
+        return Err("the direct kernel is faster on this many pixels");
+    }
+    let product = crate::kernels::matmul::Target {
+        cooperative: target.cooperative,
+        allow_raw_f16: false,
+        prefer: None,
+    };
+    crate::kernels::matmul::register_admits_product(
+        [problem.m, problem.n, problem.k],
+        problem.batch,
+        &product,
+    )
 }
 
 impl Problem {
@@ -541,6 +585,7 @@ mod tests {
             kind,
             wide: true,
             compiled: true,
+            vectorized: false,
             m,
             n,
             k,
@@ -581,6 +626,46 @@ mod tests {
         assert_eq!(Path::Compiled.admits(&p, &target(F16)), Ok(()));
         let grad = problem(Kind::GradInput, 64, 3136, 576);
         assert_eq!(select(&grad, &bare), Path::Compiled);
+    }
+
+    #[test]
+    fn small_aligned_1x1_convolutions_take_the_product() {
+        let bare = Target {
+            cooperative: None,
+            allow_raw_f16: false,
+        };
+        // D-FINE-N's 896 -> 512 at 15×20.
+        let small = Problem {
+            vectorized: true,
+            window: [1, 1, 1],
+            ..problem(Kind::Forward, 512, 300, 896)
+        };
+        assert_eq!(select(&small, &bare), Path::Product);
+        for (p, reason) in [
+            (
+                Problem {
+                    vectorized: false,
+                    ..small
+                },
+                "not a vec4-aligned 1x1 convolution",
+            ),
+            (
+                Problem { n: 1200, ..small },
+                "the direct kernel is faster on this many pixels",
+            ),
+            (
+                Problem {
+                    m: 4,
+                    n: 16,
+                    ..small
+                },
+                "too few workgroups; split K instead",
+            ),
+        ] {
+            assert_eq!(Path::Product.admits(&p, &bare), Err(reason));
+        }
+        // Declined products fall to the direct kernel.
+        assert_eq!(select(&Problem { n: 1200, ..small }, &bare), Path::Register);
     }
 
     #[test]
