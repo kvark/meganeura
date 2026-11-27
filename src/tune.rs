@@ -94,20 +94,6 @@ pub struct TuneConv2d {
 }
 
 impl TuneConv2d {
-    /// A 1×1 forward convolution that keeps its extent with vec4-aligned
-    /// channels and pixels: a product per image.
-    fn vectorized_forward(&self) -> bool {
-        self.kernel_h == 1
-            && self.kernel_w == 1
-            && self.stride == 1
-            && self.padding_h == 0
-            && self.padding_w == 0
-            && self.in_h == self.out_h
-            && self.in_w == self.out_w
-            && self.in_channels.is_multiple_of(4)
-            && self.out_h.saturating_mul(self.out_w).is_multiple_of(4)
-    }
-
     fn from_params(params: &[u32]) -> Option<Self> {
         let &[
             batch,
@@ -769,7 +755,7 @@ impl MatmulTile {
         }
         if let Self::Register(tile) = self
             && (!(class.shader == ShaderEntry::MatMul && class.conv2d.is_none()
-                || class.conv2d.is_some_and(|c| c.vectorized_forward()))
+                || class.conv_product())
                 || class.weight_format != crate::compile::WeightFormat::F32
                 || class.epilogue.is_some()
                 || crate::kernels::matmul::register_tile(class.m, class.n, class.k).is_none()
@@ -857,6 +843,29 @@ impl TuneClass {
             self.cooperative_f16
                 .then_some(crate::codegen::MatrixTypes::F32_AS_F16)
         })
+    }
+
+    /// A forward 1×1 convolution that keeps its extent, with vec4-aligned
+    /// channels and pixels: a product per image, which the register product
+    /// kernel computes with the weight as A (`conv::Path::Product`). The
+    /// derivatives of such a convolution bind other buffers in another
+    /// orientation, so they are not.
+    fn conv_product(&self) -> bool {
+        is_forward_conv(&self.shader)
+            && self.conv2d.is_some_and(|c| {
+                c.kernel_h == 1
+                    && c.kernel_w == 1
+                    && c.stride == 1
+                    && c.padding_h == 0
+                    && c.padding_w == 0
+                    && c.in_h == c.out_h
+                    && c.in_w == c.out_w
+                    && c.in_channels != 0
+                    && c.in_channels.is_multiple_of(4)
+                    && c.out_h
+                        .checked_mul(c.out_w)
+                        .is_some_and(|n| n != 0 && n.is_multiple_of(4))
+            })
     }
 
     pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
@@ -1224,7 +1233,7 @@ impl TuneClass {
                 }
             }
             // A small 1×1 convolution is also a register product.
-            if self.conv2d.is_some_and(|c| c.vectorized_forward()) {
+            if self.conv_product() {
                 for rows in [2, 4, 8] {
                     for threads in [32, 64] {
                         out.push(MatmulTile::Register(crate::kernels::matmul::RegisterTile {
@@ -2565,6 +2574,42 @@ mod tests {
             let shape = swapped_kernel.conv2d.as_mut().unwrap();
             std::mem::swap(&mut shape.kernel_h, &mut shape.kernel_w);
             assert_ne!(swapped_kernel, class); // same GEMM shape is insufficient
+        }
+    }
+
+    #[test]
+    fn only_forward_1x1_convolutions_challenge_register_products() {
+        let register = MatmulTile::Register(crate::kernels::matmul::RegisterTile {
+            rows: 4,
+            threads: 64,
+        });
+        for shader in [
+            ShaderEntry::Conv2dGemm,
+            ShaderEntry::Conv2dGradInputGemm,
+            ShaderEntry::Conv2dGradWeightGemm,
+        ] {
+            let mut d = conv_dispatch(shader.clone());
+            // Two images, 8 -> 16 channels, 1×1 over 4×6.
+            d.params = vec![2, 8, 4, 6, 16, 1, 1, 1, 0, 4, 6, 0];
+            d.workgroups = match shader {
+                ShaderEntry::Conv2dGradWeightGemm => [1, 1, 1],
+                _ => [1, 1, 2],
+            };
+            let mut class = TuneClass::from_dispatch(&d, None).expect("tunable convolution");
+            class.binding_bytes = class.buffer_sizes().expect("convolution bindings");
+            let forward = shader == ShaderEntry::Conv2dGemm;
+            assert_eq!(
+                class
+                    .challengers(MatmulTile::Tile64, None, &[])
+                    .contains(&register),
+                forward,
+                "{shader:?}"
+            );
+            assert_eq!(
+                register.buffer_sizes(&class).is_some(),
+                forward,
+                "{shader:?}"
+            );
         }
     }
 
