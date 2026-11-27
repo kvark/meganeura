@@ -306,6 +306,12 @@ impl SessionConfig<'_> {
 pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimize::OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
     let mode = cfg.mode;
+    // Flash-attention variants and their dispatch geometry are selected while
+    // compiling the plan. Probe the context that will actually execute it so
+    // the default build path does not silently compile scalar kernels, and so
+    // applications with multiple adapters do not inherit a process-global
+    // first-device capability snapshot.
+    let gpu = context(&cfg);
     let mut share_parameters_from = cfg.share_parameters_from;
     let mut options = cfg.options;
     if cfg.runtime.debug {
@@ -319,18 +325,6 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
     log::info!("building {:?} session", mode);
     log::info!("forward graph:\n{}", forward_graph);
 
-    // Flash-attention variants and their dispatch geometry are selected while
-    // compiling the plan. Probe the context that will actually execute it so
-    // the default build path does not silently compile scalar kernels, and so
-    // applications with multiple adapters do not inherit a process-global
-    // first-device capability snapshot.
-    let gpu = match cfg.gpu {
-        Some(gpu) => gpu,
-        None => share_parameters_from
-            .as_ref()
-            .map(|source| source.context())
-            .unwrap_or_else(runtime::default_gpu_context),
-    };
     let (coop_caps, shared_memory_bytes) = compile_target(&gpu, cfg.runtime.coop);
     let mode_tag = match mode {
         Mode::Training => 0,
@@ -402,6 +396,16 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
     (session, report)
 }
 
+/// The context a session from [`build`] under `cfg` runs on: the configured
+/// one, else that of the session it shares parameters with, else the default.
+fn context(cfg: &SessionConfig<'_>) -> Arc<blade_graphics::Context> {
+    cfg.gpu.clone().unwrap_or_else(|| {
+        cfg.share_parameters_from
+            .as_ref()
+            .map_or_else(runtime::default_gpu_context, |source| source.context())
+    })
+}
+
 /// The cooperative tiles and workgroup memory a plan for `gpu` compiles
 /// against, filtered by the session's policy.
 fn compile_target(
@@ -435,9 +439,10 @@ fn compile_for_target(
 }
 
 /// The plan a session from [`build`] for `forward_graph` under `cfg` runs
-/// before tuning, without creating the session or reading a plan cache.
+/// before tuning, with its barrier groups, without creating the session or
+/// reading a plan cache.
 pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::ExecutionPlan {
-    let gpu = cfg.gpu.clone().unwrap_or_else(runtime::default_gpu_context);
+    let gpu = context(cfg);
     let mut options = cfg.options.clone();
     if cfg.runtime.debug {
         options.fuse_dispatches = false;
@@ -445,7 +450,11 @@ pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::E
     let target = compile_target(&gpu, cfg.runtime.coop);
     let optimize = (cfg.optimize, cfg.skip_full_optimize);
     let compiled = compile_for_target(forward_graph, cfg.mode, &options, optimize, target).0;
-    runtime::lower(compiled, &gpu, &cfg.runtime).plan
+    let lowered = runtime::lower(compiled, &gpu, &cfg.runtime);
+    compile::ExecutionPlan {
+        groups: lowered.groups,
+        ..lowered.plan
+    }
 }
 
 /// `graph` with the composites spelled in primitives recognized: all of
@@ -743,9 +752,11 @@ mod tests {
                 cfg.cache = None;
                 cfg
             };
-            let planned = plan(graph, &cfg());
+            let mut planned = plan(graph, &cfg());
+            let groups = std::mem::take(&mut planned.groups);
             let (session, _) = build(graph, cfg());
             assert_eq!(&planned, session.plan(), "{mode:?}");
+            assert_eq!(groups, session.groups(), "{mode:?}");
 
             let cfg = cfg();
             let target = compile_target(&gpu, cfg.runtime.coop);
