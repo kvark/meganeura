@@ -832,6 +832,10 @@ pub(crate) struct Problem {
     pub epilogue_inputs: bool,
     /// A measured schedule or explicit storage policy fixed the kernel.
     pub pinned: bool,
+    /// Any fused epilogue, which only the tiled kernels apply.
+    pub epilogue: bool,
+    /// The compiler fixed the schedule (`Dispatch::schedule_locked`).
+    pub locked: bool,
     /// Workgroups of the compiled 64-wide tiling.
     pub compiled_workgroups: u32,
 }
@@ -849,6 +853,8 @@ impl Problem {
             requires_full_precision: false,
             epilogue_inputs: false,
             pinned: false,
+            epilogue: false,
+            locked: false,
             compiled_workgroups: m.div_ceil(64) * n.div_ceil(64),
         }
     }
@@ -876,6 +882,8 @@ impl Problem {
                         | Kernel::CooperativeTyped { .. }
                         | Kernel::CooperativeWorkgroup { .. }
                 ),
+            epilogue: dispatch.matmul_epilogue.is_some(),
+            locked: dispatch.schedule_locked,
             compiled_workgroups: dispatch.workgroups.iter().product(),
         })
     }
@@ -897,6 +905,9 @@ pub(crate) struct Target {
 pub enum Path {
     /// Cooperative-matrix tiles in the device's configuration.
     Cooperative,
+    /// The direct register kernel ([`RegisterTile`]), where cooperative
+    /// matrices are absent.
+    Register,
     /// 32-wide scalar tiles, for products too small to occupy the device
     /// with 64-wide ones.
     SmallTile,
@@ -930,6 +941,7 @@ impl Family for Path {
     type Target = Target;
     const PREFERENCE: &'static [Self] = &[
         Path::Cooperative,
+        Path::Register,
         Path::SmallTile,
         Path::WideTile,
         Path::Compiled,
@@ -942,6 +954,7 @@ impl Family for Path {
     fn tile(self, _: &Problem, target: &Target) -> Option<[u32; 2]> {
         Some(match self {
             Path::Cooperative => [target.cooperative?.matmul_output_tile(); 2],
+            Path::Register => [REGISTER_TILE.rows, 4],
             Path::SmallTile => [32; 2],
             Path::WideTile => [WIDE_TILE.rows(), WIDE_TILE.cols()],
             Path::Compiled => [64; 2],
@@ -984,6 +997,7 @@ impl Family for Path {
                     }
                 }
             }
+            Path::Register => register_admits(problem, target),
             Path::SmallTile => {
                 if problem.pinned {
                     Err("the kernel is fixed by a schedule or storage policy")
@@ -1017,6 +1031,53 @@ impl Family for Path {
             }
             Path::Compiled => Ok(()),
         }
+    }
+}
+
+/// Register grids below this many workgroups leave the product to the
+/// tiled kernels, which split K to occupy the device; the register kernel
+/// walks the whole reduction in each thread.
+const MIN_REGISTER_WORKGROUPS: u32 = 4;
+
+/// Whether the register kernel computes `[m, n, k]` over `batch` products
+/// on `target`, the rules [`Path::Register`] and batch-major products share.
+pub(crate) fn register_admits_product(
+    [m, n, k]: [u32; 3],
+    batch: u32,
+    target: &Target,
+) -> Result<RegisterTile, Rejection> {
+    // Policy: measured only where cooperative matrices are absent (Adreno
+    // 740); devices with them keep their kernels unless tuning measures it.
+    if target.cooperative.is_some() {
+        return Err("measured only where cooperative matrices are absent");
+    }
+    if target.prefer.is_some_and(|path| path != Path::Register) {
+        return Err("another path is preferred");
+    }
+    let tile = register_tile(m, n, k).ok_or("vec4 loads need N and K multiples of four")?;
+    let grid = register_workgroups(tile, m, n, batch);
+    if !crate::compile::workgroups_within_portable_limits(grid) {
+        Err("grid exceeds the portable dispatch limit")
+    } else if grid.iter().map(|&g| u64::from(g)).product::<u64>()
+        < u64::from(MIN_REGISTER_WORKGROUPS)
+    {
+        Err("too few workgroups; split K instead")
+    } else {
+        Ok(tile)
+    }
+}
+
+fn register_admits(problem: &Problem, target: &Target) -> Result<(), Rejection> {
+    if problem.layout != Layout::Plain {
+        Err("the register kernel computes plain products only")
+    } else if problem.pinned || problem.locked {
+        Err("the kernel is fixed by a schedule or storage policy")
+    } else if problem.reduced_storage {
+        Err("packed weights keep their compiled kernel")
+    } else if problem.epilogue {
+        Err("the register kernel has no epilogue")
+    } else {
+        register_admits_product([problem.m, problem.n, problem.k], 1, target).map(|_| ())
     }
 }
 
@@ -1100,13 +1161,15 @@ pub struct RegisterTile {
 /// 3.7 ms on the shared-memory tiles. Other tiles won single shapes by up
 /// to 1.3× and lost others by more.
 pub(crate) fn register_tile(m: u32, n: u32, k: u32) -> Option<RegisterTile> {
-    let tile = RegisterTile {
-        rows: 4,
-        threads: 64,
-    };
     let aligned = m != 0 && n.is_multiple_of(4) && n != 0 && k.is_multiple_of(4) && k != 0;
-    (aligned && register_workgroups(tile, m, n, 1)[0] <= 65_535).then_some(tile)
+    aligned.then_some(REGISTER_TILE)
 }
+
+/// The tile [`register_tile`] picks.
+const REGISTER_TILE: RegisterTile = RegisterTile {
+    rows: 4,
+    threads: 64,
+};
 
 /// The grid of a [`RegisterTile`] over `batch` products of `m × n`.
 pub(crate) fn register_workgroups(tile: RegisterTile, m: u32, n: u32, batch: u32) -> [u32; 3] {
@@ -1127,6 +1190,74 @@ mod tests {
         assert_eq!(register_workgroups(tile, 301, 128, 1), [38, 1, 1]);
         assert!(register_tile(1200, 1, 33).is_none());
         assert!(register_tile(300, 64, 6).is_none());
+    }
+
+    #[test]
+    fn register_path_states_why_it_declines() {
+        let bare = Target {
+            cooperative: None,
+            allow_raw_f16: false,
+            prefer: None,
+        };
+        let plain = Problem::plain(Layout::Plain, [300, 128, 512], false);
+        assert_eq!(select(&plain, &bare), Path::Register);
+        let coop = Target {
+            cooperative: Some(CoopConfig {
+                tile_size: 16,
+                use_f16_input: true,
+            }),
+            ..bare
+        };
+        let preferred = Target {
+            prefer: Some(Path::SmallTile),
+            ..bare
+        };
+        for (problem, target, reason) in [
+            (
+                plain,
+                coop,
+                "measured only where cooperative matrices are absent",
+            ),
+            (plain, preferred, "another path is preferred"),
+            (
+                Problem::plain(Layout::TransposedB, [300, 128, 512], false),
+                bare,
+                "the register kernel computes plain products only",
+            ),
+            (
+                Problem::plain(Layout::Plain, [300, 130, 512], false),
+                bare,
+                "vec4 loads need N and K multiples of four",
+            ),
+            (
+                Problem {
+                    locked: true,
+                    ..plain
+                },
+                bare,
+                "the kernel is fixed by a schedule or storage policy",
+            ),
+            (
+                Problem {
+                    epilogue: true,
+                    ..plain
+                },
+                bare,
+                "the register kernel has no epilogue",
+            ),
+            (
+                // Two workgroups walking K = 1024: split K instead.
+                Problem::plain(Layout::Plain, [6, 256, 1024], false),
+                bare,
+                "too few workgroups; split K instead",
+            ),
+        ] {
+            assert_eq!(Path::Register.admits(&problem, &target), Err(reason));
+        }
+        assert_eq!(
+            register_admits_product([300, 16, 300], 70_000, &bare),
+            Err("grid exceeds the portable dispatch limit")
+        );
     }
 
     #[test]
@@ -1177,11 +1308,20 @@ mod tests {
         for problem in [product(1, 1, 1), product(4096, 4096, 4096)] {
             assert_eq!(Path::Compiled.admits(&problem, &bare), Ok(()));
         }
-        assert_eq!(select(&product(4096, 4096, 64), &bare), Path::WideTile);
+        // Without cooperative matrices, aligned products take registers.
+        assert_eq!(select(&product(4096, 4096, 64), &bare), Path::Register);
+        // Among the scalar tiles:
+        let scalar = |problem: &Problem| {
+            [Path::SmallTile, Path::WideTile, Path::Compiled]
+                .into_iter()
+                .find(|path| path.admits(problem, &bare).is_ok())
+                .unwrap()
+        };
+        assert_eq!(scalar(&product(4096, 4096, 64)), Path::WideTile);
         // 32 tiles of 128x64 are too few; 64 are enough.
-        assert_eq!(select(&product(512, 512, 64), &bare), Path::Compiled);
-        assert_eq!(select(&product(1024, 512, 64), &bare), Path::WideTile);
-        assert_eq!(select(&product(64, 64, 64), &bare), Path::SmallTile);
+        assert_eq!(scalar(&product(512, 512, 64)), Path::Compiled);
+        assert_eq!(scalar(&product(1024, 512, 64)), Path::WideTile);
+        assert_eq!(scalar(&product(64, 64, 64)), Path::SmallTile);
         // Past 65535 rows of tiles, only the compiled kernel wraps rows.
         assert_eq!(select(&product(128 * 65536, 64, 64), &bare), Path::Compiled);
     }
@@ -1348,6 +1488,7 @@ mod tests {
             Some(match dispatch.kernel {
                 Kernel::Cooperative => Some(Path::Cooperative),
                 Kernel::SmallTile => Some(Path::SmallTile),
+                Kernel::RegisterMatmul(_) => Some(Path::Register),
                 Kernel::ScalarMatmul(shape) if shape == WIDE_TILE => Some(Path::WideTile),
                 Kernel::Default => Some(Path::Compiled),
                 _ => None,

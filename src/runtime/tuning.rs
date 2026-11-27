@@ -449,6 +449,10 @@ pub(super) fn tile_module(
     knobs: crate::codegen::MatmulKnobs,
     caps: &bg::Capabilities,
 ) -> crate::codegen::ShaderModule {
+    if let MatmulTile::Register(tile) = tile {
+        let (m, n, k) = dispatch.mnk().expect("a register product has dimensions");
+        return crate::codegen::generate_register_matmul([m, n, k], tile);
+    }
     if crate::kernels::matmul::Layout::from_entry(&dispatch.shader).is_some() {
         let mut selected = dispatch.clone();
         tile.configure(&mut selected);
