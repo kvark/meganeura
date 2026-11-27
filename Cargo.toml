@@ -70,7 +70,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Full-subgroup compute pipelines (`ComputePipelineDesc::full_subgroup_size`).
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "bba0edcf18cd8440564b73b6bbb06971ce5e6725" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "7569282e1f06d34b44f2cdb030b72fc8ec56a417" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
