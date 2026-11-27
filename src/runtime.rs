@@ -3098,7 +3098,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
         ShaderEntry::MaxPool2dGrad => MaxPool2dGradData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
-        ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
+        ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::TopKInner => UnaryData::layout(),
         ShaderEntry::WinogradInputTransform => WinogradInputData::layout(),
         ShaderEntry::WinogradOutputTransform { fused: false } => WinogradOutputData::layout(),
         ShaderEntry::WinogradOutputTransform { fused: true } => WinogradOutputAddData::layout(),

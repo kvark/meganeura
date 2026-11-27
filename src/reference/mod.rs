@@ -304,6 +304,7 @@ pub fn eval_node(
         | Op::SumInner
         | Op::MaxInner
         | Op::ArgMaxInner
+        | Op::TopKInner { .. }
         | Op::BroadcastInner { .. }
         | Op::NormalizeInnerSum { .. }
         | Op::NormalizeInnerSumGrad { .. }

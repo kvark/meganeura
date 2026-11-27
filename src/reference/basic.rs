@@ -529,6 +529,23 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
                 })
                 .collect()
         }
+        Op::TopKInner { k } => {
+            let x = arg(0)?;
+            let (_, cols) = rows_cols(x);
+            x.data
+                .chunks_exact(cols)
+                .flat_map(|values| {
+                    // A stable sort by descending value keeps equal values in
+                    // column order. Adding zero turns -0 into +0, so signed
+                    // zeros tie, and total_cmp keeps the order total.
+                    let key = |col: usize| values[col] + 0.0;
+                    let mut order: Vec<usize> = (0..cols).collect();
+                    order.sort_by(|&a, &b| key(b).total_cmp(&key(a)));
+                    order.truncate(k as usize);
+                    order.into_iter().map(|col| col as f64)
+                })
+                .collect()
+        }
         Op::BroadcastInner { inner } => {
             let x = arg(0)?;
             let inner = inner as usize;

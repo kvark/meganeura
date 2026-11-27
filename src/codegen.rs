@@ -781,6 +781,7 @@ pub enum ShaderGroup {
     MaxPool2dGrad,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
+    TopKInner,
     PairwiseGrad,
     GradClipNormSq,
     GradClipScale,
@@ -1016,6 +1017,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             ShaderModule::new(include_str!("shaders/global_avg_pool_grad.wgsl"))
         }
         ShaderGroup::PairwiseGrad => ShaderModule::new(include_str!("shaders/pairwise_grad.wgsl")),
+        ShaderGroup::TopKInner => ShaderModule::new(include_str!("shaders/top_k_inner.wgsl")),
         ShaderGroup::GradClipNormSq => {
             optimizer_module(include_str!("shaders/grad_clip_norm_sq.wgsl"))
         }
@@ -3717,6 +3719,7 @@ mod tests {
                 ShaderGroup::GlobalAvgPoolGrad,
                 naga::valid::Capabilities::empty(),
             ),
+            (ShaderGroup::TopKInner, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::PairwiseGrad,
                 naga::valid::Capabilities::empty(),
@@ -4445,6 +4448,7 @@ mod tests {
             (ShaderGroup::ScatterAddAtomic, empty),
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
+            (ShaderGroup::TopKInner, empty),
             (ShaderGroup::PairwiseGrad, empty),
             (ShaderGroup::GradClipNormSq, empty),
             (ShaderGroup::GradClipScale, empty),
@@ -4747,7 +4751,8 @@ mod tests {
                 }
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
-                | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
+                | ShaderEntry::GlobalAvgPoolGrad
+                | ShaderEntry::TopKInner => vec!["src", "dst", "params"],
                 ShaderEntry::MaxPool2dGrad => vec!["grad_out", "src", "dst", "params"],
                 ShaderEntry::PairwiseGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
@@ -4875,6 +4880,7 @@ mod tests {
             ShaderEntry::MaxPool2dGrad,
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
+            ShaderEntry::TopKInner,
             ShaderEntry::PairwiseGrad,
         ];
         let entries: Vec<_> = entries

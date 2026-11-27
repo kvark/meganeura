@@ -1135,7 +1135,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::GlobalAvgPoolGrad => {
+            ShaderEntry::GlobalAvgPoolGrad | ShaderEntry::TopKInner => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,

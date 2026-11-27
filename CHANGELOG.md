@@ -39,6 +39,14 @@
   shapes run 2.3–15× faster (`bench/dfine_shapes.txt` with `op_bench`); an
   RTX 3050 without cooperative matrices is about 2× faster.
 
+- `Graph::top_k_inner` selects each row's `k` largest columns, sorted,
+  ties to the lower column, in one dispatch: a radix select over
+  order-preserving keys, an ordered compaction and a bitonic sort in
+  workgroup memory, one workgroup per row (`k <= 1024`). The ONNX importer
+  lowers `TopK` to it and gathers the values, instead of unrolling `k`
+  rounds of argmax and masking: D-FINE-N's TopK of 300 over 24,000 scores
+  goes from about 1,300 dispatches to a handful.
+
 - The ONNX importer runs D-FINE (onnx-community's `dfine_n_coco-ONNX` at a
   fixed 640×640 input). Its logits and boxes match onnxruntime within 4e-4,
   apart from two queries whose near-equal scores select in the other order.

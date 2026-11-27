@@ -1514,6 +1514,22 @@ impl<'a> Compiler<'a> {
                 );
             }
 
+            Op::TopKInner { k } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let (rows, cols) = (in_shape[0] as u32, in_shape[1] as u32);
+                // One workgroup per row; see shaders/top_k_inner.wgsl.
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::TopKInner,
+                    workgroups: [rows, 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, cols, k, 0],
+                    ..Default::default()
+                });
+            }
+
             Op::BroadcastInner { inner } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let rows = node.ty.shape[0] as u32;
