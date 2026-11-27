@@ -1469,6 +1469,11 @@ mod tests {
 
         fn prefer(self, options: &mut crate::reference::gpu::Options) {
             options.compile.knobs.prefer_matmul = Some(self);
+            // The register kernel is offered only without cooperative
+            // matrices; disabling them checks it on every device.
+            if self == Path::Register {
+                options.coop = crate::CoopPolicy::Disabled;
+            }
         }
 
         fn target(
@@ -1477,7 +1482,9 @@ mod tests {
             options: &crate::reference::gpu::Options,
         ) -> Target {
             Target {
-                cooperative: session.coop_config(),
+                cooperative: session
+                    .coop_config()
+                    .filter(|_| options.coop != crate::CoopPolicy::Disabled),
                 allow_raw_f16: options.coop == crate::CoopPolicy::AllowF16,
                 prefer: Some(self),
             }

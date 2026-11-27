@@ -124,8 +124,8 @@ pub(crate) mod sweep {
         fn problem(kind: Self::Kind, extents: [u32; 3]) -> Self::Problem;
         /// Ask sessions built with `options` to try `self` first.
         fn prefer(self, options: &mut gpu::Options);
-        /// What `session`, built with `options`, allows, with `self`
-        /// preferred.
+        /// What a session built with `options` allows, with `self`
+        /// preferred; `session` was built with the defaults.
         fn target(self, session: &Session, options: &gpu::Options) -> Self::Target;
         /// For a lowered `dispatch` of the family, the variant whose kernel
         /// it runs, or `None` when a later pass replaced the family's choice
@@ -187,9 +187,9 @@ pub(crate) mod sweep {
         let probe = gpu::session(&F::graph(F::KINDS[0], SEED), &defaults, Mode::Inference);
         let mut idle = Vec::new();
         for &variant in F::PREFERENCE {
-            let target = variant.target(&probe, &defaults);
             let mut options = defaults.clone();
             variant.prefer(&mut options);
+            let target = variant.target(&probe, &options);
             let admits = |kind, extents| variant.admits(&F::problem(kind, extents), &target);
             let mut checks = None;
             for (index, &kind) in F::KINDS.iter().enumerate() {
