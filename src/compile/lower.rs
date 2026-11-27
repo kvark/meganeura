@@ -284,6 +284,7 @@ pub(crate) fn select_variants(
     reset_workgroup_matmuls(plan);
     select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
+    select_register_matmuls(plan);
     let wg = crate::schedule::GridShape::default().workgroup_size;
     for dispatch in &mut plan.dispatches {
         if let Some(dag) = dispatch.pointwise() {
@@ -394,6 +395,43 @@ fn select_conv_paths(
         if let Some(extra) = extra {
             pad_buffer(plan, extra, geometry.output_bytes);
         }
+    }
+}
+
+/// Move the plain and batch-major f32 products still on shared-memory
+/// scalar tiles to the direct register kernel: on Adreno 740 it ran
+/// D-FINE-N's products about 4× faster. It runs before split-K and horizontal fusion, which
+/// leave it alone, since it needs neither to occupy the device. Fused
+/// epilogues and prologues, reduced storage and pinned schedules keep
+/// their kernels.
+fn select_register_matmuls(plan: &mut ExecutionPlan) {
+    use crate::kernels::matmul;
+    for dispatch in &mut plan.dispatches {
+        if !matches!(
+            dispatch.shader,
+            ShaderEntry::MatMul | ShaderEntry::BatchMatMul
+        ) || !matches!(dispatch.kernel, Kernel::Default | Kernel::SmallTile)
+            || dispatch.horizontal_batch >= 2
+            || dispatch.matmul_epilogue.is_some()
+            || dispatch.matmul_prologue.is_some()
+            || dispatch.gemv_rmsnorm.is_some()
+            || dispatch.weight_format != WeightFormat::F32
+            || dispatch.input_buffers.len() != 2
+        {
+            continue;
+        }
+        let Some((m, n, k)) = dispatch.mnk() else {
+            continue;
+        };
+        let batch = match dispatch.shader {
+            ShaderEntry::BatchMatMul => dispatch.params[3],
+            _ => 1,
+        };
+        let Some(tile) = matmul::register_tile(m, n, k) else {
+            continue;
+        };
+        dispatch.kernel = Kernel::RegisterMatmul(tile);
+        dispatch.workgroups = matmul::register_workgroups(tile, m, n, batch);
     }
 }
 

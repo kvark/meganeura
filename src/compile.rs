@@ -1334,6 +1334,9 @@ pub enum Kernel {
     /// the shared-memory tiles where cooperative matrices are absent; the
     /// convolution family's `Register` path chooses it.
     RegisterConv(crate::kernels::conv::RegisterBlock),
+    /// A plain or batch-major f32 product computed directly from registers,
+    /// dimensions baked in; see [`crate::kernels::matmul::register_tile`].
+    RegisterMatmul(crate::kernels::matmul::RegisterTile),
     /// Checked partial tiles with explicit operand, multiplication and output
     /// types, and F32 accumulation. Multiple K partitions write F32 partials
     /// for a following SumRows; a reduced output type is only legal after

@@ -924,6 +924,7 @@ enum Variant {
     ),
     SpecializedConv(ShaderEntry, Vec<u32>, u32, bool),
     RegisterConv(ShaderEntry, Vec<u32>, crate::kernels::conv::RegisterBlock),
+    RegisterMatmul(ShaderEntry, [u32; 3], crate::kernels::matmul::RegisterTile),
     ScalarMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1020,6 +1021,7 @@ impl Variant {
             | Variant::CoopConv(ref e, _, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
             | Variant::RegisterConv(ref e, _, _)
+            | Variant::RegisterMatmul(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
@@ -1052,6 +1054,9 @@ impl Variant {
             }
             Variant::SpecializedConv(ref e, ref params, k_tile, interleave) => {
                 format!("{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-{params:?}")
+            }
+            Variant::RegisterMatmul(ref e, mnk, tile) => {
+                format!("{e:?}:register-r{}-t{}-{mnk:?}", tile.rows, tile.threads)
             }
             Variant::RegisterConv(ref e, ref params, block) => {
                 format!(
@@ -2264,6 +2269,9 @@ impl Pipelines {
             Variant::RegisterConv(_, ref params, block) => {
                 crate::codegen::generate_register_conv(params, block)
             }
+            Variant::RegisterMatmul(_, mnk, tile) => {
+                crate::codegen::generate_register_matmul(mnk, tile)
+            }
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
@@ -2570,6 +2578,10 @@ impl Pipelines {
                 split,
                 dispatch.conv_transposed_weights,
             );
+        }
+        if let crate::compile::Kernel::RegisterMatmul(tile) = dispatch.kernel {
+            let (m, n, k) = dispatch.mnk().expect("a register product has dimensions");
+            return Variant::RegisterMatmul(entry, [m, n, k], tile);
         }
         if let crate::compile::Kernel::RegisterConv(block) = dispatch.kernel {
             // The image comes from the grid, so the batch is not baked in and

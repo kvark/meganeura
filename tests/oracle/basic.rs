@@ -80,6 +80,70 @@ fn matmul_lowerings() {
     }
 }
 
+/// The kernel of every plain or batch-major product `graph` compiles to.
+fn product_kernels(graph: &Graph) -> Vec<meganeura::compile::Kernel> {
+    use meganeura::compile::ShaderEntry;
+    let mut config = meganeura::SessionConfig::from_env();
+    config.mode = meganeura::Mode::Inference;
+    config.gpu = Some(gpu::shared_context());
+    let (session, _) = meganeura::build(graph, config);
+    session
+        .plan()
+        .dispatches
+        .iter()
+        .filter(|d| matches!(d.shader, ShaderEntry::MatMul | ShaderEntry::BatchMatMul))
+        .map(|d| d.kernel.clone())
+        .collect()
+}
+
+/// Products whose N and K are multiples of four run on the direct register
+/// kernel where cooperative tiles do not take them. Rows past a whole tile
+/// (M = 301, 5), the narrowest output (N = 4), the shallowest reduction
+/// (K = 4) and batch-major products with narrow and deep shapes, like
+/// attention's.
+#[test]
+fn register_matmul_lowerings() {
+    use meganeura::compile::Kernel;
+    let mut graphs = Vec::new();
+    for (m, k, n) in [(300, 128, 128), (301, 16, 4), (5, 4, 8), (64, 20, 256)] {
+        let mut g = Graph::new();
+        let a = g.input("a", &[m, k]);
+        let b = g.parameter("b", &[k, n]);
+        let y = g.matmul(a, b);
+        graphs.push((format!("register matmul {m}x{k}x{n}"), g, y));
+    }
+    for (batch, m, k, n) in [(3, 13, 8, 16), (2, 30, 300, 16), (2, 7, 16, 300)] {
+        let mut g = Graph::new();
+        let a = g.input("a", &[batch, m, k]);
+        let b = g.input("b", &[batch, k, n]);
+        let y = g.batch_matmul(a, b);
+        graphs.push((format!("register batch matmul {batch}x{m}x{k}x{n}"), g, y));
+    }
+    for (what, mut g, y) in graphs {
+        g.set_outputs(vec![y]);
+        for kernel in product_kernels(&g) {
+            assert!(
+                matches!(
+                    kernel,
+                    Kernel::RegisterMatmul(_)
+                        | Kernel::Cooperative
+                        | Kernel::CooperativeTyped { .. }
+                        | Kernel::CooperativeWorkgroup { .. }
+                        | Kernel::CooperativeTiled { .. }
+                ),
+                "{what} compiled to {kernel:?}"
+            );
+        }
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, what.len() as u64, 1.0);
+        for (lowering, options) in gpu::Options::lowerings() {
+            let report = gpu::check_inference(&g, &feeds, &options)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            report.assert_passed(&format!("{what} ({lowering})"));
+        }
+    }
+}
+
 #[test]
 fn matmul_by_unit_column_is_a_row_sum() {
     for k in [1, 7, 32, 33] {
