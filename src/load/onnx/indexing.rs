@@ -369,7 +369,7 @@ pub(super) fn top_k(
         remaining = graph.neg(remaining);
     }
     // The gather addresses each pick as `row · len + column` in F32.
-    let elements = rows * len;
+    let elements = rows.saturating_mul(len);
     if elements > 1 << 24 || rows > 65535 {
         return Err(OnnxError::UnsupportedOp(format!(
             "TopK '{}': {rows} rows of {len} (supported: up to 65535 rows and 2^24 elements)",

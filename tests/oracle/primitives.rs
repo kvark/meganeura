@@ -644,8 +644,8 @@ fn argmax_inner() {
 
 /// Short rows take a thread each, long ones a workgroup that selects and
 /// sorts: tied rows keep columns in order, signed zeros tie, k ranges from
-/// one to the whole row, and D-FINE's 4 of 33 over 1,200 rows and 300 of
-/// 24,000 scores are both here.
+/// one to the whole row. D-FINE's two shapes are here (4 of 33 over 1,200
+/// rows, 300 of 1,500), and 300 of 24,000 for a long row.
 #[test]
 fn top_k_inner() {
     for (rows, cols, k) in [

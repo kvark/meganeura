@@ -2048,8 +2048,10 @@ impl Graph {
     /// first, as exact F32 indices: `x: [M, N] → [M, k]`, like
     /// `torch.topk(x, k, dim=1).indices`. Equal values tie to the lower
     /// column, including signed zeros; rows holding NaN are unspecified. A
-    /// selection has no derivative. One dispatch computes it, one workgroup
-    /// per row, so `k <= 1024`, `M <= 65535` and `N <= 2^24` (exact in F32).
+    /// selection has no derivative. One dispatch computes it: a workgroup
+    /// per row selects and sorts long rows, a thread per row picks short
+    /// ones (`k·N <= 8192`). `k <= 1024`, `M <= 65535` and `N <= 2^24`
+    /// (exact in F32).
     #[track_caller]
     pub fn top_k_inner(&mut self, x: NodeId, k: usize) -> NodeId {
         let ty = &self.node(x).ty;

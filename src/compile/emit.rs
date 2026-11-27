@@ -1526,7 +1526,7 @@ impl<'a> Compiler<'a> {
                 // workgroup's select and sort (shaders/top_k_inner.wgsl).
                 // D-FINE-N's 4 of 33 over 1,200 rows took 6 ms on Adreno 740
                 // with a workgroup per row.
-                let narrow = k * cols <= TOP_K_NARROW_WORK;
+                let narrow = k.saturating_mul(cols) <= TOP_K_NARROW_WORK;
                 let workgroups = if narrow { rows.div_ceil(256) } else { rows };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::TopKInner,
