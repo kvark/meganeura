@@ -1,4 +1,7 @@
-use super::{MatMulCoopVariant, ShaderGroup, ShaderModule, coop_shape, matmul_module, preprocess};
+use super::workgroup::{
+    SubgroupLayout, WorkgroupMatmulShape, checked_subgroup_kernel_width, subgroup_kernel,
+};
+use super::{MatrixTypes, ShaderGroup, ShaderModule, coop_shape};
 
 /// Four subgroup tiles sharing full-range f32 operands through workgroup memory.
 /// Each workgroup writes 64 rows and `columns` columns. The caller must supply
@@ -42,20 +45,24 @@ impl CooperativeMatmulShape {
     }
 
     pub fn shared_bytes(self) -> u32 {
-        // Padding avoids repeatedly mapping adjacent matrix rows onto the
-        // same LDS banks on CDNA. It does not change the logical matrices.
-        4 * (Self::ROWS * (self.k_stage + 4) + self.k_stage * (self.columns + 16))
+        // Matches `subgroup_kernel`'s 8-element bank padding (doubled for
+        // double-buffered `prefetch`).
+        let stages = if self.prefetch { 2 } else { 1 };
+        stages * 4 * (Self::ROWS * (self.k_stage + 8) + self.k_stage * (self.columns + 8))
     }
 }
 
 /// Generate an aligned native 16x16 f32 matrix product, optionally partitioned
-/// along K. Partitions write compact M*N slices; the caller must sum them in a
+/// along K, lowered through the unified subgroup-tiled product kernel and
+/// specialized to `subgroup`-wide subgroups (8, 16, 32, or 64; `0` defaults to
+/// 32). Partitions write compact M*N slices; the caller must sum them in a
 /// separate dispatch. An addend seeds partition zero only.
 pub fn generate_tiled_coop_matmul(
     group: ShaderGroup,
     shape: CooperativeMatmulShape,
     splits: u32,
     prologue: Option<&crate::compile::MatMulPrologue>,
+    subgroup: u32,
 ) -> ShaderModule {
     assert!(shape.legal() && (1..=65535).contains(&splits));
     let (addend, variant) = coop_shape(group).expect("tiled cooperative matrix group");
@@ -63,176 +70,49 @@ pub fn generate_tiled_coop_matmul(
         !addend || prologue.is_none(),
         "prologue layout has no addend binding"
     );
-    let rows = CooperativeMatmulShape::ROWS;
-    let lanes = CooperativeMatmulShape::THREADS;
-    let cols = shape.columns;
-    let stage = shape.k_stage;
-    let stride_a = stage + 4;
-    let stride_b = cols + 16;
-    let wave_cols = cols / 2;
-    let (decl, cache_decl, cache_init, transform) = prologue
-        .map(|p| super::matmul_prologue_to_wgsl(p, rows))
-        .unwrap_or_default();
-    let mut init = String::new();
-    let mut add_loads = String::new();
-    let mut stores = String::new();
-    for i in 0..2 {
-        for j in 0..wave_cols / 16 {
-            init += &format!("var acc{i}_{j} = coop_mat16x16<f32,C>();\n");
-            let index = format!(
-                "(tile_row + wr * 32u + {}u) * n + tile_col + wc * {wave_cols}u + {}u",
-                i * 16,
-                j * 16
-            );
-            add_loads += &format!(
-                "let ci{i}_{j} = {index};\nacc{i}_{j} = coopLoadT<coop_mat16x16<f32,C>>(&src[ci{i}_{j}], n);\n"
-            );
-            stores += &format!(
-                "let oi{i}_{j} = output_base + {index};\ncoopStoreT(acc{i}_{j}, &$C_BUFFER[oi{i}_{j}], n);\n"
-            );
-        }
-    }
-    if addend {
-        init += &format!("if wgid.z == 0u {{\n{add_loads}}}\n");
-    }
-    let mut variables = String::new();
-    let mut loads = String::new();
-    let mut writes = String::new();
-    for a in [true, false] {
-        // Vector loads always follow the contiguous axis of the global
-        // operand. AT and BT scatter components into the shared tile.
-        let transposed = if a {
-            variant == MatMulCoopVariant::AT
-        } else {
-            variant == MatMulCoopVariant::BT
-        };
-        let (prefix, buffer, shared, count, vstride) = if a {
-            (
-                "a",
-                "matrix_a",
-                "sa",
-                rows * stage / 4,
-                if transposed { rows / 4 } else { stage / 4 },
-            )
-        } else {
-            (
-                "b",
-                "$B_BUFFER",
-                "sb",
-                cols * stage / 4,
-                if transposed { stage / 4 } else { cols / 4 },
-            )
-        };
-        assert!(count.is_multiple_of(lanes));
-        for part in 0..count / lanes {
-            variables += &format!(
-                "let {prefix}r{part} = (lid.x + {}u) / {vstride}u;\nlet {prefix}c{part} = ((lid.x + {}u) % {vstride}u) * 4u;\nvar {prefix}v{part} = vec4<f32>(0.0);\n",
-                part * lanes,
-                part * lanes
-            );
-            let index = match (a, transposed) {
-                (true, false) => format!("((tile_row + ar{part}) * k + t + ac{part}) / 4u"),
-                (true, true) => format!("((t + ar{part}) * m + tile_row + ac{part}) / 4u"),
-                (false, false) => format!("((t + br{part}) * n + tile_col + bc{part}) / 4u"),
-                (false, true) => format!("((tile_col + br{part}) * k + t + bc{part}) / 4u"),
-            };
-            let k_component = if a != transposed {
-                format!("{prefix}c{part}")
-            } else {
-                format!("{prefix}r{part}")
-            };
-            if stage == 32 && splits > 1 {
-                loads += &format!(
-                    "{prefix}v{part} = vec4<f32>(0.0);\nif t + {k_component} < end {{\n{prefix}v{part} = {buffer}[{index}];\n"
-                );
-            } else {
-                loads += &format!("{prefix}v{part} = {buffer}[{index}];\n");
-            }
-            for (lane, component) in ["x", "y", "z", "w"].iter().enumerate() {
-                let r = if transposed {
-                    format!("({prefix}c{part} + {lane}u)")
-                } else {
-                    format!("{prefix}r{part}")
-                };
-                let c = if transposed {
-                    format!("{prefix}r{part}")
-                } else {
-                    format!("({prefix}c{part} + {lane}u)")
-                };
-                if a && !transform.is_empty() {
-                    loads += &format!(
-                        "{{ let gr = tile_row + {r}; let tc = t + {c};\n{prefix}v{part}.{component} = {prefix}v{part}.{component}{transform}; }}\n"
-                    );
-                }
-                let stride = if a { stride_a } else { stride_b };
-                writes +=
-                    &format!("{shared}[{r} * {stride}u + {c}] = {prefix}v{part}.{component};\n");
-            }
-            if stage == 32 && splits > 1 {
-                loads += "}\n";
-            }
-        }
-    }
-    let mut multiply = String::new();
-    for q in 0..stage / 16 {
-        for i in 0..2 {
-            multiply += &format!(
-                "let ai{i}_{q} = (wr * 32u + {}u) * {stride_a}u + {}u;\nlet a{i}_{q} = coopLoadT<coop_mat16x16<f32,A>>(&sa[ai{i}_{q}], {stride_a}u);\n",
-                i * 16,
-                q * 16
-            );
-        }
-        for j in 0..wave_cols / 16 {
-            multiply += &format!(
-                "let bi{j}_{q} = {}u + wc * {wave_cols}u + {}u;\nlet b{j}_{q} = coopLoadT<coop_mat16x16<f32,B>>(&sb[bi{j}_{q}], {stride_b}u);\n",
-                q * 16 * stride_b,
-                j * 16
-            );
-        }
-        for i in 0..2 {
-            for j in 0..wave_cols / 16 {
-                multiply +=
-                    &format!("acc{i}_{j} = coopMultiplyAdd(a{i}_{q}, b{j}_{q}, acc{i}_{j});\n");
-            }
-        }
-    }
-    let (first_load, step_load, next_load) = if shape.prefetch {
-        (
-            format!("{{ let t = begin; if t < end {{\n{loads}}} }}"),
-            String::new(),
-            format!("{{ let t = t + {stage}u; if t < end {{\n{loads}}} }}"),
-        )
-    } else {
-        (String::new(), loads, String::new())
+    let subgroup = checked_subgroup_kernel_width(subgroup);
+    let wg_shape = WorkgroupMatmulShape {
+        rows: CooperativeMatmulShape::ROWS,
+        columns: shape.columns,
+        k_stage: shape.k_stage,
+        threads: 4 * subgroup,
+        stage_operands: false,
+        subgroup_rows: 2,
+        prefetch: shape.prefetch,
     };
-    let source = preprocess(
-        include_str!("../shaders/matmul_coop_tiled.wgsl"),
-        &[
-            ("$COLUMNS", &cols.to_string()),
-            ("$STAGE", &stage.to_string()),
-            ("$A_SIZE", &(rows * stride_a).to_string()),
-            ("$B_SIZE", &(stage * stride_b).to_string()),
-            ("$SPLITS", &splits.to_string()),
-            (
-                "$ADD_DECL",
-                if addend {
-                    "var<storage> src: array<f32>;"
-                } else {
-                    ""
-                },
-            ),
-            ("$PROLOGUE_DECL", &decl),
-            ("$CACHE_DECL", &cache_decl),
-            ("$CACHE_INIT", &cache_init),
-            ("$ACC_INIT", &init),
-            ("$VARIABLES", &variables),
-            ("$FIRST_LOAD", &first_load),
-            ("$STEP_LOAD", &step_load),
-            ("$NEXT_LOAD", &next_load),
-            ("$WRITES", &writes),
-            ("$MULTIPLY", &multiply),
-            ("$STORES", &stores),
-        ],
+    let mut header = String::from(
+        "struct Params { m: u32, n: u32, k: u32, _pad: u32 }\n\
+         var<storage> matrix_a: array<vec4<f32>>;\n\
+         var<storage> matrix_b: array<vec4<f32>>;\n\
+         var<storage, read_write> matrix_c: array<f32>;\n",
     );
-    matmul_module(&source, "array<vec4<f32>>", Some(lanes), 1)
+    if addend {
+        header += "var<storage> src: array<f32>;\n";
+    }
+    header += "var<uniform> params: Params;\n";
+    subgroup_kernel(
+        wg_shape,
+        MatrixTypes::F32,
+        [16, 16, 16],
+        subgroup,
+        &SubgroupLayout {
+            variant,
+            header,
+            dimensions: "let m = params.m;\nlet n = params.n;\nlet k = params.k;".into(),
+            a: "matrix_a",
+            b: "matrix_b",
+            c: "matrix_c",
+            addend: addend.then_some("src"),
+            prologue,
+            epilogue: None,
+            images: None,
+            fixed_splits: Some(splits),
+            unaligned_loads: false,
+            copies: 1,
+            row_bounds: false,
+            column_bounds: false,
+            gather: [None, None],
+            scatter: None,
+        },
+    )
 }

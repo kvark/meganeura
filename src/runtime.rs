@@ -1376,7 +1376,14 @@ fn run_matmul_probe(
 ) -> Option<Vec<f32>> {
     use blade_graphics as bg;
 
-    let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
+    let full_subgroup_size = match required_full_subgroup_size(&gpu.capabilities(), module.subgroup)
+    {
+        Ok(size) => size,
+        Err(error) => {
+            log::warn!("{kind} shader rejected: {error}");
+            return None;
+        }
+    };
     let shader = match create_gen_shader(gpu, module) {
         Ok(shader) => shader,
         Err(error) => {
@@ -1819,32 +1826,55 @@ fn create_gen_shader(
 ///
 /// Shaders with `req.size > 0` hardcode that exact subgroup width in WGSL
 /// (for example `subgroup-matmul`) and always pin `required_full_subgroup_size`
-/// when the device supports it. Shaders with `req.size == 0` adapt to
+/// when the device supports it; if the device cannot pin `req.size` and is not
+/// fixed at `req.size`, this returns `Err` rather than launching a kernel built
+/// for another subgroup width. Shaders with `req.size == 0` adapt to
 /// `@builtin(subgroup_size)` dynamically: they pin `caps.subgroup_size` on
 /// fixed-width devices (`min_size == max_size`, such as NVIDIA/Metal) so every
-/// subgroup is full, but return `None` on variable-width devices (`min_size !=
-/// max_size`, such as Intel Xe2 `[16, 32]`) because Vulkan's
+/// subgroup is full, but return `Ok(None)` on variable-width devices
+/// (`min_size != max_size`, such as Intel Xe2 `[16, 32]`) because Vulkan's
 /// `requiredSubgroupSize` overrides the driver's register-pressure heuristic
 /// and can force SIMD32 spilling on register-heavy kernels like FlashAttention
 /// backward.
 fn required_full_subgroup_size(
     caps: &blade_graphics::Capabilities,
     req: Option<crate::codegen::SubgroupRequirement>,
-) -> Option<u32> {
-    let req = req?;
-    let fs = caps.full_subgroups?;
-    let size = if req.size == 0 {
-        if fs.min_size != fs.max_size {
-            return None;
-        }
-        caps.subgroup_size
-    } else {
-        req.size
+) -> Result<Option<u32>, String> {
+    let Some(req) = req else {
+        return Ok(None);
     };
-    if size == 0 {
-        return None;
+    if req.size == 0 {
+        let Some(fs) = caps.full_subgroups else {
+            return Ok(None);
+        };
+        if fs.min_size != fs.max_size || caps.subgroup_size == 0 {
+            return Ok(None);
+        }
+        return Ok(fs
+            .supports(caps.subgroup_size, req.workgroup_size)
+            .then_some(caps.subgroup_size));
     }
-    fs.supports(size, req.workgroup_size).then_some(size)
+    if let Some(fs) = caps.full_subgroups
+        && fs.supports(req.size, req.workgroup_size)
+    {
+        return Ok(Some(req.size));
+    }
+    // Backends that do not report `subgroup_size` or `full_subgroups` (for
+    // example Metal, where Apple Silicon runs fixed 32-lane simdgroups) report
+    // `subgroup_size == 0 && full_subgroups.is_none()` and rely on
+    // `checked_subgroup_kernel_width(0) == 32`.
+    if (caps.subgroup_size == req.size
+        || (caps.subgroup_size == 0 && caps.full_subgroups.is_none()))
+        && caps
+            .full_subgroups
+            .is_none_or(|fs| fs.min_size == fs.max_size)
+    {
+        return Ok(None);
+    }
+    Err(format!(
+        "shader requires exact subgroup width {}, but device reports subgroup_size={} and full_subgroups={:?}",
+        req.size, caps.subgroup_size, caps.full_subgroups
+    ))
 }
 
 fn create_profiled_pipeline(
@@ -2048,7 +2078,7 @@ impl Pipelines {
         if let Some(dir) = dump_dir {
             module.dump(dir);
         }
-        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
+        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup)?;
         let shared_key =
             SharedPipelineKey::new(gpu, &module, &layout, entry_point, full_subgroup_size);
         if let Some(pipeline) = SharedPipelines::get(&shared_key) {
@@ -2253,6 +2283,7 @@ impl Pipelines {
                             stride,
                             Conv2dCoopDirection::Forward,
                             &config,
+                            gpu.capabilities().subgroup_size,
                         )
                     }
                     ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride) => {
@@ -2262,6 +2293,7 @@ impl Pipelines {
                             stride,
                             Conv2dCoopDirection::GradInput,
                             &config,
+                            gpu.capabilities().subgroup_size,
                         )
                     }
                     _ => unreachable!("dense products route through Variant::Product"),
@@ -2414,7 +2446,12 @@ impl Pipelines {
                 };
                 layout = horizontal_matmul_layout(count);
                 entry_point = "main";
-                crate::codegen::generate_horizontal_matmul(group, count, coop.as_ref())
+                crate::codegen::generate_horizontal_matmul(
+                    group,
+                    count,
+                    coop.as_ref(),
+                    gpu.capabilities().subgroup_size,
+                )
             }
         };
         Ok((module, layout, entry_point))
@@ -2442,7 +2479,12 @@ impl Pipelines {
                     "pipeline key {key:?} is compiled, yet {dispatch:?} cannot generate it: {error}"
                 )
             });
-        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup);
+        let full_subgroup_size = required_full_subgroup_size(&gpu.capabilities(), module.subgroup)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "pipeline key {key:?} is compiled, yet its subgroup requirement fails: {error}"
+                )
+            });
         let code = SharedPipelineKey::new(gpu, &module, &layout, entry_point, full_subgroup_size);
         if let Some(difference) = mapped.generated.0.difference(&code) {
             panic!(
@@ -3949,7 +3991,20 @@ impl Session {
     fn test_coop_matmul(gpu: &Gpu, config: &crate::codegen::CoopConfig) -> bool {
         use crate::codegen::ShaderGroup;
 
-        let sm = crate::codegen::generate_module_coop(ShaderGroup::MatMul, config);
+        let subgroup = gpu.capabilities().subgroup_size;
+        if !(config.tile_size == 8 && !config.use_f16_input)
+            && subgroup != 0
+            && !crate::codegen::subgroup_kernel_width(subgroup)
+        {
+            log::warn!("skipping cooperative matmul probe: unsupported subgroup width {subgroup}");
+            return false;
+        }
+        let sm = crate::codegen::generate_module_coop_weighted(
+            ShaderGroup::MatMul,
+            config,
+            crate::compile::WeightFormat::F32,
+            subgroup,
+        );
         // Test with a multi-tile matmul using varying values. A uniform
         // pattern like A[i,j]=i+1, B[i,j]=j+1 misses bugs where the shader
         // loses index dependence (e.g. coop-load layout mismatches that

@@ -4988,12 +4988,12 @@ mod tests {
             );
             assert_eq!(
                 required_full_subgroup_size(&fixed_caps, m.subgroup),
-                Some(32),
+                Ok(Some(32)),
                 "{name}: expected full_subgroup_size 32 on fixed-width device"
             );
             assert_eq!(
                 required_full_subgroup_size(&variable_caps, m.subgroup),
-                None,
+                Ok(None),
                 "{name}: dynamic subgroup shader must not pin SIMD width on variable-width device"
             );
         };
@@ -5032,7 +5032,7 @@ mod tests {
         assert_eq!(m_tree.subgroup, None);
         assert_eq!(
             required_full_subgroup_size(&fixed_caps, m_tree.subgroup),
-            None
+            Ok(None)
         );
 
         // Subgroup-tiled Winograd matmul hardcodes its subgroup width (32) and
@@ -5049,11 +5049,11 @@ mod tests {
         );
         assert_eq!(
             required_full_subgroup_size(&fixed_caps, m_wino.subgroup),
-            Some(32)
+            Ok(Some(32))
         );
         assert_eq!(
             required_full_subgroup_size(&variable_caps, m_wino.subgroup),
-            Some(32)
+            Ok(Some(32))
         );
 
         // Dynamic subgroup shaders (CoopTyped, FlashAttention forward/backward,
@@ -5129,7 +5129,52 @@ mod tests {
         );
         assert_eq!(
             required_full_subgroup_size(&variable_caps, m_pinned.subgroup),
-            Some(16)
+            Ok(Some(16))
+        );
+
+        // An exact subgroup requirement that the device cannot pin and does not
+        // natively run at fixed width must be rejected rather than silently
+        // running with the wrong subgroup count.
+        let lavapipe_8_caps = bg::Capabilities {
+            subgroup_size: 8,
+            full_subgroups: Some(bg::FullSubgroups {
+                min_size: 8,
+                max_size: 8,
+                max_workgroup_subgroups: 128,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            required_full_subgroup_size(&lavapipe_8_caps, m_wino.subgroup).is_err(),
+            "32-lane pinned shader must be rejected on an 8-lane device"
+        );
+        let unpinned_fixed_32_caps = bg::Capabilities {
+            subgroup_size: 32,
+            full_subgroups: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            required_full_subgroup_size(&unpinned_fixed_32_caps, m_wino.subgroup),
+            Ok(None)
+        );
+        // Backends that do not report subgroup capabilities (e.g. Metal) report
+        // `subgroup_size == 0` and `full_subgroups == None`.
+        let metal_unreported_caps = bg::Capabilities {
+            subgroup_size: 0,
+            full_subgroups: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            required_full_subgroup_size(&metal_unreported_caps, m_wino.subgroup),
+            Ok(None)
+        );
+        let req_64 = Some(SubgroupRequirement {
+            size: 64,
+            workgroup_size: [256, 1, 1],
+        });
+        assert!(
+            required_full_subgroup_size(&variable_caps, req_64).is_err(),
+            "64-lane pinned shader must be rejected on a [16, 32] variable-width device"
         );
     }
 }

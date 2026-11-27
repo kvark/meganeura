@@ -761,10 +761,14 @@ mod tests {
             assert!(
                 module
                     .source
-                    .contains("acc11 = coopMultiplyAdd(a1, b1, acc11)")
+                    .contains("acc0_0 = coopMultiplyAdd(a0_0, b0_0, acc0_0)")
             );
-            assert!(!module.source.contains("var<workgroup> shared_c"));
-            assert!(module.source.contains("wgid.z * m * n"));
+            assert!(
+                module
+                    .source
+                    .contains("coopStoreT(acc0_0, &matrix_c[c_base +")
+            );
+            assert!(module.source.contains("group.z * m * n"));
         }
     }
 }
