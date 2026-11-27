@@ -184,6 +184,68 @@ pub(crate) fn exact_kernel() -> Kernel {
 /// The K stage of [`exact_kernel`]. Any other stage was measured and pinned.
 const EXACT_K_TILE: u32 = 16;
 
+/// Register blocking of the direct forward convolution
+/// ([`crate::compile::Kernel::RegisterConv`]): each thread accumulates
+/// `channels` output channels for `pixels` consecutive output pixels, and a
+/// workgroup is `threads` threads along the pixels. It uses no workgroup
+/// memory. Every thread of a workgroup reads the same weights, which the
+/// cache serves, and adjacent threads read adjacent pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct RegisterBlock {
+    pub channels: u32,
+    pub pixels: u32,
+    pub threads: u32,
+}
+
+/// Output pixels (over the batch) below which a convolution takes the
+/// smaller 8 × 2 block, so the grid still has threads to spread over.
+const FEW_PIXELS: u32 = 1024;
+
+/// The register block for a forward convolution with `out_channels`
+/// channels over `pixels` output pixels (all images), at `stride`.
+///
+/// Measured on Adreno 740 (Quest 3S) over D-FINE-N's convolutions, one
+/// dispatch at a time:
+/// - 16 channels by 4 pixels where there are at least 16 channels; 2
+///   pixels at strides above 1, whose gathers are not contiguous;
+/// - 4 channels where there are fewer than 16;
+/// - 8 channels by 2 pixels below [`FEW_PIXELS`] pixels: the deep 1×1
+///   convolutions at 15×20 then have twice the threads, and ran up to
+///   1.2× faster than with 16 by 4;
+/// - always 64 threads.
+///
+/// Neighbouring blocks were up to 2.5× slower on some shapes, and not
+/// predictably, so tuning should eventually choose per shape.
+pub(crate) fn register_block(out_channels: u32, pixels: u32, stride: u32) -> RegisterBlock {
+    let (channels, pixels) = if out_channels < 16 {
+        (4, if stride == 1 { 4 } else { 2 })
+    } else if pixels < FEW_PIXELS {
+        (8, 2)
+    } else {
+        (16, if stride == 1 { 4 } else { 2 })
+    };
+    RegisterBlock {
+        channels,
+        pixels,
+        threads: 64,
+    }
+}
+
+/// The grid of a [`RegisterBlock`] over `out_channels` × `spatial` outputs
+/// for `batch` images.
+pub(crate) fn register_workgroups(
+    block: RegisterBlock,
+    out_channels: u32,
+    spatial: u32,
+    batch: u32,
+) -> [u32; 3] {
+    [
+        spatial.div_ceil(block.pixels * block.threads),
+        out_channels.div_ceil(block.channels),
+        batch,
+    ]
+}
+
 /// One 64-wide dispatch that cooperative tiles may replace.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Problem {
@@ -364,6 +426,22 @@ pub(crate) fn cooperative_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_blocks_cover_every_output() {
+        // D-FINE-N's 16->8 2x2 convolution: 4 channels, 4 pixels.
+        let narrow = register_block(8, 240 * 320, 1);
+        assert_eq!((narrow.channels, narrow.pixels), (4, 4));
+        assert_eq!(register_workgroups(narrow, 8, 240 * 320, 1), [300, 2, 1]);
+        // Strided gathers take two pixels; partial blocks round up.
+        let strided = register_block(17, 3 * 1200, 2);
+        assert_eq!((strided.channels, strided.pixels), (16, 2));
+        assert_eq!(register_workgroups(strided, 17, 1200, 3), [10, 2, 3]);
+        // A deep 1x1 at 15x20 takes the smaller block for more threads.
+        let deep = register_block(512, 300, 1);
+        assert_eq!((deep.channels, deep.pixels), (8, 2));
+        assert_eq!(register_workgroups(deep, 512, 300, 1), [3, 64, 1]);
+    }
 
     #[test]
     fn keeps_a_wide_grid_on_the_64_tile() {

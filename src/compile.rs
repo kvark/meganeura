@@ -1329,6 +1329,11 @@ pub enum Kernel {
         interleave_columns: bool,
     },
     Cooperative,
+    /// A forward convolution computed directly from registers, with its
+    /// geometry baked in: no workgroup memory and no im2col tile. Faster than
+    /// the shared-memory tiles where cooperative matrices are absent; see
+    /// [`crate::kernels::conv::register_block`].
+    RegisterConv(crate::kernels::conv::RegisterBlock),
     /// Checked partial tiles with explicit operand, multiplication and output
     /// types, and F32 accumulation. Multiple K partitions write F32 partials
     /// for a following SumRows; a reduced output type is only legal after

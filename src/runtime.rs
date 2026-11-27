@@ -923,6 +923,7 @@ enum Variant {
         bool,
     ),
     SpecializedConv(ShaderEntry, Vec<u32>, u32, bool),
+    RegisterConv(ShaderEntry, Vec<u32>, crate::kernels::conv::RegisterBlock),
     ScalarMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1018,6 +1019,7 @@ impl Variant {
             | Variant::Attention(ref e, _, _, _)
             | Variant::CoopConv(ref e, _, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
+            | Variant::RegisterConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
@@ -1050,6 +1052,12 @@ impl Variant {
             }
             Variant::SpecializedConv(ref e, ref params, k_tile, interleave) => {
                 format!("{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-{params:?}")
+            }
+            Variant::RegisterConv(ref e, ref params, block) => {
+                format!(
+                    "{e:?}:register-c{}-p{}-t{}-{params:?}",
+                    block.channels, block.pixels, block.threads
+                )
             }
             Variant::Reduction {
                 hash,
@@ -2223,6 +2231,9 @@ impl Pipelines {
                 matmul_knobs,
                 &capabilities,
             ),
+            Variant::RegisterConv(_, ref params, block) => {
+                crate::codegen::generate_register_conv(params, block)
+            }
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
@@ -2517,6 +2528,9 @@ impl Pipelines {
                 split,
                 dispatch.conv_transposed_weights,
             );
+        }
+        if let crate::compile::Kernel::RegisterConv(block) = dispatch.kernel {
+            return Variant::RegisterConv(entry, dispatch.params.clone(), block);
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
             return Variant::SpecializedConv(

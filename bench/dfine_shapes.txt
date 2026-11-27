@@ -1,0 +1,14 @@
+# D-FINE-N at 640x480, its slowest convolutions on a Quest 3S (RedEye profile).
+# kind name dims...   conv: Cin H W Cout k stride pad (batch 1)
+conv dfine-1x1-896to512@15x20 896 15 20 512 1 1 0
+conv dfine-2x2-16to8@241x321 16 241 321 8 2 1 0
+conv dfine-3x3s2-32to16@240x320 32 240 320 16 3 2 1
+conv dfine-1x1-704to256@30x40 704 30 40 256 1 1 0
+conv dfine-3x3-16to16@120x160 16 120 160 16 3 1 1
+conv dfine-1x1-256to512@30x40 256 30 40 512 1 1 0
+conv dfine-stem-3x3s2-3to16 3 480 640 16 3 2 1
+conv dfine-3x3-64to32@60x80 64 60 80 32 3 1 1
+conv dfine-1x1-512to128@30x40 512 30 40 128 1 1 0
+conv dfine-1x1-1024to128@15x20 1024 15 20 128 1 1 0
+conv dfine-1x1-128to256@60x80 128 60 80 256 1 1 0
+gemm dfine-mm-300x512x128 300 512 128
