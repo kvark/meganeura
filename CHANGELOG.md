@@ -1,5 +1,11 @@
 # Unreleased
 
+- Subgroup-tiled cooperative matmul search menus add two 4-subgroup 64-lane
+  tiles on Wave64 devices (AMD RDNA/CDNA, Adreno): `128×32` at `k_stage = 32`
+  (restoring the geometry dropped by the 256-thread workgroup cap) and a
+  4-subgroup `64×64` at `k_stage = 64` (halving per-subgroup accumulators
+  relative to the existing 2-subgroup layout).
+
 - Occupancy thresholds (`SCALAR_OCCUPIED`, `MIN_F16_COOP_WORKGROUPS`,
   `MIN_F32_COOP_WORKGROUPS`, `MIN_GRAD_INPUT_WORKGROUPS`,
   `SMALL_TILE_BELOW_WORKGROUPS`), device-scaled workgroup targets, widest-tile

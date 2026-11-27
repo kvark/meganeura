@@ -46,6 +46,16 @@ const SUBGROUP_TILES: [(u32, u32, u32, u32, u32); 8] = [
     (2, 1, 1, 1, 64),
 ];
 
+/// Additional four-subgroup (256-thread) tiles for 64-lane waves (AMD
+/// RDNA/CDNA, Adreno):
+/// - `(2, 2, 4, 1, 32)` restores the 128×32 (`k_stage = 32`) geometry whose
+///   eight-subgroup `(4, 2, 2, 1, 32)` layout exceeds the 256-thread cap at 64
+///   lanes.
+/// - `(2, 2, 2, 2, 64)` adds a four-subgroup layout of 64×64 (`k_stage = 64`)
+///   alongside the existing two-subgroup `(2, 1, 2, 4, 64)` (128 threads),
+///   halving per-subgroup accumulators.
+const WAVE64_SUBGROUP_TILES: [(u32, u32, u32, u32, u32); 2] = [(2, 2, 4, 1, 32), (2, 2, 2, 2, 64)];
+
 /// Default subgroup width when no device capability overrides it.
 pub(crate) const SUBGROUP_WIDTH: u32 = 32;
 
@@ -118,6 +128,11 @@ impl WorkgroupMatmulShape {
             SUBGROUP_TILES
                 .into_iter()
                 .filter(move |&(wr, wc, ..)| subgroup_ok && wr * wc * subgroup <= 256)
+                .chain(
+                    WAVE64_SUBGROUP_TILES
+                        .into_iter()
+                        .filter(move |_| subgroup_ok && subgroup == 64),
+                )
                 .flat_map(move |(wr, wc, tr, tc, k_stage)| {
                     [false, true].map(move |prefetch| Self {
                         rows: wr * tr * nm,
@@ -2603,5 +2618,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// On 64-lane waves (AMD RDNA/CDNA, Adreno), `WAVE64_SUBGROUP_TILES` adds
+    /// two four-subgroup (256-thread) tiles: 128×32 (`k_stage = 32`, restoring
+    /// the geometry dropped by the 256-thread cap) and 64×64 (`k_stage = 64`, a
+    /// four-subgroup variant of the existing two-subgroup tile). Every
+    /// generated module validates to SPIR-V.
+    #[test]
+    fn wave64_subgroup_tiles_add_four_subgroup_128x32_and_64x64_k64_and_validate() {
+        let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        let shapes: Vec<_> = WorkgroupMatmulShape::all_for([16, 16, 16], 64)
+            .filter(|s| s.subgroup_rows != 0)
+            .collect();
+        assert!(shapes.iter().all(|s| s.threads <= 256));
+        for (rows, columns, k_stage) in [(128, 32, 32), (64, 64, 64)] {
+            for prefetch in [false, true] {
+                let shape = shapes
+                    .iter()
+                    .copied()
+                    .find(|s| {
+                        (s.rows, s.columns, s.k_stage, s.threads, s.prefetch)
+                            == (rows, columns, k_stage, 256, prefetch)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing wave64 tile {rows}x{columns} k={k_stage} prefetch={prefetch}"
+                        )
+                    });
+                assert_eq!(
+                    shape
+                        .subgroup_grid_for([16, 16, 16], 64)
+                        .map(|(wr, wc, ..)| wr * wc),
+                    Some(4)
+                );
+                let mut module = generate_workgroup_matmul_for_device(
+                    ShaderGroup::MatMul,
+                    shape,
+                    MatrixTypes::F32_AS_F16,
+                    [16, 16, 16],
+                    64,
+                    true,
+                    None,
+                );
+                super::super::validate_shader_for_test(&mut module.module, capabilities, (1, 6))
+                    .unwrap_or_else(|error| panic!("wave64 {shape:?}: {error}"));
+            }
+        }
+        // Wave32 menu is unaffected by the wave64-only entries. Every entry in
+        // `SUBGROUP_TILES` currently has at most 8 subgroups (<= 256 threads at
+        // 32 lanes), so all entries survive with both `prefetch` states.
+        let wave32: Vec<_> = WorkgroupMatmulShape::all_for([16, 16, 16], 32)
+            .filter(|s| s.subgroup_rows != 0)
+            .collect();
+        assert_eq!(wave32.len(), SUBGROUP_TILES.len() * 2);
     }
 }
