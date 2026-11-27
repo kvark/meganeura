@@ -450,7 +450,11 @@ pub(super) fn tile_module(
     caps: &bg::Capabilities,
 ) -> crate::codegen::ShaderModule {
     if let MatmulTile::Register(tile) = tile {
-        let (m, n, k) = dispatch.mnk().expect("a register product has dimensions");
+        // A 1×1 convolution's product: Co rows over Ci, one column per pixel.
+        let (m, n, k) = dispatch.mnk().unwrap_or_else(|| {
+            let p = crate::kernels::conv::Params::from(dispatch);
+            (p.out_channels, p.out_h * p.out_w, p.in_channels)
+        });
         let bindings = match dispatch.shader.shader_group() {
             crate::codegen::ShaderGroup::MatMul | crate::codegen::ShaderGroup::BatchMatMul => {
                 crate::codegen::ProductBindings::Matmul

@@ -316,7 +316,8 @@ fn conv2d_forward() {
             std::slice::from_ref(&shader),
         );
         // Without cooperative matrices every forward convolution takes the
-        // direct register kernel; checking that way too runs it everywhere.
+        // direct register kernel, or the register product for a small 1×1
+        // one; checking that way too runs them everywhere.
         let scalar = gpu::Options {
             coop: CoopPolicy::Disabled,
             ..options.clone()
@@ -331,7 +332,43 @@ fn conv2d_forward() {
         );
         for kernel in forward_conv_kernels(&g, &scalar) {
             assert!(
-                matches!(kernel, Kernel::RegisterConv(_)),
+                matches!(kernel, Kernel::RegisterConv(_) | Kernel::RegisterMatmul(_)),
+                "{c:?} compiled to {kernel:?}"
+            );
+        }
+    }
+    failures.assert_none();
+}
+
+/// Without cooperative matrices, a 1×1 convolution over few pixels with
+/// vec4-aligned channels runs on the register product kernel, its weight
+/// shared as A by every image; the batched case checks that sharing.
+#[test]
+fn conv2d_small_1x1_products() {
+    let cases = [
+        Conv::new(1, 32, (8, 12), 48, (1, 1), 1, (0, 0)),
+        Conv::new(3, 16, (6, 8), 40, (1, 1), 1, (0, 0)),
+    ];
+    let options = gpu::Options {
+        coop: CoopPolicy::Disabled,
+        ..gpu::Options::default()
+    };
+    let mut failures = Failures::default();
+    for (i, c) in cases.into_iter().enumerate() {
+        let g = c.forward_graph();
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, 400 + i as u64, 1.0);
+        inference(
+            &mut failures,
+            &format!("{c:?}"),
+            &g,
+            &feeds,
+            &options,
+            &[ShaderEntry::Conv2dGemm16],
+        );
+        for kernel in forward_conv_kernels(&g, &options) {
+            assert!(
+                matches!(kernel, Kernel::RegisterMatmul(_)),
                 "{c:?} compiled to {kernel:?}"
             );
         }

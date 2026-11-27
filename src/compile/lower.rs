@@ -379,6 +379,19 @@ fn select_conv_paths(
                 dispatch.workgroups = problem.register_workgroups();
                 continue;
             }
+            conv::Path::Product => {
+                let tile = conv::product_admits(&problem, &target)
+                    .expect("an admitted 1x1 product is legal");
+                let dispatch = &mut plan.dispatches[index];
+                dispatch.kernel = Kernel::RegisterMatmul(tile);
+                dispatch.workgroups = crate::kernels::matmul::register_workgroups(
+                    tile,
+                    problem.m,
+                    problem.n,
+                    problem.batch,
+                );
+                continue;
+            }
             conv::Path::Cooperative => {}
         }
         let config = coop_config.expect("cooperative paths need a configuration");

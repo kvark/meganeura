@@ -94,6 +94,20 @@ pub struct TuneConv2d {
 }
 
 impl TuneConv2d {
+    /// A 1×1 forward convolution that keeps its extent with vec4-aligned
+    /// channels and pixels: a product per image.
+    fn vectorized_forward(&self) -> bool {
+        self.kernel_h == 1
+            && self.kernel_w == 1
+            && self.stride == 1
+            && self.padding_h == 0
+            && self.padding_w == 0
+            && self.in_h == self.out_h
+            && self.in_w == self.out_w
+            && self.in_channels.is_multiple_of(4)
+            && self.out_h.saturating_mul(self.out_w).is_multiple_of(4)
+    }
+
     fn from_params(params: &[u32]) -> Option<Self> {
         let &[
             batch,
@@ -598,11 +612,12 @@ impl MatmulTile {
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
             Self::Register(tile) => {
+                // A 1×1 convolution is Co rows by its pixels, per image.
+                let batch = class
+                    .conv2d
+                    .map_or_else(|| class.batch_dispatches(), |c| c.batch);
                 return Some(crate::kernels::matmul::register_workgroups(
-                    tile,
-                    class.m,
-                    class.n,
-                    class.batch_dispatches(),
+                    tile, class.m, class.n, batch,
                 ));
             }
             Self::RegisterConv(block) => {
@@ -753,8 +768,8 @@ impl MatmulTile {
             return None;
         }
         if let Self::Register(tile) = self
-            && (class.conv2d.is_some()
-                || class.shader != ShaderEntry::MatMul
+            && (!(class.shader == ShaderEntry::MatMul && class.conv2d.is_none()
+                || class.conv2d.is_some_and(|c| c.vectorized_forward()))
                 || class.weight_format != crate::compile::WeightFormat::F32
                 || class.epilogue.is_some()
                 || crate::kernels::matmul::register_tile(class.m, class.n, class.k).is_none()
@@ -1205,6 +1220,17 @@ impl TuneClass {
                             k_tile,
                             interleave_columns,
                         });
+                    }
+                }
+            }
+            // A small 1×1 convolution is also a register product.
+            if self.conv2d.is_some_and(|c| c.vectorized_forward()) {
+                for rows in [2, 4, 8] {
+                    for threads in [32, 64] {
+                        out.push(MatmulTile::Register(crate::kernels::matmul::RegisterTile {
+                            rows,
+                            threads,
+                        }));
                     }
                 }
             }
