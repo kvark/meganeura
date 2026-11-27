@@ -284,7 +284,7 @@ pub(crate) fn select_variants(
     reset_workgroup_matmuls(plan);
     select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
-    select_register_matmuls(plan);
+    select_batch_register_matmuls(plan, coop_config);
     let wg = crate::schedule::GridShape::default().workgroup_size;
     for dispatch in &mut plan.dispatches {
         if let Some(dag) = dispatch.pointwise() {
@@ -398,43 +398,6 @@ fn select_conv_paths(
     }
 }
 
-/// Move the plain and batch-major f32 products still on shared-memory
-/// scalar tiles to the direct register kernel: on Adreno 740 it ran
-/// D-FINE-N's products about 4× faster. It runs before split-K and horizontal fusion, which
-/// leave it alone, since it needs neither to occupy the device. Fused
-/// epilogues and prologues, reduced storage and pinned schedules keep
-/// their kernels.
-fn select_register_matmuls(plan: &mut ExecutionPlan) {
-    use crate::kernels::matmul;
-    for dispatch in &mut plan.dispatches {
-        if !matches!(
-            dispatch.shader,
-            ShaderEntry::MatMul | ShaderEntry::BatchMatMul
-        ) || !matches!(dispatch.kernel, Kernel::Default | Kernel::SmallTile)
-            || dispatch.horizontal_batch >= 2
-            || dispatch.matmul_epilogue.is_some()
-            || dispatch.matmul_prologue.is_some()
-            || dispatch.gemv_rmsnorm.is_some()
-            || dispatch.weight_format != WeightFormat::F32
-            || dispatch.input_buffers.len() != 2
-        {
-            continue;
-        }
-        let Some((m, n, k)) = dispatch.mnk() else {
-            continue;
-        };
-        let batch = match dispatch.shader {
-            ShaderEntry::BatchMatMul => dispatch.params[3],
-            _ => 1,
-        };
-        let Some(tile) = matmul::register_tile(m, n, k) else {
-            continue;
-        };
-        dispatch.kernel = Kernel::RegisterMatmul(tile);
-        dispatch.workgroups = matmul::register_workgroups(tile, m, n, batch);
-    }
-}
-
 /// Pick each dense product's path from its kernel family, and size its
 /// workgroups and buffers for it.
 fn select_matmul_paths(
@@ -471,6 +434,16 @@ fn select_matmul_paths(
                     pad_buffer(plan, addend, geometry.output_bytes);
                 }
             }
+            // The tiles stage A and B through workgroup memory; without
+            // cooperative matrices to consume it, registers are faster: on
+            // Adreno 740 D-FINE-N's products ran about 4× faster.
+            matmul::Path::Register => {
+                let tile = matmul::register_tile(problem.m, problem.n, problem.k)
+                    .expect("an admitted register product is aligned");
+                let dispatch = &mut plan.dispatches[index];
+                dispatch.kernel = Kernel::RegisterMatmul(tile);
+                dispatch.workgroups = matmul::register_workgroups(tile, problem.m, problem.n, 1);
+            }
             matmul::Path::SmallTile => {
                 let dispatch = &mut plan.dispatches[index];
                 let product = dispatch.product().expect("dense product");
@@ -486,6 +459,38 @@ fn select_matmul_paths(
                     .workgroups;
             }
             matmul::Path::Compiled => {}
+        }
+    }
+}
+
+/// Batch-major products are not in the matmul family; give them the
+/// register kernel by the same rules as [`matmul::Path::Register`]. Runs
+/// before split-K and horizontal packing, which leave the register kernel
+/// alone.
+fn select_batch_register_matmuls(plan: &mut ExecutionPlan, coop_config: Option<&CoopConfig>) {
+    use crate::kernels::matmul;
+    let target = matmul::Target {
+        cooperative: coop_config.copied(),
+        allow_raw_f16: false,
+        prefer: plan.knobs.prefer_matmul,
+    };
+    for dispatch in &mut plan.dispatches {
+        if dispatch.shader != ShaderEntry::BatchMatMul
+            || !matches!(dispatch.kernel, Kernel::Default | Kernel::SmallTile)
+            || dispatch.schedule_locked
+            || dispatch.matmul_epilogue.is_some()
+            || dispatch.matmul_prologue.is_some()
+            || dispatch.weight_format != WeightFormat::F32
+        {
+            continue;
+        }
+        let Some((m, n, k)) = dispatch.mnk() else {
+            continue;
+        };
+        let batch = dispatch.params[3];
+        if let Ok(tile) = matmul::register_admits_product([m, n, k], batch, &target) {
+            dispatch.kernel = Kernel::RegisterMatmul(tile);
+            dispatch.workgroups = matmul::register_workgroups(tile, m, n, batch);
         }
     }
 }

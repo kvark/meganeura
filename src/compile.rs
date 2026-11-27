@@ -1335,7 +1335,7 @@ pub enum Kernel {
     /// convolution family's `Register` path chooses it.
     RegisterConv(crate::kernels::conv::RegisterBlock),
     /// A plain or batch-major f32 product computed directly from registers,
-    /// dimensions baked in; see [`crate::kernels::matmul::register_tile`].
+    /// dimensions baked in. The matmul family's `Register` path chooses it.
     RegisterMatmul(crate::kernels::matmul::RegisterTile),
     /// Checked partial tiles with explicit operand, multiplication and output
     /// types, and F32 accumulation. Multiple K partitions write F32 partials

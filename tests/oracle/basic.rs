@@ -80,11 +80,13 @@ fn matmul_lowerings() {
     }
 }
 
-/// The kernel of every plain or batch-major product `graph` compiles to.
+/// The kernel of every plain or batch-major product `graph` compiles to
+/// without cooperative matrices, where the register kernel is preferred.
 fn product_kernels(graph: &Graph) -> Vec<meganeura::compile::Kernel> {
     use meganeura::compile::ShaderEntry;
     let mut config = meganeura::SessionConfig::from_env();
     config.mode = meganeura::Mode::Inference;
+    config.runtime.coop = meganeura::CoopPolicy::Disabled;
     config.gpu = Some(gpu::shared_context());
     let (session, _) = meganeura::build(graph, config);
     session
@@ -96,23 +98,24 @@ fn product_kernels(graph: &Graph) -> Vec<meganeura::compile::Kernel> {
         .collect()
 }
 
-/// Products whose N and K are multiples of four run on the direct register
-/// kernel where cooperative tiles do not take them. Rows past a whole tile
-/// (M = 301, 5), the narrowest output (N = 4), the shallowest reduction
-/// (K = 4) and batch-major products with narrow and deep shapes, like
-/// attention's.
+/// Without cooperative matrices, products whose N and K are multiples of
+/// four, with grids of at least four workgroups, run on the direct register
+/// kernel. Rows past a whole tile (M = 1201, 1025, 49), the narrowest output
+/// (N = 4), the shallowest reduction (K = 4) and batch-major products with
+/// narrow and deep shapes, like attention's. Each also runs with
+/// cooperative matrices disabled, so every device checks the kernel.
 #[test]
 fn register_matmul_lowerings() {
     use meganeura::compile::Kernel;
     let mut graphs = Vec::new();
-    for (m, k, n) in [(300, 128, 128), (301, 16, 4), (5, 4, 8), (64, 20, 256)] {
+    for (m, k, n) in [(300, 128, 128), (1201, 16, 4), (1025, 4, 8), (64, 20, 256)] {
         let mut g = Graph::new();
         let a = g.input("a", &[m, k]);
         let b = g.parameter("b", &[k, n]);
         let y = g.matmul(a, b);
         graphs.push((format!("register matmul {m}x{k}x{n}"), g, y));
     }
-    for (batch, m, k, n) in [(3, 13, 8, 16), (2, 30, 300, 16), (2, 7, 16, 300)] {
+    for (batch, m, k, n) in [(6, 49, 8, 16), (8, 30, 300, 16), (2, 7, 16, 300)] {
         let mut g = Graph::new();
         let a = g.input("a", &[batch, m, k]);
         let b = g.input("b", &[batch, k, n]);
@@ -123,20 +126,20 @@ fn register_matmul_lowerings() {
         g.set_outputs(vec![y]);
         for kernel in product_kernels(&g) {
             assert!(
-                matches!(
-                    kernel,
-                    Kernel::RegisterMatmul(_)
-                        | Kernel::Cooperative
-                        | Kernel::CooperativeTyped { .. }
-                        | Kernel::CooperativeWorkgroup { .. }
-                        | Kernel::CooperativeTiled { .. }
-                ),
+                matches!(kernel, Kernel::RegisterMatmul(_)),
                 "{what} compiled to {kernel:?}"
             );
         }
         let mut feeds = Feeds::new();
         feeds.fill_random(&g, what.len() as u64, 1.0);
-        for (lowering, options) in gpu::Options::lowerings() {
+        let scalar = gpu::Options {
+            coop: meganeura::CoopPolicy::Disabled,
+            ..Default::default()
+        };
+        for (lowering, options) in gpu::Options::lowerings()
+            .into_iter()
+            .chain([("no cooperative matrices", scalar)])
+        {
             let report = gpu::check_inference(&g, &feeds, &options)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             report.assert_passed(&format!("{what} ({lowering})"));

@@ -240,6 +240,9 @@ pub enum MatmulTile {
     /// The direct register-blocked forward convolution at one block; see
     /// [`crate::compile::Kernel::RegisterConv`].
     RegisterConv(crate::kernels::conv::RegisterBlock),
+    /// The direct register product at one tile; see
+    /// [`crate::compile::Kernel::RegisterMatmul`].
+    Register(crate::kernels::matmul::RegisterTile),
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
     /// Keeps the shader entry and buffer layout. Width and reduction apply
@@ -355,6 +358,7 @@ impl MatmulTile {
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
                 Kernel::RegisterConv(block) => Some(Self::RegisterConv(block)),
+                Kernel::RegisterMatmul(tile) => Some(Self::Register(tile)),
                 _ => None,
             }
         } else {
@@ -388,6 +392,7 @@ impl MatmulTile {
                 Kernel::CooperativeTyped {
                     splits, specialize, ..
                 } => Some(Self::CooperativeChecked { splits, specialize }),
+                Kernel::RegisterMatmul(tile) => Some(Self::Register(tile)),
                 _ => None,
             }
         }
@@ -434,7 +439,8 @@ impl MatmulTile {
             | Self::Tile64
             | Self::Scalar(_)
             | Self::SpecializedConv { .. }
-            | Self::RegisterConv(_) => TileFamily::Scalar,
+            | Self::RegisterConv(_)
+            | Self::Register(_) => TileFamily::Scalar,
             Self::CooperativeF32 { .. }
             | Self::CooperativeF16 { .. }
             | Self::CooperativeWorkgroup { .. }
@@ -510,6 +516,7 @@ impl MatmulTile {
                 interleave_columns,
             },
             Self::RegisterConv(block) => crate::compile::Kernel::RegisterConv(block),
+            Self::Register(tile) => crate::compile::Kernel::RegisterMatmul(tile),
             Self::Gemv(_) | Self::CooperativeChecked { .. } | Self::CooperativeWorkgroup { .. } => {
                 unreachable!()
             }
@@ -565,6 +572,11 @@ impl MatmulTile {
                     crate::kernels::matmul::Variant::Cooperative(self.coop_config()?),
                     1,
                 ),
+                Self::Register(tile) => {
+                    return Some(crate::kernels::matmul::register_workgroups(
+                        tile, class.m, class.n, 1,
+                    ));
+                }
                 Self::Tile16
                 | Self::SpecializedConv { .. }
                 | Self::RegisterConv(_)
@@ -585,6 +597,14 @@ impl MatmulTile {
                 ]);
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
+            Self::Register(tile) => {
+                return Some(crate::kernels::matmul::register_workgroups(
+                    tile,
+                    class.m,
+                    class.n,
+                    class.batch_dispatches(),
+                ));
+            }
             Self::RegisterConv(block) => {
                 let c = class.conv2d?;
                 return Some(crate::kernels::conv::register_workgroups(
@@ -730,6 +750,17 @@ impl MatmulTile {
             return Some(sizes);
         }
         if matches!(self, Self::Tile16) && class.conv2d.is_none() {
+            return None;
+        }
+        if let Self::Register(tile) = self
+            && (class.conv2d.is_some()
+                || class.shader != ShaderEntry::MatMul
+                || class.weight_format != crate::compile::WeightFormat::F32
+                || class.epilogue.is_some()
+                || crate::kernels::matmul::register_tile(class.m, class.n, class.k).is_none()
+                || !matches!(tile.rows, 2 | 4 | 8)
+                || !matches!(tile.threads, 32 | 64 | 128))
+        {
             return None;
         }
         if let Self::RegisterConv(block) = self
@@ -1336,6 +1367,15 @@ impl TuneClass {
                             }
                         }
                     }
+                }
+            }
+            // Register tiles last: plain f32 products with vec4 extents.
+            for rows in [2, 4, 8] {
+                for threads in [32, 64] {
+                    candidates.push(MatmulTile::Register(crate::kernels::matmul::RegisterTile {
+                        rows,
+                        threads,
+                    }));
                 }
             }
         }
