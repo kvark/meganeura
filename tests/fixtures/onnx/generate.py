@@ -372,9 +372,55 @@ def vision_ops():
     b.finish("vision_ops", x, y, 20, (1, 4, 6, 6), (1, "total"))
 
 
+def speech_ops():
+    """What a speech model needs beyond the layers above: a token embedding
+    looked up by int64 ids, and InstanceNormalization over several channels
+    and over one long row (a raw-waveform stem, as Moonshine's)."""
+    b = Builder(6)
+    vocab, width, channels, length = 20, 8, 3, 50
+    table = b.weight("embedding", (vocab, width), 1.0)
+    tokens = b.op("Gather", table, "ids", axis=0)
+    scale = b.const("scale", 1.0 + b.rng.normal(0.0, 0.2, (channels,)))
+    shift = b.weight("shift", (channels,), 0.3)
+    channelwise = b.op("InstanceNormalization", "audio", scale, shift, epsilon=1e-5)
+    row = b.op("Reshape", "audio", b.const("row", [1, 1, channels * length], np.int64))
+    one = b.op(
+        "InstanceNormalization", row, b.const("one", [1.5]), b.const("zero", [-0.25]), epsilon=1e-5
+    )
+    graph = helper.make_graph(
+        b.nodes,
+        "speech_ops",
+        [
+            helper.make_tensor_value_info("ids", TensorProto.INT64, [1, 6]),
+            helper.make_tensor_value_info("audio", TensorProto.FLOAT, [1, channels, length]),
+        ],
+        [
+            helper.make_tensor_value_info(tokens, TensorProto.FLOAT, [1, 6, width]),
+            helper.make_tensor_value_info(channelwise, TensorProto.FLOAT, [1, channels, length]),
+            helper.make_tensor_value_info(one, TensorProto.FLOAT, [1, 1, channels * length]),
+        ],
+        b.inits,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    ids = np.array([[1, 17, 0, 5, 5, 19]], np.int64)
+    # An offset and a spread per channel, which the normalization removes.
+    audio = (b.rng.normal(0.0, 1.0, (1, channels, length)) * [[[0.5], [2.0], [0.1]]] + [[[1.0], [-3.0], [0.2]]]).astype(np.float32)
+    outputs = ReferenceEvaluator(model).run(None, {"ids": ids, "audio": audio})
+    onnx.save(model, os.path.join(HERE, "speech_ops.onnx"))
+    ids.astype(np.uint32).tofile(os.path.join(HERE, "speech_ops.ids.bin"))
+    audio.tofile(os.path.join(HERE, "speech_ops.audio.bin"))
+    np.concatenate([o.astype(np.float32).ravel() for o in outputs]).tofile(
+        os.path.join(HERE, "speech_ops.expected.bin")
+    )
+    print("speech_ops", len(b.nodes), "nodes")
+
+
 if __name__ == "__main__":
     bert_layer()
     llama_layer()
     llama_gqa_dynamic_layer()
     resnet_block()
     vision_ops()
+    speech_ops()

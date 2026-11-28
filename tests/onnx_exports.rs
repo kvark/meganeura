@@ -36,6 +36,10 @@ pub(super) fn fixture(name: &str) -> &'static [u8] {
         "vision_ops.onnx",
         "vision_ops.input.bin",
         "vision_ops.expected.bin",
+        "speech_ops.onnx",
+        "speech_ops.ids.bin",
+        "speech_ops.audio.bin",
+        "speech_ops.expected.bin",
     )
 }
 
@@ -118,4 +122,43 @@ fn vision_ops() {
     // Both depthwise branches, the plain one and the one that repeats each
     // input channel, run the depthwise kernel.
     assert_eq!(count(&ops, |op| matches!(op, Op::Conv2dDw { .. })), 2);
+}
+
+/// A token embedding looked up by int64 ids, which import as U32, and
+/// InstanceNormalization over channels and over one long row: what
+/// Moonshine's encoder stem and decoder input need.
+#[test]
+fn speech_ops() {
+    let model = load_onnx_bytes(fixture("speech_ops.onnx"), None)
+        .unwrap_or_else(|e| panic!("speech_ops: import failed: {e}"));
+    let mut config = SessionConfig::from_env();
+    config.mode = Mode::Inference;
+    config.gpu = Some(meganeura::reference::gpu::shared_context());
+    let (mut session, _) = meganeura::build(&model.graph, config);
+    for (param, data) in &model.weights {
+        session.set_parameter(param, data);
+    }
+    let ids: Vec<u32> = fixture("speech_ops.ids.bin")
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| u32::from_le_bytes(b))
+        .collect();
+    session.set_input_u32("ids", &ids);
+    session.set_input("audio", &floats("speech_ops.audio.bin"));
+    session.step();
+    session.wait();
+    let expected = floats("speech_ops.expected.bin");
+    let mut offset = 0;
+    for (index, len) in [6 * 8, 3 * 50, 150].into_iter().enumerate() {
+        let mut got = vec![0.0; len];
+        session.read_output_by_index(index, &mut got);
+        for (i, (&g, &e)) in got.iter().zip(&expected[offset..offset + len]).enumerate() {
+            assert!(
+                g.is_finite() && (g - e).abs() < 2e-4,
+                "speech_ops output {index}: element {i} is {g}, want {e}"
+            );
+        }
+        offset += len;
+    }
 }
