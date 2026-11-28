@@ -90,9 +90,14 @@ fn translate_graph(
             log::warn!("ONNX input '{}': shape unknown, using [1]", input.name);
             vec![1]
         });
-        // Flatten to 2D for our IR: [batch, ..., features] -> [batch*..., features]
-        let flat_shape = flatten_to_2d(&shape);
-        let id = graph.input(&input.name, &flat_shape);
+        // Integer inputs carry indices, such as the token ids of a text
+        // model, which only a lookup reads: one flat row of U32.
+        let id = if input.is_integer() {
+            graph.input_u32(&input.name, &[shape.iter().product::<usize>().max(1)])
+        } else {
+            // Flatten to 2D for our IR: [batch, ..., features] -> [batch*..., features]
+            graph.input(&input.name, &flatten_to_2d(&shape))
+        };
         name_to_id.insert(input.name.clone(), id);
         shapes.insert(input.name.clone(), shape);
     }
@@ -868,6 +873,8 @@ fn translate_node(
                 let batch = x_shape[0] as u32;
                 let channels = x_shape[1] as u32;
                 let spatial = (x_shape[2] * x_shape[3]) as u32;
+                // The kernel counts elements by the first dimension.
+                let x = view(graph, x, &[x_shape.iter().product()])?;
                 let out =
                     graph.group_norm(x, scale, bias, batch, channels, spatial, num_groups, eps);
                 register_output(node, 0, out, &x_shape, name_to_id, shapes);
@@ -876,6 +883,31 @@ fn translate_node(
                     "GroupNorm: only 4D (NCHW) input supported".into(),
                 ));
             }
+        }
+
+        // --- InstanceNormalization: GroupNorm with a group per channel ---
+        // Each (sample, channel) is normalised over everything after the
+        // channel axis, then scaled and shifted per channel.
+        "InstanceNormalization" => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let scale = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
+            let bias = resolve_input(&node.inputs[2], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let eps = attrs.f("epsilon", 1e-5);
+            if x_shape.len() < 3 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "InstanceNormalization of {x_shape:?} (supported: [N, C, ...])"
+                )));
+            }
+            let (batch, channels) = (x_shape[0] as u32, x_shape[1] as u32);
+            let spatial = x_shape[2..].iter().product::<usize>() as u32;
+            // The kernel counts elements by the first dimension, so it takes
+            // the tensor flat; an input arrives as rows.
+            let x = view(graph, x, &[x_shape.iter().product()])?;
+            let scale = view(graph, scale, &[channels as usize])?;
+            let bias = view(graph, bias, &[channels as usize])?;
+            let out = graph.group_norm(x, scale, bias, batch, channels, spatial, channels, eps);
+            register_output(node, 0, out, &x_shape, name_to_id, shapes);
         }
 
         // --- BatchNormalization (inference mode) ---

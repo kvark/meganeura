@@ -24,6 +24,18 @@ pub(super) struct Graph {
 pub(super) struct ValueInfo {
     pub name: String,
     pub shape: Option<Vec<usize>>,
+    /// `TensorProto.DataType`, when declared: 1 is f32, 6 and 7 are i32 and
+    /// i64.
+    pub elem_type: Option<i32>,
+}
+
+impl ValueInfo {
+    /// Integer data: token ids and other indices, which the graph takes as
+    /// U32.
+    pub fn is_integer(&self) -> bool {
+        // INT8..INT64 (3, 4, 5, 6, 7), UINT32 and UINT64 (12, 13); UINT8 is 2.
+        matches!(self.elem_type, Some(2..=7 | 12 | 13))
+    }
 }
 
 pub(super) struct Node {
@@ -252,6 +264,7 @@ fn parse_value_info(bytes: &[u8]) -> Result<ValueInfo, String> {
     let mut info = ValueInfo {
         name: String::new(),
         shape: None,
+        elem_type: None,
     };
     for field in Fields(bytes) {
         let (number, value) = field?;
@@ -264,8 +277,10 @@ fn parse_value_info(bytes: &[u8]) -> Result<ValueInfo, String> {
                     if number == 1 {
                         for field in Fields(value.bytes(number)?) {
                             let (number, value) = field?;
-                            if number == 2 {
-                                info.shape = Some(parse_shape(value.bytes(number)?)?);
+                            match number {
+                                1 => info.elem_type = Some(value.varint(number)? as i32),
+                                2 => info.shape = Some(parse_shape(value.bytes(number)?)?),
+                                _ => {}
                             }
                         }
                     }
